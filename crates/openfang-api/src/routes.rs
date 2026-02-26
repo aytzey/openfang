@@ -31,6 +31,8 @@ pub struct AppState {
     pub bridge_manager: tokio::sync::Mutex<Option<openfang_channels::bridge::BridgeManager>>,
     /// Live channel config — updated on every hot-reload so list_channels() reflects reality.
     pub channels_config: tokio::sync::RwLock<openfang_types::config::ChannelsConfig>,
+    /// Notify handle to trigger graceful HTTP server shutdown from the API.
+    pub shutdown_notify: Arc<tokio::sync::Notify>,
 }
 
 /// POST /api/agents — Spawn a new agent.
@@ -492,6 +494,8 @@ pub async fn shutdown(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         "ok",
     );
     state.kernel.shutdown();
+    // Signal the HTTP server to initiate graceful shutdown so the process exits.
+    state.shutdown_notify.notify_one();
     Json(serde_json::json!({"status": "shutting_down"}))
 }
 
