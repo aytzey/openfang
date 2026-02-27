@@ -180,7 +180,7 @@ function app() {
       });
 
       // Hash routing
-      var validPages = ['overview','agents','sessions','approvals','workflows','scheduler','channels','skills','hands','analytics','logs','settings','wizard'];
+      var validPages = ['overview','agents','sessions','approvals','sales','workflows','scheduler','channels','skills','hands','analytics','logs','settings','wizard'];
       var pageRedirects = {
         'chat': 'agents',
         'templates': 'agents',
@@ -193,7 +193,8 @@ function app() {
         'peers': 'settings',
         'migration': 'settings',
         'usage': 'analytics',
-        'approval': 'approvals'
+        'approval': 'approvals',
+        'leadgen': 'sales'
       };
       function handleHash() {
         var hash = window.location.hash.replace('#', '') || 'agents';

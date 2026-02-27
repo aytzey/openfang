@@ -797,6 +797,7 @@ mod tests {
             temperature: 0.7,
             system: None,
             thinking: None,
+            reasoning_effort: None,
         };
 
         let tools = convert_tools(&request);
@@ -815,6 +816,7 @@ mod tests {
             temperature: 0.7,
             system: None,
             thinking: None,
+            reasoning_effort: None,
         };
 
         let tools = convert_tools(&request);

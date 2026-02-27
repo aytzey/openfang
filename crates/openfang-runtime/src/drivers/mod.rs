@@ -5,6 +5,7 @@
 //! Mistral, Fireworks, Ollama, vLLM, and any OpenAI-compatible endpoint.
 
 pub mod anthropic;
+pub mod codex;
 pub mod copilot;
 pub mod fallback;
 pub mod gemini;
@@ -15,9 +16,9 @@ use openfang_types::model_catalog::{
     AI21_BASE_URL, ANTHROPIC_BASE_URL, CEREBRAS_BASE_URL, COHERE_BASE_URL, DEEPSEEK_BASE_URL,
     FIREWORKS_BASE_URL, GEMINI_BASE_URL, GROQ_BASE_URL, HUGGINGFACE_BASE_URL, LMSTUDIO_BASE_URL,
     MINIMAX_BASE_URL, MISTRAL_BASE_URL, MOONSHOT_BASE_URL, OLLAMA_BASE_URL, OPENAI_BASE_URL,
-    OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL, QIANFAN_BASE_URL, QWEN_BASE_URL,
-    REPLICATE_BASE_URL, SAMBANOVA_BASE_URL, TOGETHER_BASE_URL, VLLM_BASE_URL, XAI_BASE_URL,
-    ZHIPU_BASE_URL,
+    OPENAI_CODEX_BASE_URL, OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL, QIANFAN_BASE_URL,
+    QWEN_BASE_URL, REPLICATE_BASE_URL, SAMBANOVA_BASE_URL, TOGETHER_BASE_URL, VLLM_BASE_URL,
+    XAI_BASE_URL, ZHIPU_BASE_URL,
 };
 use std::sync::Arc;
 
@@ -65,6 +66,11 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
         "openai" => Some(ProviderDefaults {
             base_url: OPENAI_BASE_URL,
             api_key_env: "OPENAI_API_KEY",
+            key_required: true,
+        }),
+        "openai-codex" => Some(ProviderDefaults {
+            base_url: OPENAI_CODEX_BASE_URL,
+            api_key_env: "OPENAI_CODEX_ACCESS_TOKEN",
             key_required: true,
         }),
         "gemini" | "google" => Some(ProviderDefaults {
@@ -166,6 +172,7 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
 /// Supported providers:
 /// - `anthropic` — Anthropic Claude (Messages API)
 /// - `openai` — OpenAI GPT models
+/// - `openai-codex` — OpenAI Codex OAuth (ChatGPT Codex Responses backend)
 /// - `groq` — Groq (ultra-fast inference)
 /// - `openrouter` — OpenRouter (multi-model gateway)
 /// - `deepseek` — DeepSeek
@@ -245,6 +252,25 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
         )));
     }
 
+    // OpenAI Codex OAuth — ChatGPT Codex Responses backend
+    if provider == "openai-codex" {
+        let access_token = config
+            .api_key
+            .clone()
+            .or_else(|| std::env::var("OPENAI_CODEX_ACCESS_TOKEN").ok())
+            .unwrap_or_default();
+        let account_id = std::env::var("OPENAI_CODEX_ACCOUNT_ID").ok();
+        let base_url = config
+            .base_url
+            .clone()
+            .unwrap_or_else(|| OPENAI_CODEX_BASE_URL.to_string());
+        return Ok(Arc::new(codex::CodexDriver::new(
+            access_token,
+            base_url,
+            account_id,
+        )));
+    }
+
     // All other providers use OpenAI-compatible format
     if let Some(defaults) = provider_defaults(provider) {
         let api_key = config
@@ -281,9 +307,9 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
         status: 0,
         message: format!(
             "Unknown provider '{}'. Supported: anthropic, gemini, openai, groq, openrouter, \
-             deepseek, together, mistral, fireworks, ollama, vllm, lmstudio, perplexity, \
-             cohere, ai21, cerebras, sambanova, huggingface, xai, replicate, github-copilot. \
-             Or set base_url for a custom OpenAI-compatible endpoint.",
+             openai-codex, deepseek, together, mistral, fireworks, ollama, vllm, lmstudio, \
+             perplexity, cohere, ai21, cerebras, sambanova, huggingface, xai, replicate, \
+             github-copilot. Or set base_url for a custom OpenAI-compatible endpoint.",
             provider
         ),
     })
@@ -295,6 +321,7 @@ pub fn known_providers() -> &'static [&'static str] {
         "anthropic",
         "gemini",
         "openai",
+        "openai-codex",
         "groq",
         "openrouter",
         "deepseek",
@@ -395,6 +422,7 @@ mod tests {
         assert!(providers.contains(&"openrouter"));
         assert!(providers.contains(&"anthropic"));
         assert!(providers.contains(&"gemini"));
+        assert!(providers.contains(&"openai-codex"));
         // New providers
         assert!(providers.contains(&"perplexity"));
         assert!(providers.contains(&"cohere"));
@@ -410,7 +438,7 @@ mod tests {
         assert!(providers.contains(&"minimax"));
         assert!(providers.contains(&"zhipu"));
         assert!(providers.contains(&"qianfan"));
-        assert_eq!(providers.len(), 26);
+        assert_eq!(providers.len(), 27);
     }
 
     #[test]

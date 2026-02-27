@@ -34,7 +34,7 @@ function chatPage() {
       { cmd: '/agents', desc: 'Switch to Agents page' },
       { cmd: '/new', desc: 'Reset session (clear history)' },
       { cmd: '/compact', desc: 'Trigger LLM session compaction' },
-      { cmd: '/model', desc: 'Show or switch model (/model [name])' },
+      { cmd: '/model', desc: 'Show locked model (gpt-5.3-codex)' },
       { cmd: '/stop', desc: 'Cancel current agent run' },
       { cmd: '/usage', desc: 'Show session token usage & cost' },
       { cmd: '/think', desc: 'Toggle extended thinking (/think [on|off|stream])' },
@@ -52,7 +52,7 @@ function chatPage() {
 
     // ── Tip Bar ──
     tipIndex: 0,
-    tips: ['Type / for commands', '/think on for reasoning', 'Ctrl+Shift+F for focus mode', 'Drag files to attach', '/model to switch models', '/context to check usage', '/verbose off to hide tool details'],
+    tips: ['Type / for commands', '/think on for reasoning', 'Ctrl+Shift+F for focus mode', 'Drag files to attach', '/model shows locked Codex model', '/context to check usage', '/verbose off to hide tool details'],
     tipTimer: null,
     get currentTip() {
       if (localStorage.getItem('of-tips-off') === 'true') return '';
@@ -282,13 +282,19 @@ function chatPage() {
         case '/model':
           if (self.currentAgent) {
             if (cmdArgs) {
-              OpenFangAPI.put('/api/agents/' + self.currentAgent.id + '/model', { model: cmdArgs }).then(function() {
-                self.currentAgent.model_name = cmdArgs;
-                self.messages.push({ id: ++msgId, role: 'system', text: 'Model switched to: `' + cmdArgs + '`', meta: '', tools: [] });
+              if (cmdArgs.toLowerCase() !== 'gpt-5.3-codex') {
+                self.messages.push({ id: ++msgId, role: 'system', text: 'Model is locked to `openai-codex:gpt-5.3-codex`', meta: '', tools: [] });
                 self.scrollToBottom();
-              }).catch(function(e) { OpenFangToast.error('Model switch failed: ' + e.message); });
+              } else {
+                OpenFangAPI.put('/api/agents/' + self.currentAgent.id + '/model', { model: 'gpt-5.3-codex' }).then(function() {
+                  self.currentAgent.model_provider = 'openai-codex';
+                  self.currentAgent.model_name = 'gpt-5.3-codex';
+                  self.messages.push({ id: ++msgId, role: 'system', text: 'Model locked to: `openai-codex:gpt-5.3-codex`', meta: '', tools: [] });
+                  self.scrollToBottom();
+                }).catch(function(e) { OpenFangToast.error('Model switch failed: ' + e.message); });
+              }
             } else {
-              self.messages.push({ id: ++msgId, role: 'system', text: '**Current Model**\n- Provider: `' + (self.currentAgent.model_provider || '?') + '`\n- Model: `' + (self.currentAgent.model_name || '?') + '`', meta: '', tools: [] });
+              self.messages.push({ id: ++msgId, role: 'system', text: '**Current Model**\n- Provider: `' + (self.currentAgent.model_provider || 'openai-codex') + '`\n- Model: `' + (self.currentAgent.model_name || 'gpt-5.3-codex') + '`\n- Policy: locked to `openai-codex:gpt-5.3-codex`', meta: '', tools: [] });
               self.scrollToBottom();
             }
           } else {

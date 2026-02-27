@@ -26,6 +26,7 @@ hmac = { workspace = true }
 sha2 = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
+lettre = { version = "=0.10.4", default-features = false, features = ["tokio1", "tokio1-rustls-tls", "smtp-transport", "builder"] }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

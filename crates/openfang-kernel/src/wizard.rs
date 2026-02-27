@@ -162,6 +162,7 @@ impl SetupWizard {
                 system_prompt,
                 api_key_env: None,
                 base_url: None,
+                reasoning_effort: Some(openfang_types::agent::ReasoningEffort::High),
             },
             resources: ResourceQuota::default(),
             priority: Priority::default(),

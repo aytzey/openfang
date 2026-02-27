@@ -1,5 +1,6 @@
 //! Configuration types for the OpenFang kernel.
 
+use crate::agent::ReasoningEffort;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1296,15 +1297,19 @@ pub struct DefaultModelConfig {
     pub api_key_env: String,
     /// Optional base URL override.
     pub base_url: Option<String>,
+    /// Optional reasoning effort level (provider/model dependent).
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl Default for DefaultModelConfig {
     fn default() -> Self {
         Self {
-            provider: "anthropic".to_string(),
-            model: "claude-sonnet-4-20250514".to_string(),
-            api_key_env: "ANTHROPIC_API_KEY".to_string(),
+            provider: "openai-codex".to_string(),
+            model: "gpt-5.3-codex".to_string(),
+            api_key_env: "OPENAI_CODEX_ACCESS_TOKEN".to_string(),
             base_url: None,
+            reasoning_effort: Some(ReasoningEffort::High),
         }
     }
 }

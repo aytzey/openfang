@@ -1,9 +1,11 @@
 //! OpenFang daemon server — boots the kernel and serves the HTTP API.
 
 use crate::channel_bridge;
+use crate::codex_oauth;
 use crate::middleware;
 use crate::rate_limiter;
 use crate::routes::{self, AppState};
+use crate::sales;
 use crate::webchat;
 use crate::ws;
 use axum::Router;
@@ -386,6 +388,69 @@ pub async fn build_router(
             axum::routing::get(routes::config_schema),
         )
         .route("/api/config/set", axum::routing::post(routes::config_set))
+        // Codex OAuth endpoints
+        .route(
+            "/api/auth/codex/start",
+            axum::routing::post(codex_oauth::codex_oauth_start),
+        )
+        .route(
+            "/api/auth/codex/callback",
+            axum::routing::get(codex_oauth::codex_oauth_callback),
+        )
+        .route(
+            "/auth/callback",
+            axum::routing::get(codex_oauth::codex_oauth_callback),
+        )
+        .route(
+            "/api/auth/codex/paste-code",
+            axum::routing::post(codex_oauth::codex_oauth_paste_code),
+        )
+        .route(
+            "/api/auth/codex/import-cli",
+            axum::routing::post(codex_oauth::codex_oauth_import_cli),
+        )
+        .route(
+            "/api/auth/codex/status",
+            axum::routing::get(codex_oauth::codex_oauth_status),
+        )
+        .route(
+            "/api/auth/codex/logout",
+            axum::routing::post(codex_oauth::codex_oauth_logout),
+        )
+        // Sales engine endpoints
+        .route(
+            "/api/sales/profile",
+            axum::routing::get(sales::get_sales_profile).put(sales::put_sales_profile),
+        )
+        .route(
+            "/api/sales/profile/autofill",
+            axum::routing::post(sales::autofill_sales_profile),
+        )
+        .route("/api/sales/run", axum::routing::post(sales::run_sales_now))
+        .route(
+            "/api/sales/runs",
+            axum::routing::get(sales::list_sales_runs),
+        )
+        .route(
+            "/api/sales/leads",
+            axum::routing::get(sales::list_sales_leads),
+        )
+        .route(
+            "/api/sales/approvals",
+            axum::routing::get(sales::list_sales_approvals),
+        )
+        .route(
+            "/api/sales/approvals/{id}/approve",
+            axum::routing::post(sales::approve_and_send),
+        )
+        .route(
+            "/api/sales/approvals/{id}/reject",
+            axum::routing::post(sales::reject_sales_approval),
+        )
+        .route(
+            "/api/sales/deliveries",
+            axum::routing::get(sales::list_sales_deliveries),
+        )
         // Approval endpoints
         .route(
             "/api/approvals",
@@ -635,6 +700,7 @@ pub async fn run_daemon(
     let kernel = Arc::new(kernel);
     kernel.set_self_handle();
     kernel.start_background_agents();
+    sales::spawn_sales_scheduler(kernel.clone());
 
     // Config file hot-reload watcher (polls every 30 seconds)
     {

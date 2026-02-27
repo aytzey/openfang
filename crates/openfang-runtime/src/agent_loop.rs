@@ -275,6 +275,7 @@ pub async fn run_agent_loop(
             temperature: manifest.model.temperature,
             system: Some(system_prompt.clone()),
             thinking: None,
+            reasoning_effort: manifest.model.reasoning_effort.clone(),
         };
 
         // Notify phase: Thinking
@@ -1149,6 +1150,7 @@ pub async fn run_agent_loop_streaming(
             temperature: manifest.model.temperature,
             system: Some(system_prompt.clone()),
             thinking: None,
+            reasoning_effort: manifest.model.reasoning_effort.clone(),
         };
 
         // Notify phase: Streaming (streaming variant always streams)

@@ -39,8 +39,15 @@ struct OaiRequest {
     tools: Vec<OaiTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<OaiReasoning>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct OaiReasoning {
+    effort: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -283,6 +290,13 @@ impl LlmDriver for OpenAIDriver {
             temperature: request.temperature,
             tools: oai_tools,
             tool_choice,
+            reasoning: request.reasoning_effort.as_ref().map(|e| OaiReasoning {
+                effort: match e {
+                    openfang_types::agent::ReasoningEffort::Low => "low".to_string(),
+                    openfang_types::agent::ReasoningEffort::Medium => "medium".to_string(),
+                    openfang_types::agent::ReasoningEffort::High => "high".to_string(),
+                },
+            }),
             stream: false,
         };
 
@@ -562,6 +576,13 @@ impl LlmDriver for OpenAIDriver {
             temperature: request.temperature,
             tools: oai_tools,
             tool_choice,
+            reasoning: request.reasoning_effort.as_ref().map(|e| OaiReasoning {
+                effort: match e {
+                    openfang_types::agent::ReasoningEffort::Low => "low".to_string(),
+                    openfang_types::agent::ReasoningEffort::Medium => "medium".to_string(),
+                    openfang_types::agent::ReasoningEffort::High => "high".to_string(),
+                },
+            }),
             stream: true,
         };
 

@@ -61,6 +61,7 @@ async fn start_test_server_with_provider(
             model: model.to_string(),
             api_key_env: api_key_env.to_string(),
             base_url: None,
+            reasoning_effort: None,
         },
         ..KernelConfig::default()
     };
@@ -223,7 +224,8 @@ async fn test_status_endpoint() {
     assert_eq!(body["status"], "running");
     assert_eq!(body["agent_count"], 0);
     assert!(body["uptime_seconds"].is_number());
-    assert_eq!(body["default_provider"], "ollama");
+    assert_eq!(body["default_provider"], "openai-codex");
+    assert_eq!(body["default_model"], "gpt-5.3-codex");
     assert_eq!(body["agents"].as_array().unwrap().len(), 0);
 }
 
@@ -257,7 +259,8 @@ async fn test_spawn_list_kill_agent() {
     assert_eq!(agents.len(), 1);
     assert_eq!(agents[0]["name"], "test-agent");
     assert_eq!(agents[0]["id"], agent_id);
-    assert_eq!(agents[0]["model_provider"], "ollama");
+    assert_eq!(agents[0]["model_provider"], "openai-codex");
+    assert_eq!(agents[0]["model_name"], "gpt-5.3-codex");
 
     // --- Kill ---
     let resp = client
@@ -687,6 +690,7 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
             model: "test-model".to_string(),
             api_key_env: "OLLAMA_API_KEY".to_string(),
             base_url: None,
+            reasoning_effort: None,
         },
         ..KernelConfig::default()
     };

@@ -2,6 +2,8 @@
 'use strict';
 
 function agentsPage() {
+  var CODEX_PROVIDER = 'openai-codex';
+  var CODEX_MODEL = 'gpt-5.3-codex';
   return {
     tab: 'agents',
     activeChatAgent: null,
@@ -17,8 +19,8 @@ function agentsPage() {
     loadError: '',
     spawnForm: {
       name: '',
-      provider: 'groq',
-      model: 'llama-3.3-70b-versatile',
+      provider: CODEX_PROVIDER,
+      model: CODEX_MODEL,
       systemPrompt: 'You are a helpful assistant.',
       profile: 'full',
       caps: { memory_read: true, memory_write: true, network: false, shell: false, agent_spawn: false }
@@ -247,6 +249,8 @@ function agentsPage() {
 
     async init() {
       var self = this;
+      this.spawnForm.provider = CODEX_PROVIDER;
+      this.spawnForm.model = CODEX_MODEL;
       this.loading = true;
       this.loadError = '';
       try {
@@ -366,6 +370,8 @@ function agentsPage() {
       this.selectedPreset = '';
       this.soulContent = '';
       this.spawnForm.name = '';
+      this.spawnForm.provider = CODEX_PROVIDER;
+      this.spawnForm.model = CODEX_MODEL;
       this.spawnForm.systemPrompt = 'You are a helpful assistant.';
       this.spawnForm.profile = 'full';
     },
@@ -398,8 +404,8 @@ function agentsPage() {
         lines.push('profile = "' + f.profile + '"');
       }
       lines.push('', '[model]');
-      lines.push('provider = "' + f.provider + '"');
-      lines.push('model = "' + f.model + '"');
+      lines.push('provider = "' + CODEX_PROVIDER + '"');
+      lines.push('model = "' + CODEX_MODEL + '"');
       lines.push('system_prompt = "' + f.systemPrompt.replace(/"/g, '\\"') + '"');
       if (f.profile === 'custom') {
         lines.push('', '[capabilities]');
@@ -451,11 +457,13 @@ function agentsPage() {
 
           this.showSpawnModal = false;
           this.spawnForm.name = '';
+          this.spawnForm.provider = CODEX_PROVIDER;
+          this.spawnForm.model = CODEX_MODEL;
           this.spawnToml = '';
           this.spawnStep = 1;
           OpenFangToast.success('Agent "' + (res.name || 'new') + '" spawned');
           await Alpine.store('app').refreshAgents();
-          this.chatWithAgent({ id: res.agent_id, name: res.name, model_provider: '?', model_name: '?' });
+          this.chatWithAgent({ id: res.agent_id, name: res.name, model_provider: CODEX_PROVIDER, model_name: CODEX_MODEL });
         } else {
           OpenFangToast.error('Spawn failed: ' + (res.error || 'Unknown error'));
         }
@@ -551,7 +559,7 @@ function agentsPage() {
           if (res.agent_id) {
             OpenFangToast.success('Agent "' + (res.name || name) + '" spawned from template');
             await Alpine.store('app').refreshAgents();
-            this.chatWithAgent({ id: res.agent_id, name: res.name || name, model_provider: '?', model_name: '?' });
+            this.chatWithAgent({ id: res.agent_id, name: res.name || name, model_provider: CODEX_PROVIDER, model_name: CODEX_MODEL });
           }
         }
       } catch(e) {
@@ -564,7 +572,7 @@ function agentsPage() {
       toml += 'description = "' + t.description.replace(/"/g, '\\"') + '"\n';
       toml += 'module = "builtin:chat"\n';
       toml += 'profile = "' + t.profile + '"\n\n';
-      toml += '[model]\nprovider = "' + t.provider + '"\nmodel = "' + t.model + '"\n';
+      toml += '[model]\nprovider = "' + CODEX_PROVIDER + '"\nmodel = "' + CODEX_MODEL + '"\n';
       toml += 'system_prompt = """\n' + t.system_prompt + '\n"""\n';
 
       try {
@@ -572,7 +580,7 @@ function agentsPage() {
         if (res.agent_id) {
           OpenFangToast.success('Agent "' + t.name + '" spawned');
           await Alpine.store('app').refreshAgents();
-          this.chatWithAgent({ id: res.agent_id, name: t.name, model_provider: t.provider, model_name: t.model });
+          this.chatWithAgent({ id: res.agent_id, name: t.name, model_provider: CODEX_PROVIDER, model_name: CODEX_MODEL });
         }
       } catch(e) {
         OpenFangToast.error('Failed to spawn agent: ' + e.message);

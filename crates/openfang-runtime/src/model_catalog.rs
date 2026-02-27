@@ -1,6 +1,6 @@
 //! Model catalog — registry of known models with metadata, pricing, and auth detection.
 //!
-//! Provides a comprehensive catalog of 130+ builtin models across 27 providers,
+//! Provides a comprehensive catalog of 130+ builtin models across 28 providers,
 //! with alias resolution, auth status detection, and pricing lookups.
 
 use openfang_types::model_catalog::{
@@ -8,9 +8,9 @@ use openfang_types::model_catalog::{
     BEDROCK_BASE_URL, CEREBRAS_BASE_URL, COHERE_BASE_URL, DEEPSEEK_BASE_URL, FIREWORKS_BASE_URL,
     GEMINI_BASE_URL, GITHUB_COPILOT_BASE_URL, GROQ_BASE_URL, HUGGINGFACE_BASE_URL,
     LMSTUDIO_BASE_URL, MINIMAX_BASE_URL, MISTRAL_BASE_URL, MOONSHOT_BASE_URL, OLLAMA_BASE_URL,
-    OPENAI_BASE_URL, OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL, QIANFAN_BASE_URL, QWEN_BASE_URL,
-    REPLICATE_BASE_URL, SAMBANOVA_BASE_URL, TOGETHER_BASE_URL, VLLM_BASE_URL, XAI_BASE_URL,
-    ZHIPU_BASE_URL,
+    OPENAI_BASE_URL, OPENAI_CODEX_BASE_URL, OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL,
+    QIANFAN_BASE_URL, QWEN_BASE_URL, REPLICATE_BASE_URL, SAMBANOVA_BASE_URL, TOGETHER_BASE_URL,
+    VLLM_BASE_URL, XAI_BASE_URL, ZHIPU_BASE_URL,
 };
 use std::collections::HashMap;
 
@@ -208,6 +208,15 @@ fn builtin_providers() -> Vec<ProviderInfo> {
             display_name: "OpenAI".into(),
             api_key_env: "OPENAI_API_KEY".into(),
             base_url: OPENAI_BASE_URL.into(),
+            key_required: true,
+            auth_status: AuthStatus::Missing,
+            model_count: 0,
+        },
+        ProviderInfo {
+            id: "openai-codex".into(),
+            display_name: "OpenAI Codex OAuth".into(),
+            api_key_env: "OPENAI_CODEX_ACCESS_TOKEN".into(),
+            base_url: OPENAI_CODEX_BASE_URL.into(),
             key_required: true,
             auth_status: AuthStatus::Missing,
             model_count: 0,
@@ -455,6 +464,9 @@ fn builtin_aliases() -> HashMap<String, String> {
         ("gpt4", "gpt-4o"),
         ("gpt4o", "gpt-4o"),
         ("gpt4-mini", "gpt-4o-mini"),
+        ("gpt-5.3-codex-high", "gpt-5.3-codex"),
+        ("codex-high", "gpt-5.3-codex"),
+        ("gpt5-codex", "gpt-5.3-codex"),
         ("flash", "gemini-2.5-flash"),
         ("gemini-flash", "gemini-2.5-flash"),
         ("gemini-pro", "gemini-2.5-pro"),
@@ -576,8 +588,22 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             aliases: vec![],
         },
         // ══════════════════════════════════════════════════════════════
-        // OpenAI (10)
+        // OpenAI Codex + OpenAI API
         // ══════════════════════════════════════════════════════════════
+        ModelCatalogEntry {
+            id: "gpt-5.3-codex".into(),
+            display_name: "GPT-5.3 Codex".into(),
+            provider: "openai-codex".into(),
+            tier: ModelTier::Frontier,
+            context_window: 200_000,
+            max_output_tokens: 100_000,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: true,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec!["gpt-5.3-codex-high".into(), "codex-high".into()],
+        },
         ModelCatalogEntry {
             id: "gpt-4o".into(),
             display_name: "GPT-4o".into(),
@@ -2307,7 +2333,7 @@ mod tests {
     #[test]
     fn test_catalog_has_providers() {
         let catalog = ModelCatalog::new();
-        assert_eq!(catalog.list_providers().len(), 27);
+        assert_eq!(catalog.list_providers().len(), 28);
     }
 
     #[test]

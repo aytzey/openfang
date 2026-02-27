@@ -33,6 +33,13 @@ governor = { workspace = true }
 tokio-stream = { workspace = true }
 subtle = { workspace = true }
 base64 = { workspace = true }
+rusqlite = { workspace = true }
+reqwest = { workspace = true }
+regex-lite = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+url = { workspace = true }
+lettre = { version = "=0.10.4", default-features = false, features = ["tokio1", "tokio1-rustls-tls", "smtp-transport", "builder"] }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

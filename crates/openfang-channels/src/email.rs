@@ -6,11 +6,14 @@
 use crate::types::{ChannelAdapter, ChannelContent, ChannelMessage, ChannelType, ChannelUser};
 use async_trait::async_trait;
 use futures::Stream;
+use lettre::message::{Mailbox, Message};
+use lettre::transport::smtp::authentication::Credentials;
+use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
 /// Email channel adapter using IMAP for receiving and SMTP for sending.
@@ -166,26 +169,39 @@ impl ChannelAdapter for EmailAdapter {
         user: &ChannelUser,
         content: ChannelContent,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        match content {
-            ChannelContent::Text(text) => {
-                // Placeholder: In a full implementation, this would:
-                // 1. Build email (From, To, Subject, Body) using lettre
-                // 2. Connect to SMTP server via STARTTLS
-                // 3. Send the email
-                info!(
-                    "Would send email to {}: {} chars",
-                    user.platform_id,
-                    text.len()
-                );
-                debug!(
-                    "SMTP: {}:{} -> {}",
-                    self.smtp_host, self.smtp_port, user.platform_id
-                );
-            }
+        let text = match content {
+            ChannelContent::Text(text) => text,
             _ => {
-                info!("Unsupported email content type for {}", user.platform_id);
+                warn!("Unsupported email content type for {}", user.platform_id);
+                return Ok(());
             }
-        }
+        };
+
+        let from: Mailbox = self
+            .username
+            .parse()
+            .map_err(|e| format!("Invalid sender email '{}': {e}", self.username))?;
+        let to: Mailbox = user
+            .platform_id
+            .parse()
+            .map_err(|e| format!("Invalid recipient email '{}': {e}", user.platform_id))?;
+
+        let message = Message::builder()
+            .from(from)
+            .to(to)
+            .subject("OpenFang Message")
+            .body(text)?;
+
+        let creds = Credentials::new(self.username.clone(), self.password.to_string());
+
+        let mailer = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&self.smtp_host)?
+            .port(self.smtp_port)
+            .credentials(creds)
+            .build();
+
+        mailer.send(message).await?;
+        info!("Sent email to {}", user.platform_id);
+        debug!("SMTP delivered via {}:{}", self.smtp_host, self.smtp_port);
         Ok(())
     }
 

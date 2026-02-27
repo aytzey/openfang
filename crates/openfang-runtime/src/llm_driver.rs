@@ -59,6 +59,8 @@ pub struct CompletionRequest {
     pub system: Option<String>,
     /// Extended thinking configuration (if supported by the model).
     pub thinking: Option<openfang_types::config::ThinkingConfig>,
+    /// Optional reasoning effort level (provider/model dependent).
+    pub reasoning_effort: Option<openfang_types::agent::ReasoningEffort>,
 }
 
 /// A response from an LLM completion.
@@ -270,6 +272,7 @@ mod tests {
             temperature: 0.0,
             system: None,
             thinking: None,
+            reasoning_effort: None,
         };
 
         let response = driver.stream(request, tx).await.unwrap();

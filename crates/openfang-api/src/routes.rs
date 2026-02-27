@@ -13,7 +13,7 @@ use openfang_kernel::workflow::{
 use openfang_kernel::OpenFangKernel;
 use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_runtime::tool_runner::builtin_tool_definitions;
-use openfang_types::agent::{AgentId, AgentIdentity, AgentManifest};
+use openfang_types::agent::{AgentId, AgentIdentity, AgentManifest, ReasoningEffort};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
@@ -33,6 +33,27 @@ pub struct AppState {
     pub channels_config: tokio::sync::RwLock<openfang_types::config::ChannelsConfig>,
     /// Notify handle to trigger graceful HTTP server shutdown from the API.
     pub shutdown_notify: Arc<tokio::sync::Notify>,
+}
+
+pub(crate) const CODEX_ONLY_PROVIDER: &str = "openai-codex";
+pub(crate) const CODEX_ONLY_MODEL: &str = "gpt-5.3-codex";
+const CODEX_ONLY_API_KEY_ENV: &str = "OPENAI_CODEX_ACCESS_TOKEN";
+
+fn is_codex_only_provider(name: &str) -> bool {
+    name.eq_ignore_ascii_case(CODEX_ONLY_PROVIDER)
+}
+
+fn is_codex_only_model(name: &str) -> bool {
+    name.eq_ignore_ascii_case(CODEX_ONLY_MODEL)
+}
+
+fn enforce_codex_only_manifest(manifest: &mut AgentManifest) {
+    manifest.model.provider = CODEX_ONLY_PROVIDER.to_string();
+    manifest.model.model = CODEX_ONLY_MODEL.to_string();
+    manifest.model.api_key_env = Some(CODEX_ONLY_API_KEY_ENV.to_string());
+    manifest.model.base_url = None;
+    manifest.model.reasoning_effort = Some(ReasoningEffort::High);
+    manifest.fallback_models.clear();
 }
 
 /// POST /api/agents — Spawn a new agent.
@@ -80,7 +101,7 @@ pub async fn spawn_agent(
         }
     }
 
-    let manifest: AgentManifest = match toml::from_str(&req.manifest_toml) {
+    let mut manifest: AgentManifest = match toml::from_str(&req.manifest_toml) {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!("Invalid manifest TOML: {e}");
@@ -90,6 +111,7 @@ pub async fn spawn_agent(
             );
         }
     };
+    enforce_codex_only_manifest(&mut manifest);
 
     let name = manifest.name.clone();
     match state.kernel.spawn_agent(manifest) {
@@ -258,6 +280,12 @@ pub async fn send_message(
         if !image_blocks.is_empty() {
             inject_attachments_into_session(&state.kernel, agent_id, image_blocks);
         }
+    }
+    if let Err(e) = state.kernel.set_agent_model(agent_id, CODEX_ONLY_MODEL) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to enforce Codex model: {e}")})),
+        );
     }
 
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
@@ -476,8 +504,8 @@ pub async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "running",
         "agent_count": agent_count,
-        "default_provider": state.kernel.config.default_model.provider,
-        "default_model": state.kernel.config.default_model.model,
+        "default_provider": CODEX_ONLY_PROVIDER,
+        "default_model": CODEX_ONLY_MODEL,
         "uptime_seconds": uptime,
         "agents": agents,
     }))
@@ -972,6 +1000,13 @@ pub async fn send_message_stream(
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Agent not found"})),
+        )
+            .into_response();
+    }
+    if let Err(e) = state.kernel.set_agent_model(agent_id, CODEX_ONLY_MODEL) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to enforce Codex model: {e}")})),
         )
             .into_response();
     }
@@ -4025,9 +4060,9 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse
         "data_dir": config.data_dir.to_string_lossy(),
         "api_key": if config.api_key.is_empty() { "not set" } else { "***" },
         "default_model": {
-            "provider": config.default_model.provider,
-            "model": config.default_model.model,
-            "api_key_env": config.default_model.api_key_env,
+            "provider": CODEX_ONLY_PROVIDER,
+            "model": CODEX_ONLY_MODEL,
+            "api_key_env": CODEX_ONLY_API_KEY_ENV,
         },
         "memory": {
             "decay_rate": config.memory.decay_rate,
@@ -4689,54 +4724,77 @@ pub async fn list_models(
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
 
-    let models: Vec<serde_json::Value> = catalog
-        .list_models()
-        .iter()
-        .filter(|m| {
-            if let Some(ref p) = provider_filter {
-                if m.provider.to_lowercase() != *p {
-                    return false;
-                }
-            }
-            if let Some(ref t) = tier_filter {
-                if m.tier.to_string() != *t {
-                    return false;
-                }
-            }
-            if available_only {
-                let provider = catalog.get_provider(&m.provider);
-                if let Some(p) = provider {
-                    if p.auth_status == openfang_types::model_catalog::AuthStatus::Missing {
-                        return false;
-                    }
-                }
-            }
-            true
-        })
-        .map(|m| {
-            let available = catalog
-                .get_provider(&m.provider)
-                .map(|p| p.auth_status != openfang_types::model_catalog::AuthStatus::Missing)
-                .unwrap_or(false);
-            serde_json::json!({
-                "id": m.id,
-                "display_name": m.display_name,
-                "provider": m.provider,
-                "tier": m.tier,
-                "context_window": m.context_window,
-                "max_output_tokens": m.max_output_tokens,
-                "input_cost_per_m": m.input_cost_per_m,
-                "output_cost_per_m": m.output_cost_per_m,
-                "supports_tools": m.supports_tools,
-                "supports_vision": m.supports_vision,
-                "supports_streaming": m.supports_streaming,
-                "available": available,
-            })
-        })
-        .collect();
+    if let Some(ref p) = provider_filter {
+        if !is_codex_only_provider(p) {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "models": Vec::<serde_json::Value>::new(),
+                    "total": 0,
+                    "available": 0,
+                })),
+            );
+        }
+    }
 
-    let total = catalog.list_models().len();
-    let available_count = catalog.available_models().len();
+    let codex = match catalog.find_model(CODEX_ONLY_MODEL) {
+        Some(m) if is_codex_only_provider(&m.provider) && is_codex_only_model(&m.id) => m,
+        _ => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "models": Vec::<serde_json::Value>::new(),
+                    "total": 0,
+                    "available": 0,
+                })),
+            )
+        }
+    };
+
+    if let Some(ref t) = tier_filter {
+        if codex.tier.to_string() != *t {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "models": Vec::<serde_json::Value>::new(),
+                    "total": 0,
+                    "available": 0,
+                })),
+            );
+        }
+    }
+
+    let available = catalog
+        .get_provider(CODEX_ONLY_PROVIDER)
+        .map(|p| p.auth_status != openfang_types::model_catalog::AuthStatus::Missing)
+        .unwrap_or(false);
+    if available_only && !available {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "models": Vec::<serde_json::Value>::new(),
+                "total": 0,
+                "available": 0,
+            })),
+        );
+    }
+
+    let models = vec![serde_json::json!({
+        "id": codex.id,
+        "display_name": codex.display_name,
+        "provider": codex.provider,
+        "tier": codex.tier,
+        "context_window": codex.context_window,
+        "max_output_tokens": codex.max_output_tokens,
+        "input_cost_per_m": codex.input_cost_per_m,
+        "output_cost_per_m": codex.output_cost_per_m,
+        "supports_tools": codex.supports_tools,
+        "supports_vision": codex.supports_vision,
+        "supports_streaming": codex.supports_streaming,
+        "available": available,
+    })];
+    let total = models.len();
+    let available_count = if available { 1 } else { 0 };
 
     (
         StatusCode::OK,
@@ -4759,6 +4817,7 @@ pub async fn list_aliases(State(state): State<Arc<AppState>>) -> impl IntoRespon
         .clone();
     let entries: Vec<serde_json::Value> = aliases
         .iter()
+        .filter(|(_, model_id)| is_codex_only_model(model_id))
         .map(|(alias, model_id)| {
             serde_json::json!({
                 "alias": alias,
@@ -4787,7 +4846,7 @@ pub async fn get_model(
         .read()
         .unwrap_or_else(|e| e.into_inner());
     match catalog.find_model(&id) {
-        Some(m) => {
+        Some(m) if is_codex_only_provider(&m.provider) && is_codex_only_model(&m.id) => {
             let available = catalog
                 .get_provider(&m.provider)
                 .map(|p| p.auth_status != openfang_types::model_catalog::AuthStatus::Missing)
@@ -4811,7 +4870,7 @@ pub async fn get_model(
                 })),
             )
         }
-        None => (
+        _ => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": format!("Model '{}' not found", id)})),
         ),
@@ -4829,7 +4888,12 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResp
             .model_catalog
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        catalog.list_providers().to_vec()
+        catalog
+            .list_providers()
+            .iter()
+            .filter(|p| is_codex_only_provider(&p.id))
+            .cloned()
+            .collect()
     };
 
     let mut providers: Vec<serde_json::Value> = Vec::with_capacity(provider_list.len());
@@ -5494,10 +5558,22 @@ pub async fn set_model(
             )
         }
     };
-    match state.kernel.set_agent_model(agent_id, model) {
+    if !is_codex_only_model(model) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Model is locked to '{}'", CODEX_ONLY_MODEL)
+            })),
+        );
+    }
+    match state.kernel.set_agent_model(agent_id, CODEX_ONLY_MODEL) {
         Ok(()) => (
             StatusCode::OK,
-            Json(serde_json::json!({"status": "ok", "model": model})),
+            Json(serde_json::json!({
+                "status": "ok",
+                "provider": CODEX_ONLY_PROVIDER,
+                "model": CODEX_ONLY_MODEL
+            })),
         ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -5686,6 +5762,15 @@ pub async fn set_provider_key(
     Path(name): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    if !is_codex_only_provider(&name) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": format!("Provider '{}' is disabled. Use '{}'.", name, CODEX_ONLY_PROVIDER)
+            })),
+        );
+    }
+
     // Validate provider name against known list
     {
         let catalog = state
@@ -5761,6 +5846,15 @@ pub async fn delete_provider_key(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    if !is_codex_only_provider(&name) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": format!("Provider '{}' is disabled. Use '{}'.", name, CODEX_ONLY_PROVIDER)
+            })),
+        );
+    }
+
     let env_var = {
         let catalog = state
             .kernel
@@ -5816,6 +5910,15 @@ pub async fn test_provider(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    if !is_codex_only_provider(&name) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": format!("Provider '{}' is disabled. Use '{}'.", name, CODEX_ONLY_PROVIDER)
+            })),
+        );
+    }
+
     let (env_var, base_url, key_required) = {
         let catalog = state
             .kernel
@@ -5865,6 +5968,7 @@ pub async fn test_provider(
                 temperature: 0.0,
                 system: None,
                 thinking: None,
+                reasoning_effort: None,
             };
             match driver.complete(test_req).await {
                 Ok(_) => {
@@ -8457,7 +8561,7 @@ pub async fn list_commands(State(state): State<Arc<AppState>>) -> impl IntoRespo
         serde_json::json!({"cmd": "/help", "desc": "Show available commands"}),
         serde_json::json!({"cmd": "/new", "desc": "Reset session (clear history)"}),
         serde_json::json!({"cmd": "/compact", "desc": "Trigger LLM session compaction"}),
-        serde_json::json!({"cmd": "/model", "desc": "Show or switch model (/model [name])"}),
+        serde_json::json!({"cmd": "/model", "desc": "Show locked model (gpt-5.3-codex)"}),
         serde_json::json!({"cmd": "/stop", "desc": "Cancel current agent run"}),
         serde_json::json!({"cmd": "/usage", "desc": "Show session token usage & cost"}),
         serde_json::json!({"cmd": "/think", "desc": "Toggle extended thinking (/think [on|off|stream])"}),

@@ -360,6 +360,15 @@ impl ToolProfile {
     }
 }
 
+/// Reasoning effort level for models that support explicit reasoning controls.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+}
+
 /// LLM model configuration for an agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -378,18 +387,22 @@ pub struct ModelConfig {
     pub api_key_env: Option<String>,
     /// Optional base URL override for the provider.
     pub base_url: Option<String>,
+    /// Optional reasoning effort level (provider/model dependent).
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
-            provider: "anthropic".to_string(),
-            model: "claude-sonnet-4-20250514".to_string(),
+            provider: "openai-codex".to_string(),
+            model: "gpt-5.3-codex".to_string(),
             max_tokens: 4096,
             temperature: 0.7,
             system_prompt: "You are a helpful AI agent.".to_string(),
             api_key_env: None,
             base_url: None,
+            reasoning_effort: Some(ReasoningEffort::High),
         }
     }
 }

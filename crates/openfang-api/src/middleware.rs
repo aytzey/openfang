@@ -89,6 +89,7 @@ pub async fn auth(
         || path == "/api/agents"
         || path == "/api/profiles"
         || path == "/api/config"
+        || path.starts_with("/api/auth/codex/")
         || path.starts_with("/api/uploads/")
     {
         return next.run(request).await;

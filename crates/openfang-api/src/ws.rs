@@ -12,7 +12,7 @@
 //! Server → Client: `{"type":"silent_complete"}` (agent chose NO_REPLY)
 //! Server → Client: `{"type":"canvas","canvas_id":"...","html":"...","title":"..."}`
 
-use crate::routes::AppState;
+use crate::routes::{AppState, CODEX_ONLY_MODEL, CODEX_ONLY_PROVIDER};
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{ConnectInfo, Path, State, WebSocketUpgrade};
 use axum::response::IntoResponse;
@@ -467,15 +467,25 @@ async fn handle_text_message(
                         &serde_json::json!({
                             "type": "command_result",
                             "message": format!(
-                                "**Vision not supported** — the current model `{}` cannot analyze images. \
-                                 Switch to a vision-capable model (e.g. `gemini-2.5-flash`, `claude-sonnet-4-20250514`, `gpt-4o`) \
-                                 with `/model <name>` for image analysis.",
+                                "**Vision not supported** — locked model `{}` cannot analyze images in Codex-only mode.",
                                 model_name
                             ),
                         }),
                     )
                     .await;
                 }
+            }
+
+            if let Err(e) = state.kernel.set_agent_model(agent_id, CODEX_ONLY_MODEL) {
+                let _ = send_json(
+                    sender,
+                    &serde_json::json!({
+                        "type": "error",
+                        "content": format!("Failed to enforce Codex model: {e}"),
+                    }),
+                )
+                .await;
+                return;
             }
 
             // Send typing lifecycle: start
@@ -794,12 +804,20 @@ async fn handle_command(
                     serde_json::json!({"type": "error", "content": "Agent not found"})
                 }
             } else {
-                match state.kernel.set_agent_model(agent_id, args) {
-                    Ok(()) => {
-                        serde_json::json!({"type": "command_result", "command": cmd, "message": format!("Model switched to: {args}")})
-                    }
-                    Err(e) => {
-                        serde_json::json!({"type": "error", "content": format!("Model switch failed: {e}")})
+                if !args.eq_ignore_ascii_case(CODEX_ONLY_MODEL) {
+                    serde_json::json!({
+                        "type": "command_result",
+                        "command": cmd,
+                        "message": format!("Model is locked to {CODEX_ONLY_PROVIDER}:{CODEX_ONLY_MODEL}")
+                    })
+                } else {
+                    match state.kernel.set_agent_model(agent_id, CODEX_ONLY_MODEL) {
+                        Ok(()) => {
+                            serde_json::json!({"type": "command_result", "command": cmd, "message": format!("Model locked to: {CODEX_ONLY_MODEL}")})
+                        }
+                        Err(e) => {
+                            serde_json::json!({"type": "error", "content": format!("Model switch failed: {e}")})
+                        }
                     }
                 }
             }
@@ -1080,6 +1098,24 @@ fn sanitize_text(s: &str) -> String {
 fn classify_streaming_error(err: &openfang_kernel::error::KernelError) -> String {
     let inner = format!("{err}");
 
+    if inner.contains("missing organization_id") || inner.contains("missing organization context") {
+        return "Codex OAuth token is missing account/organization context. Reconnect from Sales > Connect OAuth or import ~/.codex/auth.json."
+            .to_string();
+    }
+    if inner.contains("missing required scope")
+        || inner.contains("model.request")
+        || inner.contains("Missing scopes: model.request")
+    {
+        return "Codex OAuth token is missing required scope 'model.request'. Reconnect from Sales > Connect OAuth."
+            .to_string();
+    }
+    if inner.contains("Missing API key: Set OPENAI_CODEX_ACCESS_TOKEN")
+        || inner.contains("Missing API key: Set OPENAI_API_KEY")
+    {
+        return "Codex OAuth is not connected. Open Sales page and press Connect OAuth."
+            .to_string();
+    }
+
     // Check for agent-specific errors first (not LLM errors)
     if inner.contains("Agent not found") {
         return "Agent not found. It may have been stopped or deleted.".to_string();
@@ -1107,9 +1143,11 @@ fn classify_streaming_error(err: &openfang_kernel::error::KernelError) -> String
         llm_errors::LlmErrorCategory::Billing => {
             "Check provider account status (billing issue detected).".to_string()
         }
-        llm_errors::LlmErrorCategory::Auth => "Verify your API key in config.".to_string(),
+        llm_errors::LlmErrorCategory::Auth => {
+            "Codex auth missing. Connect OAuth in Sales page and retry.".to_string()
+        }
         llm_errors::LlmErrorCategory::ModelNotFound => {
-            "Model unavailable. Use /model to see options.".to_string()
+            format!("Model unavailable. Use {} only.", CODEX_ONLY_MODEL)
         }
         _ => classified.sanitized_message,
     }

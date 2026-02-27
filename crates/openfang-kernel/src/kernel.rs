@@ -1868,6 +1868,7 @@ impl OpenFangKernel {
                 temperature: manifest.model.temperature,
                 system: Some(manifest.model.system_prompt.clone()),
                 thinking: None,
+                reasoning_effort: None,
             };
             let (complexity, routed_model) = router.select_model(&probe);
             info!(
@@ -2213,15 +2214,11 @@ impl OpenFangKernel {
     /// Switch an agent's model.
     pub fn set_agent_model(&self, agent_id: AgentId, model: &str) -> KernelResult<()> {
         // Resolve provider from model catalog so switching models also switches provider
-        let resolved_provider = self
-            .model_catalog
-            .read()
-            .ok()
-            .and_then(|catalog| {
-                catalog
-                    .find_model(model)
-                    .map(|entry| entry.provider.clone())
-            });
+        let resolved_provider = self.model_catalog.read().ok().and_then(|catalog| {
+            catalog
+                .find_model(model)
+                .map(|entry| entry.provider.clone())
+        });
 
         if let Some(provider) = resolved_provider {
             self.registry
@@ -2569,6 +2566,7 @@ impl OpenFangKernel {
                 system_prompt: def.agent.system_prompt.clone(),
                 api_key_env: def.agent.api_key_env.clone(),
                 base_url: def.agent.base_url.clone(),
+                reasoning_effort: self.config.default_model.reasoning_effort.clone(),
             },
             capabilities: ManifestCapabilities {
                 tools: def.tools.clone(),
@@ -3444,25 +3442,37 @@ impl OpenFangKernel {
     fn resolve_driver(&self, manifest: &AgentManifest) -> KernelResult<Arc<dyn LlmDriver>> {
         let agent_provider = &manifest.model.provider;
         let default_provider = &self.config.default_model.provider;
+        let codex_model = manifest.model.model.eq_ignore_ascii_case("gpt-5.3-codex")
+            && (agent_provider.eq_ignore_ascii_case("openai-codex")
+                || agent_provider.eq_ignore_ascii_case("openai"));
 
         // If agent uses same provider as kernel default and has no custom overrides, reuse
-        let has_custom_key = manifest.model.api_key_env.is_some();
+        let has_custom_key = manifest.model.api_key_env.is_some() || codex_model;
         let has_custom_url = manifest.model.base_url.is_some();
 
         let primary = if agent_provider == default_provider && !has_custom_key && !has_custom_url {
             Arc::clone(&self.default_driver)
         } else {
             // Create a dedicated driver for this agent
+            let provider_for_driver = if codex_model {
+                "openai-codex"
+            } else {
+                agent_provider.as_str()
+            };
             // Auth profile rotation: if profiles are configured for this provider,
             // select the highest-priority profile's key env var.
-            let default_key_env = manifest
-                .model
-                .api_key_env
-                .as_deref()
-                .unwrap_or(&self.config.default_model.api_key_env);
+            let default_key_env = if codex_model {
+                "OPENAI_CODEX_ACCESS_TOKEN"
+            } else {
+                manifest
+                    .model
+                    .api_key_env
+                    .as_deref()
+                    .unwrap_or(&self.config.default_model.api_key_env)
+            };
 
             let api_key_env =
-                if let Some(profiles) = self.config.auth_profiles.get(agent_provider.as_str()) {
+                if let Some(profiles) = self.config.auth_profiles.get(provider_for_driver) {
                     if !profiles.is_empty() {
                         // Pick highest-priority profile (lowest priority number)
                         let mut sorted: Vec<_> = profiles.iter().collect();
@@ -3482,7 +3492,7 @@ impl OpenFangKernel {
                 };
 
             let driver_config = DriverConfig {
-                provider: agent_provider.clone(),
+                provider: provider_for_driver.to_string(),
                 api_key: std::env::var(&api_key_env).ok(),
                 base_url: manifest.model.base_url.clone(),
             };
