@@ -3,6 +3,8 @@
 //! Supports 4 providers: Tavily (AI-agent-native), Brave, Perplexity, and
 //! DuckDuckGo (zero-config fallback). Auto mode cascades through available
 //! providers based on configured API keys.
+//! If DuckDuckGo is unreachable, the engine automatically falls back to
+//! Bing RSS parsing as a resilience path.
 //!
 //! All API keys use `Zeroizing<String>` via `resolve_api_key()` to auto-wipe
 //! secrets from memory on drop.
@@ -10,6 +12,7 @@
 use crate::web_cache::WebCache;
 use crate::web_content::wrap_external_content;
 use openfang_types::config::{SearchProvider, WebConfig};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::{debug, warn};
 use zeroize::Zeroizing;
@@ -19,6 +22,7 @@ pub struct WebSearchEngine {
     config: WebConfig,
     client: reqwest::Client,
     cache: Arc<WebCache>,
+    ddg_unavailable: AtomicBool,
 }
 
 /// Context that bundles both search and fetch engines for passing through the tool runner.
@@ -38,6 +42,7 @@ impl WebSearchEngine {
             config,
             client,
             cache,
+            ddg_unavailable: AtomicBool::new(false),
         }
     }
 
@@ -278,16 +283,36 @@ impl WebSearchEngine {
 
     /// Search via DuckDuckGo HTML (no API key needed).
     async fn search_duckduckgo(&self, query: &str, max_results: usize) -> Result<String, String> {
+        if self.ddg_unavailable.load(Ordering::Relaxed) {
+            return self.search_bing_rss(query, max_results).await;
+        }
         debug!(query, "Searching via DuckDuckGo HTML");
 
-        let resp = self
+        let resp = match self
             .client
             .get("https://html.duckduckgo.com/html/")
             .query(&[("q", query)])
             .header("User-Agent", "Mozilla/5.0 (compatible; OpenFangAgent/0.1)")
             .send()
             .await
-            .map_err(|e| format!("DuckDuckGo request failed: {e}"))?;
+        {
+            Ok(r) => r,
+            Err(e) => {
+                self.ddg_unavailable.store(true, Ordering::Relaxed);
+                warn!(query, error = %e, "DuckDuckGo request failed, trying Bing RSS fallback");
+                return self.search_bing_rss(query, max_results).await;
+            }
+        };
+
+        if !resp.status().is_success() {
+            self.ddg_unavailable.store(true, Ordering::Relaxed);
+            warn!(
+                query,
+                status = %resp.status(),
+                "DuckDuckGo returned non-success status, trying Bing RSS fallback"
+            );
+            return self.search_bing_rss(query, max_results).await;
+        }
 
         let body = resp
             .text()
@@ -297,10 +322,57 @@ impl WebSearchEngine {
         let results = parse_ddg_results(&body, max_results);
 
         if results.is_empty() {
-            return Ok(format!("No results found for '{query}'."));
+            return self.search_bing_rss(query, max_results).await;
         }
 
         let mut output = format!("Search results for '{query}':\n\n");
+        for (i, (title, url, snippet)) in results.iter().enumerate() {
+            output.push_str(&format!(
+                "{}. {}\n   URL: {}\n   {}\n\n",
+                i + 1,
+                title,
+                url,
+                snippet
+            ));
+        }
+
+        Ok(output)
+    }
+
+    /// Search via Bing RSS feed as fallback when DDG is unreachable.
+    async fn search_bing_rss(&self, query: &str, max_results: usize) -> Result<String, String> {
+        debug!(query, "Searching via Bing RSS fallback");
+
+        let resp = self
+            .client
+            .get("https://www.bing.com/search")
+            .query(&[
+                ("q", query),
+                ("format", "rss"),
+                ("setlang", "en-US"),
+                ("mkt", "en-US"),
+                ("cc", "us"),
+            ])
+            .header("User-Agent", "Mozilla/5.0 (compatible; OpenFangAgent/0.1)")
+            .send()
+            .await
+            .map_err(|e| format!("Bing RSS request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("Bing RSS returned {}", resp.status()));
+        }
+
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| format!("Failed to read Bing RSS response: {e}"))?;
+        let results = parse_bing_rss_results(&body, max_results);
+
+        if results.is_empty() {
+            return Ok(format!("No results found for '{query}'."));
+        }
+
+        let mut output = format!("Search results for '{query}' (Bing RSS fallback):\n\n");
         for (i, (title, url, snippet)) in results.iter().enumerate() {
             output.push_str(&format!(
                 "{}. {}\n   URL: {}\n   {}\n\n",
@@ -361,6 +433,35 @@ pub fn parse_ddg_results(html: &str, max: usize) -> Vec<(String, String, String)
 
         if !title.is_empty() && !actual_url.is_empty() {
             results.push((title, actual_url, snippet));
+        }
+    }
+
+    results
+}
+
+/// Parse Bing RSS results into (title, url, snippet) tuples.
+pub fn parse_bing_rss_results(xml: &str, max: usize) -> Vec<(String, String, String)> {
+    let mut results = Vec::new();
+    let item_re = regex_lite::Regex::new(r"(?is)<item>(.*?)</item>").unwrap();
+
+    for cap in item_re.captures_iter(xml) {
+        if results.len() >= max {
+            break;
+        }
+        let item = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        let title = extract_between(item, "<title>", "</title>")
+            .map(strip_html_tags)
+            .unwrap_or_default();
+        let url = extract_between(item, "<link>", "</link>")
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string();
+        let snippet = extract_between(item, "<description>", "</description>")
+            .map(strip_html_tags)
+            .unwrap_or_default();
+
+        if !title.is_empty() && !url.is_empty() {
+            results.push((title, url, snippet));
         }
     }
 
@@ -463,5 +564,19 @@ mod tests {
         let results = parse_ddg_results(html, 5);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1, "https://example.com");
+    }
+
+    #[test]
+    fn test_parse_bing_rss_results() {
+        let xml = r#"<?xml version="1.0"?>
+<rss><channel>
+<item><title>Example &amp; Co</title><link>https://example.com</link><description>Desc one</description></item>
+<item><title>Second</title><link>https://second.example</link><description>Desc two</description></item>
+</channel></rss>"#;
+        let results = parse_bing_rss_results(xml, 5);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, "Example & Co");
+        assert_eq!(results[0].1, "https://example.com");
+        assert_eq!(results[1].0, "Second");
     }
 }

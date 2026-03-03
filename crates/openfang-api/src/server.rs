@@ -426,6 +426,14 @@ pub async fn build_router(
             "/api/sales/profile/autofill",
             axum::routing::post(sales::autofill_sales_profile),
         )
+        .route(
+            "/api/sales/onboarding/status",
+            axum::routing::get(sales::get_sales_onboarding_status),
+        )
+        .route(
+            "/api/sales/onboarding/brief",
+            axum::routing::post(sales::put_sales_onboarding_brief),
+        )
         .route("/api/sales/run", axum::routing::post(sales::run_sales_now))
         .route(
             "/api/sales/runs",

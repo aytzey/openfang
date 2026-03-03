@@ -5,12 +5,10 @@
 //! single-binary deployment while allowing organized source files.
 //!
 //! Features:
-//! - Alpine.js SPA with hash-based routing (10 panels)
+//! - Alpine.js single-panel Sales UI
 //! - Dark/light theme toggle with system preference detection
-//! - Responsive layout with collapsible sidebar
-//! - Markdown rendering + syntax highlighting (bundled locally)
-//! - WebSocket real-time chat with HTTP fallback
-//! - Agent management, workflows, memory browser, audit log, and more
+//! - OAuth + onboarding + lead pipeline controls
+//! - Vendor libraries bundled locally (no CDN dependency)
 
 use axum::http::header;
 use axum::response::IntoResponse;
@@ -94,37 +92,8 @@ const WEBCHAT_HTML: &str = concat!(
     "\n",
     include_str!("../static/js/app.js"),
     "\n",
-    include_str!("../static/js/pages/overview.js"),
-    "\n",
-    include_str!("../static/js/pages/chat.js"),
-    "\n",
-    include_str!("../static/js/pages/agents.js"),
-    "\n",
-    include_str!("../static/js/pages/workflows.js"),
-    "\n",
-    include_str!("../static/js/pages/workflow-builder.js"),
-    "\n",
-    include_str!("../static/js/pages/channels.js"),
-    "\n",
-    include_str!("../static/js/pages/skills.js"),
-    "\n",
-    include_str!("../static/js/pages/hands.js"),
-    "\n",
-    include_str!("../static/js/pages/scheduler.js"),
-    "\n",
     include_str!("../static/js/pages/sales.js"),
     "\n",
-    include_str!("../static/js/pages/settings.js"),
-    "\n",
-    include_str!("../static/js/pages/usage.js"),
-    "\n",
-    include_str!("../static/js/pages/sessions.js"),
-    "\n",
-    include_str!("../static/js/pages/logs.js"),
-    "\n",
-    include_str!("../static/js/pages/wizard.js"),
-    "\n",
-    include_str!("../static/js/pages/approvals.js"),
     "\n</script>\n",
     // Alpine.js MUST be last — it processes x-data and fires alpine:init
     "<script>\n",

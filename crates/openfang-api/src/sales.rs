@@ -7,6 +7,7 @@
 //! 4. Queue per-message approvals
 //! 5. Send on manual approval (email + LinkedIn browser automation)
 
+use crate::codex_oauth::StoredCodexAuth;
 use crate::routes::AppState;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -20,6 +21,8 @@ use openfang_runtime::browser::BrowserCommand;
 use openfang_runtime::llm_driver::{CompletionRequest, DriverConfig};
 use openfang_runtime::web_cache::WebCache;
 use openfang_runtime::web_search::WebSearchEngine;
+use openfang_types::agent::ReasoningEffort;
+use openfang_types::config::SearchProvider;
 use openfang_types::message::Message as LlmMessage;
 use rusqlite::{params, Connection};
 use serde::de::Deserializer;
@@ -32,6 +35,15 @@ use tracing::{error, info, warn};
 
 const DEFAULT_LIMIT: usize = 100;
 const MIN_DOMAIN_RELEVANCE_SCORE: i32 = 10;
+const MAX_DISCOVERY_QUERIES: usize = 6;
+const MAX_DISCOVERY_FAILURES_BEFORE_FAST_FALLBACK: u32 = MAX_DISCOVERY_QUERIES as u32;
+const NO_BRAVE_FAIL_FAST_THRESHOLD: u32 = 1;
+const MAX_DIRECT_ENRICH_ATTEMPTS: usize = 8;
+const DIRECT_ENRICH_TIMEOUT_MS: u64 = 3500;
+const MAX_EXTRA_SITE_ENRICH_PAGES: usize = 5;
+const LEAD_QUERY_PLAN_TIMEOUT_SECS: u64 = 14;
+const SALES_LLM_PROVIDER: &str = "openai-codex";
+const SALES_LLM_MODEL: &str = "gpt-5.3-codex";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SalesProfile {
@@ -163,10 +175,18 @@ struct DomainCandidate {
     matched_keywords: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct OnboardingBriefState {
+    brief: Option<String>,
+    updated_at: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SalesLeadQuery {
     #[serde(default)]
     pub limit: Option<usize>,
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -255,6 +275,12 @@ impl SalesEngine {
                 sent_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS sales_onboarding (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                brief_text TEXT,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_approvals_status_created ON approvals(status, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_leads_created ON leads(created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_deliveries_sent ON deliveries(sent_at DESC);
@@ -290,6 +316,89 @@ impl SalesEngine {
         )
         .map_err(|e| format!("Failed to save profile: {e}"))?;
         Ok(())
+    }
+
+    pub fn set_onboarding_brief(&self, brief: &str) -> Result<(), String> {
+        let conn = self.open()?;
+        conn.execute(
+            "INSERT INTO sales_onboarding (id, brief_text, updated_at) VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET brief_text=excluded.brief_text, updated_at=excluded.updated_at",
+            params![brief, Utc::now().to_rfc3339()],
+        )
+        .map_err(|e| format!("Failed to save onboarding brief: {e}"))?;
+        Ok(())
+    }
+
+    fn get_onboarding_brief_state(&self) -> Result<OnboardingBriefState, String> {
+        let conn = self.open()?;
+        let mut stmt = conn
+            .prepare("SELECT brief_text, updated_at FROM sales_onboarding WHERE id = 1")
+            .map_err(|e| format!("Onboarding brief query prepare failed: {e}"))?;
+        let row = stmt
+            .query_row([], |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                ))
+            })
+            .optional()
+            .map_err(|e| format!("Onboarding brief query failed: {e}"))?;
+        let Some((brief, updated_at)) = row else {
+            return Ok(OnboardingBriefState::default());
+        };
+        let brief = brief.and_then(|v| {
+            let t = v.trim().to_string();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t)
+            }
+        });
+        let updated_at = updated_at.and_then(|v| {
+            let t = v.trim().to_string();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t)
+            }
+        });
+        Ok(OnboardingBriefState { brief, updated_at })
+    }
+
+    pub fn get_onboarding_brief(&self) -> Result<Option<String>, String> {
+        self.get_onboarding_brief_state().map(|s| s.brief)
+    }
+
+    pub fn latest_successful_run_id_since(
+        &self,
+        since: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let conn = self.open()?;
+        let (sql, with_since) = if since.is_some() {
+            (
+                "SELECT id FROM sales_runs WHERE status = 'completed' AND inserted > 0 AND started_at >= ? ORDER BY completed_at DESC LIMIT 1",
+                true,
+            )
+        } else {
+            (
+                "SELECT id FROM sales_runs WHERE status = 'completed' AND inserted > 0 ORDER BY completed_at DESC LIMIT 1",
+                false,
+            )
+        };
+        if with_since {
+            conn.query_row(sql, params![since.unwrap_or_default()], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()
+            .map_err(|e| format!("Latest successful run query failed: {e}"))
+        } else {
+            conn.query_row(sql, [], |r| r.get::<_, String>(0))
+                .optional()
+                .map_err(|e| format!("Latest successful run query failed: {e}"))
+        }
+    }
+
+    pub fn latest_successful_run_id(&self) -> Result<Option<String>, String> {
+        self.latest_successful_run_id_since(None)
     }
 
     fn begin_run(&self) -> Result<String, String> {
@@ -435,18 +544,28 @@ impl SalesEngine {
         Ok(out)
     }
 
-    pub fn list_leads(&self, limit: usize) -> Result<Vec<SalesLead>, String> {
+    pub fn list_leads(&self, limit: usize, run_id: Option<&str>) -> Result<Vec<SalesLead>, String> {
         let conn = self.open()?;
+        let sql_with_run = "SELECT id, run_id, company, website, company_domain, contact_name, contact_title, linkedin_url, email, phone, reasons_json, email_subject, email_body, linkedin_message, score, status, created_at
+                 FROM leads WHERE run_id = ? ORDER BY created_at DESC LIMIT ?";
+        let sql_all = "SELECT id, run_id, company, website, company_domain, contact_name, contact_title, linkedin_url, email, phone, reasons_json, email_subject, email_body, linkedin_message, score, status, created_at
+                 FROM leads ORDER BY created_at DESC LIMIT ?";
+
         let mut stmt = conn
-            .prepare(
-                "SELECT id, run_id, company, website, company_domain, contact_name, contact_title, linkedin_url, email, phone, reasons_json, email_subject, email_body, linkedin_message, score, status, created_at
-                 FROM leads ORDER BY created_at DESC LIMIT ?",
-            )
+            .prepare(if run_id.is_some() {
+                sql_with_run
+            } else {
+                sql_all
+            })
             .map_err(|e| format!("Prepare list leads failed: {e}"))?;
 
-        let mut rows = stmt
-            .query(params![limit as i64])
-            .map_err(|e| format!("List leads query failed: {e}"))?;
+        let mut rows = if let Some(rid) = run_id {
+            stmt.query(params![rid, limit as i64])
+                .map_err(|e| format!("List leads query failed: {e}"))?
+        } else {
+            stmt.query(params![limit as i64])
+                .map_err(|e| format!("List leads query failed: {e}"))?
+        };
 
         let mut out = Vec::new();
         while let Some(r) = rows
@@ -814,6 +933,18 @@ impl SalesEngine {
         Ok(count > 0)
     }
 
+    fn completed_runs_count(&self) -> Result<u32, String> {
+        let conn = self.open()?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sales_runs WHERE status = 'completed'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("Completed-runs count failed: {e}"))?;
+        Ok(count.max(0) as u32)
+    }
+
     pub async fn run_generation(
         &self,
         kernel: &openfang_kernel::OpenFangKernel,
@@ -830,15 +961,26 @@ impl SalesEngine {
             return Err("Sales profile is incomplete: product_name/product_description/target_industry are required".to_string());
         }
 
+        let run_sequence = self.completed_runs_count()? as usize;
         let run_id = self.begin_run()?;
         let started_at = Utc::now().to_rfc3339();
+        let mut llm_fallback_attempted = false;
 
         let max_candidates = (profile.daily_target as usize).saturating_mul(4).max(30);
-        let lead_plan = match llm_build_lead_query_plan(kernel, &profile).await {
-            Ok(plan) if !plan.discovery_queries.is_empty() => plan,
-            Ok(_) => heuristic_lead_query_plan(&profile),
-            Err(e) => {
+        let lead_plan = match tokio::time::timeout(
+            Duration::from_secs(LEAD_QUERY_PLAN_TIMEOUT_SECS),
+            llm_build_lead_query_plan(kernel, &profile),
+        )
+        .await
+        {
+            Ok(Ok(plan)) if !plan.discovery_queries.is_empty() => plan,
+            Ok(Ok(_)) => heuristic_lead_query_plan(&profile),
+            Ok(Err(e)) => {
                 warn!(error = %e, "Lead query planner failed, using heuristic plan");
+                heuristic_lead_query_plan(&profile)
+            }
+            Err(_) => {
+                warn!("Lead query planner timed out, using heuristic plan");
                 heuristic_lead_query_plan(&profile)
             }
         };
@@ -850,6 +992,28 @@ impl SalesEngine {
 
         let cache = Arc::new(WebCache::new(Duration::from_secs(900)));
         let search_engine = WebSearchEngine::new(kernel.config.web.clone(), cache);
+        let brave_search_engine = {
+            let brave_env = kernel.config.web.brave.api_key_env.clone();
+            let has_brave_key = std::env::var(&brave_env)
+                .ok()
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false);
+            if has_brave_key && kernel.config.web.search_provider != SearchProvider::Brave {
+                let mut brave_cfg = kernel.config.web.clone();
+                brave_cfg.search_provider = SearchProvider::Brave;
+                Some(WebSearchEngine::new(
+                    brave_cfg,
+                    Arc::new(WebCache::new(Duration::from_secs(900))),
+                ))
+            } else {
+                None
+            }
+        };
+        let discovery_fail_fast_threshold = if brave_search_engine.is_some() {
+            MAX_DISCOVERY_FAILURES_BEFORE_FAST_FALLBACK
+        } else {
+            NO_BRAVE_FAIL_FAST_THRESHOLD
+        };
         let is_field_ops = profile_targets_field_ops(&profile);
         let strict_min_score = if is_field_ops {
             MIN_DOMAIN_RELEVANCE_SCORE + 8
@@ -859,9 +1023,12 @@ impl SalesEngine {
 
         let mut domains = Vec::new();
         let mut candidates: HashMap<String, DomainCandidate> = HashMap::new();
-        for q in &queries {
+        let mut discovery_successes = 0u32;
+        let mut discovery_failures = 0u32;
+        for q in queries.iter().take(MAX_DISCOVERY_QUERIES) {
             match search_engine.search(q, max_candidates).await {
                 Ok(out) => {
+                    discovery_successes += 1;
                     collect_domains_from_search(&out, &mut domains);
                     collect_domain_candidates_from_search(
                         &out,
@@ -870,7 +1037,15 @@ impl SalesEngine {
                         &lead_plan.exclude_keywords,
                     );
                 }
-                Err(e) => warn!(query = %q, error = %e, "Sales search query failed"),
+                Err(e) => {
+                    discovery_failures += 1;
+                    warn!(query = %q, error = %e, "Sales search query failed");
+                    if discovery_successes == 0
+                        && discovery_failures >= discovery_fail_fast_threshold
+                    {
+                        break;
+                    }
+                }
             }
         }
 
@@ -886,53 +1061,146 @@ impl SalesEngine {
         }
 
         let mut candidate_list: Vec<DomainCandidate> = candidates.into_values().collect();
+        let mut search_unavailable =
+            discovery_successes == 0 && discovery_failures >= discovery_fail_fast_threshold;
 
         if candidate_list.is_empty() {
-            let fallback_queries = vec![
-                format!(
-                    "{} companies {}",
-                    profile.target_industry, profile.target_geo
-                ),
-                format!(
-                    "{} operations companies {}",
-                    profile.target_industry, profile.target_geo
-                ),
-                format!("B2B companies {} operations teams", profile.target_geo),
-                format!("field service companies {}", profile.target_geo),
-            ];
-            let mut fallback_domains = Vec::<String>::new();
-            for q in fallback_queries {
-                match search_engine.search(&q, 20).await {
-                    Ok(out) => collect_domains_from_search(&out, &mut fallback_domains),
-                    Err(e) => warn!(query = %q, error = %e, "Fallback sales query failed"),
+            if !search_unavailable {
+                let fallback_queries = vec![
+                    format!(
+                        "{} companies {}",
+                        profile.target_industry, profile.target_geo
+                    ),
+                    format!(
+                        "{} operations companies {}",
+                        profile.target_industry, profile.target_geo
+                    ),
+                    format!("B2B companies {} operations teams", profile.target_geo),
+                    format!("field service companies {}", profile.target_geo),
+                ];
+                let mut fallback_domains = Vec::<String>::new();
+                for q in fallback_queries {
+                    match search_engine.search(&q, 20).await {
+                        Ok(out) => {
+                            discovery_successes += 1;
+                            collect_domains_from_search(&out, &mut fallback_domains)
+                        }
+                        Err(e) => {
+                            discovery_failures += 1;
+                            warn!(query = %q, error = %e, "Fallback sales query failed");
+                            if discovery_successes == 0
+                                && discovery_failures >= discovery_fail_fast_threshold
+                            {
+                                break;
+                            }
+                        }
+                    }
                 }
-            }
-            let mut seen = HashSet::<String>::new();
-            for domain in fallback_domains {
-                if is_blocked_company_domain(&domain) || !seen.insert(domain.clone()) {
-                    continue;
+                search_unavailable =
+                    discovery_successes == 0 && discovery_failures >= discovery_fail_fast_threshold;
+                let mut seen = HashSet::<String>::new();
+                for domain in fallback_domains {
+                    if is_blocked_company_domain(&domain) || !seen.insert(domain.clone()) {
+                        continue;
+                    }
+                    candidate_list.push(DomainCandidate {
+                        domain: domain.clone(),
+                        score: MIN_DOMAIN_RELEVANCE_SCORE,
+                        evidence: vec![format!(
+                            "Discovered via fallback query for {}",
+                            profile.target_industry
+                        )],
+                        matched_keywords: vec![profile.target_industry.clone()],
+                    });
                 }
-                candidate_list.push(DomainCandidate {
-                    domain: domain.clone(),
-                    score: MIN_DOMAIN_RELEVANCE_SCORE,
-                    evidence: vec![format!(
-                        "Discovered via fallback query for {}",
-                        profile.target_industry
-                    )],
-                    matched_keywords: vec![profile.target_industry.clone()],
-                });
             }
 
-            if candidate_list.is_empty() {
-                match llm_generate_company_candidates(
-                    kernel,
-                    &profile,
-                    profile.daily_target as usize,
+            if candidate_list.is_empty() && search_unavailable {
+                if let Some(brave_engine) = brave_search_engine.as_ref() {
+                    let mut brave_domains = Vec::<String>::new();
+                    let mut brave_candidates = HashMap::<String, DomainCandidate>::new();
+                    let mut brave_successes = 0u32;
+
+                    for q in queries.iter().take(MAX_DISCOVERY_QUERIES) {
+                        match brave_engine.search(q, max_candidates).await {
+                            Ok(out) => {
+                                brave_successes += 1;
+                                collect_domains_from_search(&out, &mut brave_domains);
+                                collect_domain_candidates_from_search(
+                                    &out,
+                                    &mut brave_candidates,
+                                    &lead_plan.must_include_keywords,
+                                    &lead_plan.exclude_keywords,
+                                );
+                            }
+                            Err(e) => {
+                                warn!(query = %q, error = %e, "Brave rescue query failed");
+                            }
+                        }
+                    }
+
+                    if brave_successes > 0 {
+                        for domain in brave_domains {
+                            if is_blocked_company_domain(&domain) {
+                                continue;
+                            }
+                            let entry = brave_candidates.entry(domain.clone()).or_default();
+                            if entry.domain.is_empty() {
+                                entry.domain = domain.clone();
+                            }
+                            entry.score = entry.score.max(1);
+                        }
+                        candidate_list.extend(brave_candidates.into_values());
+                        candidate_list = dedupe_domain_candidates(candidate_list);
+                        discovery_successes += brave_successes;
+                        search_unavailable = false;
+                        info!("Primary web discovery failed; recovered via Brave rescue search");
+                    }
+                }
+            }
+
+            if candidate_list.is_empty() && !search_unavailable {
+                llm_fallback_attempted = true;
+                match tokio::time::timeout(
+                    Duration::from_secs(4),
+                    llm_generate_company_candidates(
+                        kernel,
+                        &profile,
+                        profile.daily_target as usize,
+                    ),
                 )
                 .await
                 {
-                    Ok(mut llm_candidates) => candidate_list.append(&mut llm_candidates),
-                    Err(e) => warn!(error = %e, "LLM company fallback generation failed"),
+                    Ok(Ok(mut llm_candidates)) => candidate_list.append(&mut llm_candidates),
+                    Ok(Err(e)) => warn!(error = %e, "LLM company fallback generation failed"),
+                    Err(_) => warn!("LLM company fallback generation timed out"),
+                }
+            }
+
+            if candidate_list.is_empty() {
+                let mut matched_keywords = vec![profile.target_industry.clone()];
+                if is_field_ops {
+                    matched_keywords.push("on-site teams".to_string());
+                    matched_keywords.push("field service".to_string());
+                }
+                let fallback_reason = if search_unavailable {
+                    format!(
+                        "Deterministic fallback while web search is unavailable for {}",
+                        profile.target_industry
+                    )
+                } else {
+                    format!(
+                        "Deterministic fallback after filtering low-signal web results for {}",
+                        profile.target_industry
+                    )
+                };
+                for domain in deterministic_seed_domains_for_profile(&profile, run_sequence) {
+                    candidate_list.push(DomainCandidate {
+                        domain: domain.clone(),
+                        score: strict_min_score,
+                        evidence: vec![fallback_reason.clone()],
+                        matched_keywords: dedupe_strings(matched_keywords.clone()),
+                    });
                 }
             }
         }
@@ -952,15 +1220,40 @@ impl SalesEngine {
                 .collect();
         }
 
-        if candidate_list.len() < (profile.daily_target as usize / 2).max(5) {
-            match llm_generate_company_candidates(
-                kernel,
-                &profile,
-                (profile.daily_target as usize).max(12),
+        if candidate_list.is_empty() {
+            let mut matched_keywords = vec![profile.target_industry.clone()];
+            if is_field_ops {
+                matched_keywords.push("on-site teams".to_string());
+                matched_keywords.push("field service".to_string());
+            }
+            for domain in deterministic_seed_domains_for_profile(&profile, run_sequence) {
+                candidate_list.push(DomainCandidate {
+                    domain: domain.clone(),
+                    score: strict_min_score,
+                    evidence: vec![format!(
+                        "Deterministic fallback after post-filter candidate exhaustion for {}",
+                        profile.target_industry
+                    )],
+                    matched_keywords: dedupe_strings(matched_keywords.clone()),
+                });
+            }
+        }
+
+        if !llm_fallback_attempted
+            && discovery_successes == 0
+            && candidate_list.len() < (profile.daily_target as usize / 2).max(5)
+        {
+            match tokio::time::timeout(
+                Duration::from_secs(4),
+                llm_generate_company_candidates(
+                    kernel,
+                    &profile,
+                    (profile.daily_target as usize).max(12),
+                ),
             )
             .await
             {
-                Ok(llm_candidates) => {
+                Ok(Ok(llm_candidates)) => {
                     let mut seen = candidate_list
                         .iter()
                         .map(|c| c.domain.clone())
@@ -976,15 +1269,63 @@ impl SalesEngine {
                         }
                     }
                 }
-                Err(e) => warn!(error = %e, "LLM company augmentation failed"),
+                Ok(Err(e)) => warn!(error = %e, "LLM company augmentation failed"),
+                Err(_) => warn!("LLM company augmentation timed out"),
             }
         }
 
         candidate_list.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.domain.cmp(&b.domain)));
 
+        if candidate_list.len() < max_candidates {
+            let mut seen = candidate_list
+                .iter()
+                .map(|c| c.domain.clone())
+                .collect::<HashSet<_>>();
+            let mut matched_keywords = vec![profile.target_industry.clone()];
+            if is_field_ops {
+                matched_keywords.push("on-site teams".to_string());
+                matched_keywords.push("field service".to_string());
+            }
+            for domain in deterministic_seed_domains_for_profile(&profile, run_sequence) {
+                if !seen.insert(domain.clone()) {
+                    continue;
+                }
+                candidate_list.push(DomainCandidate {
+                    domain: domain.clone(),
+                    score: strict_min_score,
+                    evidence: vec![format!(
+                        "Deterministic supplementation to keep lead pipeline full for {}",
+                        profile.target_industry
+                    )],
+                    matched_keywords: dedupe_strings(matched_keywords.clone()),
+                });
+                if candidate_list.len() >= max_candidates {
+                    break;
+                }
+            }
+        }
+
+        if candidate_list.is_empty() && discovery_successes == 0 {
+            let err_msg = format!(
+                "Lead discovery failed: all web discovery queries failed ({} errors). Check network/search provider and retry.",
+                discovery_failures
+            );
+            self.finish_run(&run_id, "failed", 0, 0, 0, Some(&err_msg))?;
+            return Err(err_msg);
+        }
+
         let mut discovered = 0u32;
         let mut inserted = 0u32;
         let mut approvals_queued = 0u32;
+        let site_client = reqwest::Client::builder()
+            .user_agent("OpenFangSalesBot/1.0 (+https://openfang.ai)")
+            .timeout(Duration::from_millis(DIRECT_ENRICH_TIMEOUT_MS))
+            .redirect(reqwest::redirect::Policy::limited(4))
+            .build()
+            .ok();
+        let max_direct_enrich_attempts =
+            (profile.daily_target as usize).clamp(MAX_DIRECT_ENRICH_ATTEMPTS, 40);
+        let mut direct_enrich_attempts = 0usize;
 
         for candidate in candidate_list.iter().take(max_candidates) {
             if inserted >= profile.daily_target {
@@ -999,40 +1340,258 @@ impl SalesEngine {
             let domain = &candidate.domain;
             let company = domain_to_company(domain);
 
-            let contact_query = if profile.target_title_policy == "ceo_only" {
-                format!(
-                    "site:linkedin.com/in {} {} CEO \"{}\"",
-                    company, domain, profile.target_geo
-                )
-            } else {
-                let title_hints = if lead_plan.contact_titles.is_empty() {
-                    "CEO founder owner managing director".to_string()
+            let (mut contact_name, mut contact_title, mut linkedin_url, mut email) =
+                if search_unavailable {
+                    let default_title = if profile.target_title_policy == "ceo_only" {
+                        Some("CEO".to_string())
+                    } else {
+                        Some("CEO/Founder".to_string())
+                    };
+                    (None, default_title, None, None)
                 } else {
-                    lead_plan.contact_titles.join(" ")
+                    let primary_contact_query = if profile.target_title_policy == "ceo_only" {
+                        format!(
+                            "site:linkedin.com/in \"{}\" (CEO OR \"Chief Executive Officer\")",
+                            company
+                        )
+                    } else {
+                        format!(
+                            "site:linkedin.com/in \"{}\" (CEO OR Founder OR COO OR \"Head of Operations\")",
+                            company
+                        )
+                    };
+
+                    let domain_contact_query = if profile.target_title_policy == "ceo_only" {
+                        format!(
+                            "site:{} (\"Chief Executive Officer\" OR CEO) (leadership OR management OR executive team)",
+                            domain
+                        )
+                    } else {
+                        format!(
+                            "site:{} (\"Chief Executive Officer\" OR CEO OR Founder OR COO OR \"Head of Operations\") (leadership OR management OR executive team)",
+                            domain
+                        )
+                    };
+
+                    let secondary_contact_query = if profile.target_title_policy == "ceo_only" {
+                        format!(
+                            "\"{}\" \"{}\" (\"Chief Executive Officer\" OR CEO) (LinkedIn OR leadership OR executive team)",
+                            company, domain
+                        )
+                    } else {
+                        format!(
+                            "\"{}\" \"{}\" (CEO OR Founder OR COO OR \"Head of Operations\") (LinkedIn OR leadership OR executive team)",
+                            company, domain
+                        )
+                    };
+
+                    let contact_queries = dedupe_strings(vec![
+                        primary_contact_query,
+                        domain_contact_query,
+                        secondary_contact_query,
+                    ]);
+
+                    let mut contact_outputs = Vec::<String>::new();
+                    for query in contact_queries {
+                        if let Ok(out) = search_engine.search(&query, 6).await {
+                            if !out.trim().is_empty() {
+                                contact_outputs.push(out);
+                                let merged = contact_outputs.join("\n");
+                                let (found_name, found_title, found_linkedin) =
+                                    extract_contact_from_search(
+                                        &merged,
+                                        profile.target_title_policy.as_str(),
+                                    );
+                                if found_name.is_some()
+                                    && (found_linkedin.is_some() || found_title.is_some())
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let contact_res = contact_outputs.join("\n");
+
+                    let (mut contact_name, mut contact_title, mut linkedin_url) =
+                        extract_contact_from_search(
+                            &contact_res,
+                            profile.target_title_policy.as_str(),
+                        );
+                    let (entry_name, entry_title, entry_linkedin, entry_email) =
+                        extract_contact_from_search_for_company(
+                            &contact_res,
+                            profile.target_title_policy.as_str(),
+                            &company,
+                            domain,
+                        );
+                    if contact_name.is_none() {
+                        contact_name = entry_name;
+                    }
+                    if contact_title.is_none() {
+                        contact_title = entry_title;
+                    }
+                    if linkedin_url.is_none() {
+                        linkedin_url = entry_linkedin;
+                    }
+                    if contact_name.is_none() {
+                        contact_name = linkedin_url
+                            .as_deref()
+                            .and_then(extract_name_from_linkedin_url);
+                    }
+                    let mut email = normalize_contact_email_for_domain(
+                        extract_email_from_text(&contact_res).or(entry_email),
+                        domain,
+                    )
+                    .or_else(|| guessed_email(contact_name.as_deref(), domain));
+
+                    if contact_name.is_none() || linkedin_url.is_none() || email.is_none() {
+                        let fallback_contact_query = format!(
+                            "\"{}\" \"{}\" {} (CEO OR \"Chief Executive Officer\" OR Founder OR COO OR \"Head of Operations\") (LinkedIn OR Wikipedia OR leadership OR executive team OR email)",
+                            company, domain, profile.target_geo
+                        );
+                        let fallback_contact_res = search_engine
+                            .search(&fallback_contact_query, 10)
+                            .await
+                            .unwrap_or_default();
+                        let (fallback_name, fallback_title, fallback_linkedin) =
+                            extract_contact_from_search(
+                                &fallback_contact_res,
+                                profile.target_title_policy.as_str(),
+                            );
+                        let (
+                            fallback_entry_name,
+                            fallback_entry_title,
+                            fallback_entry_linkedin,
+                            fallback_entry_email,
+                        ) = extract_contact_from_search_for_company(
+                            &fallback_contact_res,
+                            profile.target_title_policy.as_str(),
+                            &company,
+                            domain,
+                        );
+                        if contact_name.is_none() {
+                            contact_name = fallback_name;
+                        }
+                        if contact_name.is_none() {
+                            contact_name = fallback_entry_name;
+                        }
+                        if contact_title.is_none() {
+                            contact_title = fallback_title;
+                        }
+                        if contact_title.is_none() {
+                            contact_title = fallback_entry_title;
+                        }
+                        if linkedin_url.is_none() {
+                            linkedin_url = fallback_linkedin;
+                        }
+                        if linkedin_url.is_none() {
+                            linkedin_url = fallback_entry_linkedin;
+                        }
+                        if contact_name.is_none() {
+                            contact_name = linkedin_url
+                                .as_deref()
+                                .and_then(extract_name_from_linkedin_url);
+                        }
+                        if email.is_none() {
+                            email = normalize_contact_email_for_domain(
+                                extract_email_from_text(&fallback_contact_res)
+                                    .or(fallback_entry_email),
+                                domain,
+                            )
+                            .or_else(|| guessed_email(contact_name.as_deref(), domain));
+                        }
+                    }
+                    if linkedin_url.is_none() {
+                        let company_linkedin_query =
+                            format!("site:linkedin.com/company \"{}\" \"{}\"", company, domain);
+                        if let Ok(company_linkedin_res) =
+                            search_engine.search(&company_linkedin_query, 6).await
+                        {
+                            linkedin_url =
+                                extract_company_linkedin_from_text(&company_linkedin_res);
+                        }
+                    }
+                    (contact_name, contact_title, linkedin_url, email)
                 };
-                format!(
-                    "site:linkedin.com/in {} {} {} \"{}\"",
-                    company, domain, title_hints, profile.target_geo
-                )
-            };
+            let mut site_evidence: Option<String> = None;
+            let needs_enrichment =
+                contact_name.is_none() || linkedin_url.is_none() || email.is_none();
+            if needs_enrichment
+                && direct_enrich_attempts < max_direct_enrich_attempts
+                && site_client.is_some()
+            {
+                direct_enrich_attempts += 1;
+                if let Some(client) = site_client.as_ref() {
+                    if let Ok(pages) = tokio::time::timeout(
+                        Duration::from_millis(DIRECT_ENRICH_TIMEOUT_MS + 400),
+                        fetch_company_site_html_pages(client, domain),
+                    )
+                    .await
+                    {
+                        let mut best_page_signal = 0u8;
+                        let mut best_site_name = None;
+                        let mut best_site_title = None;
+                        let mut best_site_linkedin = None;
+                        let mut best_site_email = None;
+                        let mut best_site_evidence = None;
 
-            let contact_res = search_engine
-                .search(&contact_query, 8)
-                .await
-                .unwrap_or_default();
+                        for html in pages {
+                            let (s_name, s_title, s_linkedin, s_email, s_evidence) =
+                                extract_contact_from_company_site_html(
+                                    &html,
+                                    profile.target_title_policy.as_str(),
+                                );
+                            let signal = (s_name.is_some() as u8)
+                                + (s_linkedin.is_some() as u8)
+                                + (s_email.is_some() as u8)
+                                + (s_evidence.is_some() as u8);
+                            if signal > best_page_signal {
+                                best_page_signal = signal;
+                                best_site_name = s_name;
+                                best_site_title = s_title;
+                                best_site_linkedin = s_linkedin;
+                                best_site_email = s_email;
+                                best_site_evidence = s_evidence;
+                            }
+                            if best_page_signal >= 3 {
+                                break;
+                            }
+                        }
 
-            let (contact_name, contact_title, linkedin_url) =
-                extract_contact_from_search(&contact_res, profile.target_title_policy.as_str());
+                        if contact_name.is_none() {
+                            contact_name = best_site_name;
+                        }
+                        if contact_title.is_none() {
+                            contact_title = best_site_title;
+                        }
+                        if linkedin_url.is_none() {
+                            linkedin_url = best_site_linkedin;
+                        }
+                        if email.is_none() {
+                            email = normalize_contact_email_for_domain(best_site_email, domain)
+                                .or_else(|| guessed_email(contact_name.as_deref(), domain));
+                        }
+                        site_evidence = best_site_evidence;
+                    }
+                }
+            }
 
-            let email = guessed_email(contact_name.as_deref(), domain);
-            let score = (lead_score(&linkedin_url, &email) + candidate.score).min(100);
+            contact_name = contact_name.and_then(|n| normalize_person_name(&n));
+            email = normalize_contact_email_for_domain(email, domain);
 
-            let evidence = candidate.evidence.first().cloned().unwrap_or_else(|| {
-                format!(
-                    "{} appears in search results for {}",
-                    company, profile.target_industry
-                )
-            });
+            let mut score = (lead_score(&linkedin_url, &email) + candidate.score).min(100);
+            if is_field_ops && site_evidence.is_some() {
+                score = (score + 4).min(100);
+            }
+
+            let evidence = site_evidence
+                .or_else(|| candidate.evidence.first().cloned())
+                .unwrap_or_else(|| {
+                    format!(
+                        "{} appears in search results for {}",
+                        company, profile.target_industry
+                    )
+                });
             let matched = if candidate.matched_keywords.is_empty() {
                 profile.target_industry.clone()
             } else {
@@ -1097,7 +1656,7 @@ impl SalesEngine {
                 company,
                 website: format!("https://{}", domain),
                 company_domain: domain.clone(),
-                contact_name: contact_name.unwrap_or_else(|| "Unknown".to_string()),
+                contact_name: contact_name.unwrap_or_else(|| "Leadership Team".to_string()),
                 contact_title: contact_title.unwrap_or_else(|| {
                     if profile.target_title_policy == "ceo_only" {
                         "CEO".to_string()
@@ -1209,9 +1768,31 @@ fn is_blocked_company_domain(domain: &str) -> bool {
         "wsj.com",
         "techcrunch.com",
         "crunchbase.com",
+        "mordorintelligence.com",
+        "techsciresearch.com",
+        "researchandmarkets.com",
+        "grandviewresearch.com",
+        "gminsights.com",
+        "marketsandmarkets.com",
+        "fortunebusinessinsights.com",
+        "statista.com",
+        "expertmarketresearch.com",
         "g2.com",
         "capterra.com",
         "producthunt.com",
+        "definitions.net",
+        "merriam-webster.com",
+        "cambridge.org",
+        "dictionary.com",
+        "thefreedictionary.com",
+        "vocabulary.com",
+        "wiktionary.org",
+        "constructiondive.com",
+        "finance.yahoo.com",
+        "marketbeat.com",
+        "barchart.com",
+        "ptt.cc",
+        "zhihu.com",
         "angel.co",
         "wellfound.com",
         "ycombinator.com",
@@ -1223,9 +1804,18 @@ fn is_blocked_company_domain(domain: &str) -> bool {
         "yahoo.com",
     ];
 
-    BLOCKED
+    let static_blocked = BLOCKED
         .iter()
-        .any(|blocked| domain == *blocked || domain.ends_with(&format!(".{blocked}")))
+        .any(|blocked| domain == *blocked || domain.ends_with(&format!(".{blocked}")));
+    if static_blocked {
+        return true;
+    }
+
+    domain.starts_with("blog.")
+        || domain.contains("dictionary")
+        || domain.contains("definitions")
+        || domain.contains("wiktionary")
+        || domain.contains("marketresearch")
 }
 
 fn parse_search_entries(search_output: &str) -> Vec<SearchEntry> {
@@ -1416,6 +2006,25 @@ fn collect_domain_candidates_from_search(
     }
 }
 
+fn dedupe_domain_candidates(items: Vec<DomainCandidate>) -> Vec<DomainCandidate> {
+    let mut map = HashMap::<String, DomainCandidate>::new();
+    for item in items {
+        let key = item.domain.to_lowercase();
+        let entry = map.entry(key).or_default();
+        if entry.domain.is_empty() {
+            entry.domain = item.domain.clone();
+        }
+        entry.score = entry.score.max(item.score);
+        entry.evidence.extend(item.evidence);
+        if entry.evidence.len() > 6 {
+            entry.evidence.truncate(6);
+        }
+        entry.matched_keywords.extend(item.matched_keywords);
+        entry.matched_keywords = dedupe_strings(entry.matched_keywords.clone());
+    }
+    map.into_values().collect()
+}
+
 fn truncate_cleaned_text(text: &str, max_chars: usize) -> String {
     let clean = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if clean.is_empty() || max_chars == 0 {
@@ -1460,66 +2069,927 @@ fn extract_contact_from_search(
     search_output: &str,
     title_policy: &str,
 ) -> (Option<String>, Option<String>, Option<String>) {
-    let mut linkedin_url = None;
-    let li_re =
-        regex_lite::Regex::new(r"https?://[^\s\)]+linkedin\.com/(?:in|company)/[^\s\)]+").unwrap();
-    if let Some(m) = li_re.find(search_output) {
-        linkedin_url = Some(m.as_str().trim_end_matches([')', ',']).to_string());
-    }
+    let filtered_output = search_output
+        .lines()
+        .filter(|line| {
+            let lower = line.trim().to_lowercase();
+            !lower.starts_with("search results for")
+                && !lower.starts_with("[external content:")
+                && !lower.starts_with("title:")
+                && !lower.starts_with("url source:")
+                && !lower.starts_with("markdown content:")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
-    let ceo_re = regex_lite::Regex::new(
-        r"(?im)^\s*\d+\.\s*([^\-|\n]+?)\s*[-|]\s*(CEO|Chief Executive Officer|Founder|Co[- ]Founder)",
+    let personal_linkedin_url = extract_personal_linkedin_from_text(&filtered_output);
+    let company_linkedin_url = extract_company_linkedin_from_text(&filtered_output);
+    let linkedin_url = personal_linkedin_url
+        .clone()
+        .or_else(|| company_linkedin_url.clone());
+
+    let ranked_re = regex_lite::Regex::new(
+        r"(?im)^\s*\d+\.\s*([A-ZÀ-ÖØ-ÞİĞŞÇÜÖÂÊÎÔÛ][A-Za-zÀ-ÖØ-öø-ÿİıĞğŞşÇçÜüÖöÂâÊêÎîÔôÛû\.'\-]*(?:\s+[A-ZÀ-ÖØ-ÞİĞŞÇÜÖÂÊÎÔÛ][A-Za-zÀ-ÖØ-öø-ÿİıĞğŞşÇçÜüÖöÂâÊêÎîÔôÛû\.'\-]*){1,4})\s*[-|]\s*(CEO|Chief Executive Officer|Founder|Co[- ]Founder|Managing Director|COO|Chief Operating Officer|Head of Operations|Operations Director)",
     )
     .unwrap();
-
-    if let Some(cap) = ceo_re.captures(search_output) {
-        let name = cap.get(1).map(|m| m.as_str().trim().to_string());
-        let title = cap.get(2).map(|m| m.as_str().trim().to_string());
-
-        if title_policy == "ceo_only" {
-            if let Some(t) = &title {
-                if !t.to_lowercase().contains("ceo") && !t.to_lowercase().contains("chief") {
-                    return (None, Some("CEO".to_string()), linkedin_url);
-                }
-            }
+    if let Some(cap) = ranked_re.captures(&filtered_output) {
+        let name = cap
+            .get(1)
+            .and_then(|m| normalize_person_name(m.as_str().trim()));
+        let title = cap
+            .get(2)
+            .map(|m| normalize_contact_title(m.as_str()))
+            .or_else(|| default_contact_title(title_policy));
+        if title
+            .as_deref()
+            .map(|t| title_allowed_for_policy(title_policy, t))
+            .unwrap_or(false)
+        {
+            return (name, title, linkedin_url.clone());
         }
-
-        return (name, title, linkedin_url);
     }
 
-    let li_title_re = regex_lite::Regex::new(
-        r"(?im)([A-Z][A-Za-z\.'\-]+(?:\s+[A-Z][A-Za-z\.'\-]+){1,3})\s*[-|,]\s*(CEO|Chief Executive Officer|Founder|Co[- ]Founder|Owner|Managing Director|COO|Head of Operations|Operations Director)",
+    let comma_name_title_re = regex_lite::Regex::new(
+        r"(?is)\b([A-ZÀ-ÖØ-ÞİĞŞÇÜÖÂÊÎÔÛ][A-Za-zÀ-ÖØ-öø-ÿİıĞğŞşÇçÜüÖöÂâÊêÎîÔôÛû\.'\-]*(?:\s+[A-ZÀ-ÖØ-ÞİĞŞÇÜÖÂÊÎÔÛ][A-Za-zÀ-ÖØ-öø-ÿİıĞğŞşÇçÜüÖöÂâÊêÎîÔôÛû\.'\-]*){1,4})\b\s*,\s*(?:President and )?(CEO|Chief Executive Officer|Founder|Co[- ]Founder|Managing Director|COO|Chief Operating Officer|Head of Operations|Operations Director)\b",
     )
     .unwrap();
-    if let Some(cap) = li_title_re.captures(search_output) {
-        let name = cap.get(1).map(|m| m.as_str().trim().to_string());
-        let title = cap.get(2).map(|m| m.as_str().trim().to_string());
-        if title_policy == "ceo_only" {
-            if let Some(t) = &title {
-                if !t.to_lowercase().contains("ceo") && !t.to_lowercase().contains("chief") {
-                    return (None, Some("CEO".to_string()), linkedin_url);
-                }
-            }
+    if let Some(cap) = comma_name_title_re.captures(&filtered_output) {
+        let name = cap
+            .get(1)
+            .and_then(|m| normalize_person_name(m.as_str().trim()));
+        let title = cap.get(2).map(|m| normalize_contact_title(m.as_str()));
+        if title
+            .as_deref()
+            .map(|t| title_allowed_for_policy(title_policy, t))
+            .unwrap_or(false)
+        {
+            return (name, title, linkedin_url.clone());
         }
-        return (name, title, linkedin_url);
     }
 
-    let fallback_title = if title_policy == "ceo_only" {
+    let name_then_title_re = regex_lite::Regex::new(
+        r"(?is)\b([A-ZÀ-ÖØ-ÞİĞŞÇÜÖÂÊÎÔÛ][A-Za-zÀ-ÖØ-öø-ÿİıĞğŞşÇçÜüÖöÂâÊêÎîÔôÛû\.'\-]*(?:\s+[A-ZÀ-ÖØ-ÞİĞŞÇÜÖÂÊÎÔÛ][A-Za-zÀ-ÖØ-öø-ÿİıĞğŞşÇçÜüÖöÂâÊêÎîÔôÛû\.'\-]*){1,4})\b[^\n\r]{0,120}\b(CEO|Chief Executive Officer|Founder|Co[- ]Founder|Managing Director|COO|Chief Operating Officer|Head of Operations|Operations Director)\b",
+    )
+    .unwrap();
+    if let Some(cap) = name_then_title_re.captures(&filtered_output) {
+        let name = cap
+            .get(1)
+            .and_then(|m| normalize_person_name(m.as_str().trim()));
+        let title = cap.get(2).map(|m| normalize_contact_title(m.as_str()));
+        if title
+            .as_deref()
+            .map(|t| title_allowed_for_policy(title_policy, t))
+            .unwrap_or(false)
+        {
+            return (name, title, linkedin_url.clone());
+        }
+    }
+
+    let title_then_name_re = regex_lite::Regex::new(
+        r"(?is)\b(CEO|Chief Executive Officer|Founder|Co[- ]Founder|Managing Director|COO|Chief Operating Officer|Head of Operations|Operations Director)\b[^\n\r]{0,64}\b([A-ZÀ-ÖØ-ÞİĞŞÇÜÖÂÊÎÔÛ][A-Za-zÀ-ÖØ-öø-ÿİıĞğŞşÇçÜüÖöÂâÊêÎîÔôÛû\.'\-]*(?:\s+[A-ZÀ-ÖØ-ÞİĞŞÇÜÖÂÊÎÔÛ][A-Za-zÀ-ÖØ-öø-ÿİıĞğŞşÇçÜüÖöÂâÊêÎîÔôÛû\.'\-]*){1,4})\b",
+    )
+    .unwrap();
+    if let Some(cap) = title_then_name_re.captures(&filtered_output) {
+        let title = cap.get(1).map(|m| normalize_contact_title(m.as_str()));
+        let name = cap
+            .get(2)
+            .and_then(|m| normalize_person_name(m.as_str().trim()));
+        if title
+            .as_deref()
+            .map(|t| title_allowed_for_policy(title_policy, t))
+            .unwrap_or(false)
+        {
+            return (name, title, linkedin_url.clone());
+        }
+    }
+
+    let title_punct_name_re = regex_lite::Regex::new(
+        r"(?is)\b(CEO|Chief Executive Officer|Founder|Co[- ]Founder|Managing Director|COO|Chief Operating Officer|Head of Operations|Operations Director)\b\s*[:\-–]\s*([A-ZÀ-ÖØ-ÞİĞŞÇÜÖÂÊÎÔÛ][A-Za-zÀ-ÖØ-öø-ÿİıĞğŞşÇçÜüÖöÂâÊêÎîÔôÛû\.'\-]*(?:\s+[A-ZÀ-ÖØ-ÞİĞŞÇÜÖÂÊÎÔÛ][A-Za-zÀ-ÖØ-öø-ÿİıĞğŞşÇçÜüÖöÂâÊêÎîÔôÛû\.'\-]*){1,4})\b",
+    )
+    .unwrap();
+    if let Some(cap) = title_punct_name_re.captures(&filtered_output) {
+        let title = cap.get(1).map(|m| normalize_contact_title(m.as_str()));
+        let name = cap
+            .get(2)
+            .and_then(|m| normalize_person_name(m.as_str().trim()));
+        if title
+            .as_deref()
+            .map(|t| title_allowed_for_policy(title_policy, t))
+            .unwrap_or(false)
+        {
+            return (name, title, linkedin_url.clone());
+        }
+    }
+
+    let sentence_re = regex_lite::Regex::new(
+        r"(?is)\b([A-ZÀ-ÖØ-ÞİĞŞÇÜÖÂÊÎÔÛ][A-Za-zÀ-ÖØ-öø-ÿİıĞğŞşÇçÜüÖöÂâÊêÎîÔôÛû\.'\-]*(?:\s+[A-ZÀ-ÖØ-ÞİĞŞÇÜÖÂÊÎÔÛ][A-Za-zÀ-ÖØ-öø-ÿİıĞğŞşÇçÜüÖöÂâÊêÎîÔôÛû\.'\-]*){1,4})\b[^\n\r]{0,60}\b(?:is|serves as|has served as|appointed as|was named)\b[^\n\r]{0,60}\b(CEO|Chief Executive Officer|Founder|Co[- ]Founder|Managing Director|COO|Chief Operating Officer|Head of Operations|Operations Director)\b",
+    )
+    .unwrap();
+    if let Some(cap) = sentence_re.captures(&filtered_output) {
+        let name = cap
+            .get(1)
+            .and_then(|m| normalize_person_name(m.as_str().trim()));
+        let title = cap.get(2).map(|m| normalize_contact_title(m.as_str()));
+        if title
+            .as_deref()
+            .map(|t| title_allowed_for_policy(title_policy, t))
+            .unwrap_or(false)
+        {
+            return (name, title, linkedin_url.clone());
+        }
+    }
+
+    let linkedin_name = personal_linkedin_url
+        .as_deref()
+        .and_then(extract_name_from_linkedin_url)
+        .and_then(|n| normalize_person_name(&n));
+
+    (
+        linkedin_name,
+        default_contact_title(title_policy),
+        linkedin_url,
+    )
+}
+
+fn extract_contact_from_search_for_company(
+    search_output: &str,
+    title_policy: &str,
+    company: &str,
+    domain: &str,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    let company_keys = company
+        .split_whitespace()
+        .map(|w| w.trim().to_lowercase())
+        .filter(|w| w.len() >= 3)
+        .collect::<Vec<_>>();
+    let domain_root = domain
+        .split('.')
+        .next()
+        .unwrap_or(domain)
+        .trim()
+        .to_lowercase();
+
+    let mut best_score = -1i32;
+    let mut best_name: Option<String> = None;
+    let mut best_title: Option<String> = None;
+    let mut best_linkedin: Option<String> = None;
+    let mut best_email: Option<String> = None;
+
+    for entry in parse_search_entries(search_output) {
+        let mut relevance = 0i32;
+        if let Some(entry_domain) = extract_domain(&entry.url) {
+            if entry_domain == domain {
+                relevance += 6;
+            } else if entry_domain.ends_with(&format!(".{domain}")) {
+                relevance += 3;
+            }
+        }
+        let text = format!("{} {}", entry.title, entry.snippet);
+        let lower = text.to_lowercase();
+        if !domain_root.is_empty() && lower.contains(&domain_root) {
+            relevance += 2;
+        }
+        if company_keys.iter().any(|k| lower.contains(k)) {
+            relevance += 1;
+        }
+        if relevance == 0 {
+            continue;
+        }
+
+        let single_result = format!("{}\n{}\n{}", entry.title, entry.snippet, entry.url);
+        let (name, title, mut linkedin) = extract_contact_from_search(&single_result, title_policy);
+        if linkedin.is_none() {
+            linkedin = extract_personal_linkedin_from_text(&entry.url)
+                .or_else(|| extract_company_linkedin_from_text(&entry.url));
+        }
+        let email = normalize_contact_email_for_domain(extract_email_from_text(&text), domain);
+        let score = relevance
+            + (name.is_some() as i32 * 4)
+            + (title.is_some() as i32 * 2)
+            + (linkedin.is_some() as i32 * 3)
+            + (email.is_some() as i32 * 2);
+        if score > best_score {
+            best_score = score;
+            best_name = name;
+            best_title = title;
+            best_linkedin = linkedin;
+            best_email = email;
+        }
+    }
+
+    (best_name, best_title, best_linkedin, best_email)
+}
+
+fn extract_name_from_linkedin_url(raw_url: &str) -> Option<String> {
+    let parsed = url::Url::parse(raw_url).ok()?;
+    let path = parsed.path().trim_matches('/');
+    if !path.starts_with("in/") {
+        return None;
+    }
+    let slug = path
+        .trim_start_matches("in/")
+        .split('/')
+        .next()
+        .unwrap_or("");
+    if slug.is_empty() {
+        return None;
+    }
+    let name_parts: Vec<String> = slug
+        .split('-')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .filter(|p| p.chars().all(|c| c.is_ascii_alphabetic()))
+        .take(4)
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(c) => format!("{}{}", c.to_uppercase(), chars.as_str().to_lowercase()),
+                None => String::new(),
+            }
+        })
+        .filter(|p| !p.is_empty())
+        .collect();
+    if name_parts.len() >= 2 {
+        normalize_person_name(&name_parts.join(" "))
+    } else {
+        None
+    }
+}
+
+fn title_allowed_for_policy(title_policy: &str, title: &str) -> bool {
+    if title_policy != "ceo_only" {
+        return true;
+    }
+    let t = title.to_lowercase();
+    t.contains("ceo") || t.contains("chief executive")
+}
+
+fn default_contact_title(title_policy: &str) -> Option<String> {
+    if title_policy == "ceo_only" {
         Some("CEO".to_string())
     } else {
         Some("CEO/Founder".to_string())
-    };
+    }
+}
 
-    (None, fallback_title, linkedin_url)
+fn normalize_contact_title(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn normalize_person_name(raw: &str) -> Option<String> {
+    let cleaned = raw
+        .trim_matches(|c: char| {
+            !c.is_alphanumeric() && c != '.' && c != '\'' && c != '-' && c != ' '
+        })
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    if cleaned.len() < 2 || cleaned.len() > 5 {
+        return None;
+    }
+
+    let stopwords = [
+        "and",
+        "or",
+        "the",
+        "of",
+        "to",
+        "with",
+        "without",
+        "under",
+        "over",
+        "like",
+        "no",
+        "other",
+        "team",
+        "leadership",
+        "group",
+        "company",
+        "operations",
+        "management",
+        "search",
+        "results",
+        "result",
+        "for",
+        "news",
+        "careers",
+        "career",
+        "solutions",
+        "services",
+        "technology",
+        "technologies",
+        "industry",
+        "industries",
+        "global",
+        "international",
+        "corporate",
+        "innovation",
+        "workplace",
+        "welcoming",
+        "sustainable",
+        "legacy",
+        "legacies",
+        "experience",
+        "protect",
+        "uptime",
+        "real",
+        "world",
+        "investments",
+        "mission",
+        "vision",
+        "projects",
+        "project",
+        "office",
+        "genel",
+        "mudurlugu",
+        "mudurluğu",
+        "müdürlüğü",
+        "gorevine",
+        "görevine",
+        "atanmistir",
+        "atanmıştır",
+        "olarak",
+        "gelecege",
+        "geleceğe",
+        "adimlarla",
+        "adımlarla",
+        "qatar",
+        "rwanda",
+        "saudi",
+        "arabia",
+        "senegal",
+    ];
+    let company_suffixes = [
+        "inc",
+        "corp",
+        "corporation",
+        "ltd",
+        "limited",
+        "llc",
+        "plc",
+        "as",
+        "a.s",
+        "ag",
+        "gmbh",
+        "holdings",
+        "holding",
+    ];
+    let mut out = Vec::<String>::new();
+    let mut token_freq = HashMap::<String, u8>::new();
+    for token in cleaned {
+        let t = token.trim_matches(|c: char| c == ',' || c == ';' || c == ':' || c == '|');
+        if t.is_empty() || !t.chars().any(|c| c.is_alphabetic()) {
+            return None;
+        }
+        if t.chars().count() > 18 {
+            return None;
+        }
+        let t_lower = t.to_lowercase();
+        if stopwords.contains(&t_lower.as_str()) || company_suffixes.contains(&t_lower.as_str()) {
+            return None;
+        }
+        *token_freq.entry(t_lower.clone()).or_insert(0) += 1;
+        if t.len() == 2 && t.ends_with('.') {
+            out.push(t.to_uppercase());
+            continue;
+        }
+        let mapped = if t.chars().all(|c| !c.is_alphabetic() || c.is_uppercase()) {
+            let mut chars = t.chars();
+            match chars.next() {
+                Some(c) => format!("{}{}", c.to_uppercase(), chars.as_str().to_lowercase()),
+                None => String::new(),
+            }
+        } else {
+            let mut chars = t.chars();
+            match chars.next() {
+                Some(c) if c.is_alphabetic() && c.is_lowercase() => {
+                    format!("{}{}", c.to_uppercase(), chars.as_str())
+                }
+                Some(c) => format!("{c}{}", chars.as_str()),
+                None => String::new(),
+            }
+        };
+        if mapped.is_empty() {
+            return None;
+        }
+        out.push(mapped);
+    }
+
+    if out.len() < 2 {
+        return None;
+    }
+    if out.len() >= 4 && token_freq.values().any(|count| *count > 1) {
+        return None;
+    }
+    Some(out.join(" "))
+}
+
+fn extract_email_from_text(text: &str) -> Option<String> {
+    let mailto_re =
+        regex_lite::Regex::new(r"(?i)mailto:([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})").unwrap();
+    if let Some(cap) = mailto_re.captures(text) {
+        let email = cap
+            .get(1)
+            .map(|m| m.as_str().trim().to_lowercase())
+            .unwrap_or_default();
+        if !email.is_empty() && !email.ends_with("@example.com") {
+            return Some(email);
+        }
+    }
+
+    let re = regex_lite::Regex::new(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b").unwrap();
+    for m in re.find_iter(text) {
+        let email = m
+            .as_str()
+            .trim_matches(|c: char| c == '.' || c == ',' || c == ';' || c == ':' || c == ')')
+            .trim_start_matches('(')
+            .to_lowercase();
+        if email.is_empty()
+            || email.ends_with("@example.com")
+            || email.contains("noreply")
+            || email.contains("no-reply")
+        {
+            continue;
+        }
+        return Some(email);
+    }
+    let alt_re = regex_lite::Regex::new(
+        r"(?i)\b([A-Z0-9._%+-]+)\s*(?:\[at\]|\(at\)|\sat\s)\s*([A-Z0-9.-]+)\s*(?:\[dot\]|\(dot\)|\sdot\s)\s*([A-Z]{2,})\b",
+    )
+    .unwrap();
+    if let Some(cap) = alt_re.captures(text) {
+        let local = cap
+            .get(1)
+            .map(|m| m.as_str().trim().to_lowercase())
+            .unwrap_or_default();
+        let domain = cap
+            .get(2)
+            .map(|m| m.as_str().trim().to_lowercase())
+            .unwrap_or_default();
+        let tld = cap
+            .get(3)
+            .map(|m| m.as_str().trim().to_lowercase())
+            .unwrap_or_default();
+        if !local.is_empty() && !domain.is_empty() && !tld.is_empty() {
+            return Some(format!("{local}@{domain}.{tld}"));
+        }
+    }
+    None
+}
+
+fn email_matches_company_domain(email: &str, company_domain: &str) -> bool {
+    let domain = email
+        .rsplit_once('@')
+        .map(|(_, d)| d.trim().to_lowercase())
+        .unwrap_or_default();
+    if domain.is_empty() {
+        return false;
+    }
+    let cd = company_domain.trim().to_lowercase();
+    domain == cd || domain.ends_with(&format!(".{cd}"))
+}
+
+fn normalize_contact_email_for_domain(
+    email: Option<String>,
+    company_domain: &str,
+) -> Option<String> {
+    email.and_then(|e| {
+        let trimmed = e.trim().to_lowercase();
+        if trimmed.is_empty() || !email_matches_company_domain(&trimmed, company_domain) {
+            return None;
+        }
+        Some(trimmed)
+    })
+}
+
+fn extract_personal_linkedin_from_text(text: &str) -> Option<String> {
+    let re = regex_lite::Regex::new(
+        r"(?i)https?://(?:[a-z]{2,3}\.)?linkedin\.com/(?:in|pub)/[A-Za-z0-9%._/\-]+",
+    )
+    .unwrap();
+    let decoded = text
+        .replace("\\/", "/")
+        .replace("\\u002F", "/")
+        .replace("\\u002f", "/");
+    for source in [text, decoded.as_str()] {
+        for m in re.find_iter(source) {
+            let url = m
+                .as_str()
+                .trim_matches(|c: char| c == '"' || c == '\'' || c == ')' || c == ',' || c == '.')
+                .to_string();
+            return Some(url);
+        }
+    }
+    None
+}
+
+fn extract_company_linkedin_from_text(text: &str) -> Option<String> {
+    let re = regex_lite::Regex::new(
+        r"(?i)https?://(?:[a-z]{2,3}\.)?linkedin\.com/company/[A-Za-z0-9%._/\-]+",
+    )
+    .unwrap();
+    let decoded = text
+        .replace("\\/", "/")
+        .replace("\\u002F", "/")
+        .replace("\\u002f", "/");
+    for source in [text, decoded.as_str()] {
+        if let Some(m) = re.find(source) {
+            return Some(
+                m.as_str()
+                    .trim_matches(|c: char| {
+                        c == '"' || c == '\'' || c == ')' || c == ',' || c == '.'
+                    })
+                    .to_string(),
+            );
+        }
+    }
+    None
+}
+
+fn strip_html_tags(text: &str) -> String {
+    let no_script = regex_lite::Regex::new(r"(?is)<script[^>]*>.*?</script>")
+        .unwrap()
+        .replace_all(text, " ");
+    let no_style = regex_lite::Regex::new(r"(?is)<style[^>]*>.*?</style>")
+        .unwrap()
+        .replace_all(&no_script, " ");
+    let no_tags = regex_lite::Regex::new(r"(?is)<[^>]+>")
+        .unwrap()
+        .replace_all(&no_style, " ");
+    truncate_cleaned_text(&no_tags, 20_000)
+}
+
+fn extract_internal_enrich_links(base_url: &url::Url, html: &str) -> Vec<String> {
+    let href_re = regex_lite::Regex::new(r#"(?is)href\s*=\s*["']([^"']+)["']"#).unwrap();
+    let keywords = [
+        "about",
+        "team",
+        "leadership",
+        "management",
+        "executive",
+        "contact",
+        "hakkimizda",
+        "kurumsal",
+        "ekip",
+        "yonetim",
+    ];
+
+    let mut out = Vec::<String>::new();
+    let mut seen = HashSet::<String>::new();
+    for cap in href_re.captures_iter(html) {
+        let href = cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+        if href.is_empty() {
+            continue;
+        }
+        if href.starts_with("mailto:")
+            || href.starts_with("javascript:")
+            || href.starts_with('#')
+            || href.contains("linkedin.com")
+        {
+            continue;
+        }
+        let abs = match base_url.join(href) {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+        let host_ok = abs.host_str() == base_url.host_str();
+        if !host_ok {
+            continue;
+        }
+        let path = abs.path().to_lowercase();
+        if !keywords.iter().any(|kw| path.contains(kw)) {
+            continue;
+        }
+        let key = abs.as_str().to_string();
+        if seen.insert(key.clone()) {
+            out.push(key);
+        }
+        if out.len() >= MAX_EXTRA_SITE_ENRICH_PAGES {
+            break;
+        }
+    }
+    out
+}
+
+fn default_internal_enrich_links(base_url: &url::Url) -> Vec<String> {
+    let defaults = [
+        "/about",
+        "/about-us",
+        "/company",
+        "/company/about",
+        "/leadership",
+        "/team",
+        "/management",
+        "/executive-team",
+        "/contact",
+        "/hakkimizda",
+        "/kurumsal",
+        "/kurumsal/yonetim",
+        "/yonetim",
+        "/iletisim",
+    ];
+    let mut out = Vec::<String>::new();
+    let mut seen = HashSet::<String>::new();
+    for path in defaults {
+        if let Ok(url) = base_url.join(path) {
+            let key = url.as_str().to_string();
+            if seen.insert(key.clone()) {
+                out.push(key);
+            }
+        }
+        if out.len() >= MAX_EXTRA_SITE_ENRICH_PAGES {
+            break;
+        }
+    }
+    out
+}
+
+async fn fetch_company_site_html_pages(client: &reqwest::Client, domain: &str) -> Vec<String> {
+    let candidates = [
+        format!("https://{domain}"),
+        format!("https://www.{domain}"),
+        format!("http://{domain}"),
+    ];
+    for url in candidates {
+        let resp = match client.get(&url).send().await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let ctype = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !ctype.is_empty() && !ctype.contains("text/html") && !ctype.contains("application/xhtml")
+        {
+            continue;
+        }
+        let body = match resp.text().await {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if body.trim().is_empty() {
+            continue;
+        }
+        let mut pages = vec![body.clone()];
+        if let Ok(base) = url::Url::parse(&url) {
+            let mut links = extract_internal_enrich_links(&base, &body);
+            let mut seen = links.iter().cloned().collect::<HashSet<_>>();
+            for fallback in default_internal_enrich_links(&base) {
+                if seen.insert(fallback.clone()) {
+                    links.push(fallback);
+                }
+                if links.len() >= MAX_EXTRA_SITE_ENRICH_PAGES {
+                    break;
+                }
+            }
+
+            for link in links.into_iter().take(MAX_EXTRA_SITE_ENRICH_PAGES) {
+                if let Ok(r) = client.get(&link).send().await {
+                    if !r.status().is_success() {
+                        continue;
+                    }
+                    if let Ok(extra) = r.text().await {
+                        if !extra.trim().is_empty() {
+                            pages.push(extra);
+                        }
+                    }
+                }
+            }
+        }
+        return pages;
+    }
+    Vec::new()
+}
+
+fn extract_contact_from_json_ld(
+    html: &str,
+    title_policy: &str,
+) -> (Option<String>, Option<String>) {
+    let script_re = regex_lite::Regex::new(
+        r#"(?is)<script[^>]*type\s*=\s*["']application/ld\+json["'][^>]*>(.*?)</script>"#,
+    )
+    .unwrap();
+
+    let name_job_re = regex_lite::Regex::new(
+        r#"(?is)"name"\s*:\s*"([^"]{3,120})"[^{}]{0,320}"jobTitle"\s*:\s*"([^"]{2,80})""#,
+    )
+    .unwrap();
+    let job_name_re = regex_lite::Regex::new(
+        r#"(?is)"jobTitle"\s*:\s*"([^"]{2,80})"[^{}]{0,320}"name"\s*:\s*"([^"]{3,120})""#,
+    )
+    .unwrap();
+    let founder_re = regex_lite::Regex::new(
+        r#"(?is)"founder"\s*:\s*(?:\{[^{}]{0,400})?"name"\s*:\s*"([^"]{3,120})""#,
+    )
+    .unwrap();
+
+    for cap in script_re.captures_iter(html) {
+        let raw = cap
+            .get(1)
+            .map(|m| m.as_str())
+            .unwrap_or("")
+            .replace("\\\"", "\"");
+
+        if let Some(c) = name_job_re.captures(&raw) {
+            let name = c
+                .get(1)
+                .and_then(|m| normalize_person_name(m.as_str().trim()));
+            let title = c.get(2).map(|m| normalize_contact_title(m.as_str()));
+            if name.is_some()
+                && title
+                    .as_deref()
+                    .map(|t| title_allowed_for_policy(title_policy, t))
+                    .unwrap_or(false)
+            {
+                return (name, title);
+            }
+        }
+
+        if let Some(c) = job_name_re.captures(&raw) {
+            let title = c.get(1).map(|m| normalize_contact_title(m.as_str()));
+            let name = c
+                .get(2)
+                .and_then(|m| normalize_person_name(m.as_str().trim()));
+            if name.is_some()
+                && title
+                    .as_deref()
+                    .map(|t| title_allowed_for_policy(title_policy, t))
+                    .unwrap_or(false)
+            {
+                return (name, title);
+            }
+        }
+
+        if let Some(c) = founder_re.captures(&raw) {
+            let name = c
+                .get(1)
+                .and_then(|m| normalize_person_name(m.as_str().trim()));
+            if name.is_some() && title_policy != "ceo_only" {
+                return (name, Some("Founder".to_string()));
+            }
+        }
+    }
+
+    (None, None)
+}
+
+fn extract_contact_from_company_site_html(
+    html: &str,
+    title_policy: &str,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    let plain = strip_html_tags(html);
+    let lower_plain = plain.to_lowercase();
+    let personal_linkedin_url = extract_personal_linkedin_from_text(html)
+        .or_else(|| extract_personal_linkedin_from_text(&plain));
+    let company_linkedin_url = extract_company_linkedin_from_text(html)
+        .or_else(|| extract_company_linkedin_from_text(&plain));
+    let linkedin_url = personal_linkedin_url
+        .clone()
+        .or_else(|| company_linkedin_url.clone());
+    let mut contact_name = personal_linkedin_url
+        .as_deref()
+        .and_then(extract_name_from_linkedin_url)
+        .and_then(|n| normalize_person_name(&n));
+    let mut contact_title = default_contact_title(title_policy);
+
+    let (jsonld_name, jsonld_title) = extract_contact_from_json_ld(html, title_policy);
+    if jsonld_name.is_some() {
+        contact_name = jsonld_name;
+    }
+    if jsonld_title.is_some() {
+        contact_title = jsonld_title;
+    }
+
+    let name_then_title_re = regex_lite::Regex::new(
+        r"(?is)\b([A-ZÀ-ÖØ-ÞİĞŞÇÜÖÂÊÎÔÛ][A-Za-zÀ-ÖØ-öø-ÿİıĞğŞşÇçÜüÖöÂâÊêÎîÔôÛû\.'\-]*(?:\s+[A-ZÀ-ÖØ-ÞİĞŞÇÜÖÂÊÎÔÛ][A-Za-zÀ-ÖØ-öø-ÿİıĞğŞşÇçÜüÖöÂâÊêÎîÔôÛû\.'\-]*){1,4})\b[^\n\r]{0,140}\b(CEO|Chief Executive Officer|Founder|Co[- ]Founder|Managing Director|COO|Chief Operating Officer|Head of Operations|Operations Director)\b",
+    )
+    .unwrap();
+    if let Some(cap) = name_then_title_re.captures(&plain) {
+        let name = cap
+            .get(1)
+            .and_then(|m| normalize_person_name(m.as_str().trim()));
+        let title = cap.get(2).map(|m| normalize_contact_title(m.as_str()));
+        if title
+            .as_deref()
+            .map(|t| title_allowed_for_policy(title_policy, t))
+            .unwrap_or(false)
+        {
+            if name.is_some() {
+                contact_name = name;
+            }
+            contact_title = title;
+        }
+    } else {
+        let comma_name_title_re = regex_lite::Regex::new(
+            r"(?is)\b([A-ZÀ-ÖØ-ÞİĞŞÇÜÖÂÊÎÔÛ][A-Za-zÀ-ÖØ-öø-ÿİıĞğŞşÇçÜüÖöÂâÊêÎîÔôÛû\.'\-]*(?:\s+[A-ZÀ-ÖØ-ÞİĞŞÇÜÖÂÊÎÔÛ][A-Za-zÀ-ÖØ-öø-ÿİıĞğŞşÇçÜüÖöÂâÊêÎîÔôÛû\.'\-]*){1,4})\b\s*,\s*(?:President and )?(CEO|Chief Executive Officer|Founder|Co[- ]Founder|Managing Director|COO|Chief Operating Officer|Head of Operations|Operations Director)\b",
+        )
+        .unwrap();
+        if let Some(cap) = comma_name_title_re.captures(&plain) {
+            let name = cap
+                .get(1)
+                .and_then(|m| normalize_person_name(m.as_str().trim()));
+            let title = cap.get(2).map(|m| normalize_contact_title(m.as_str()));
+            if title
+                .as_deref()
+                .map(|t| title_allowed_for_policy(title_policy, t))
+                .unwrap_or(false)
+            {
+                if name.is_some() {
+                    contact_name = name;
+                }
+                contact_title = title;
+            }
+        }
+
+        let title_then_name_re = regex_lite::Regex::new(
+            r"(?is)\b(CEO|Chief Executive Officer|Founder|Co[- ]Founder|Managing Director|COO|Chief Operating Officer|Head of Operations|Operations Director)\b[^\n\r]{0,80}\b([A-ZÀ-ÖØ-ÞİĞŞÇÜÖÂÊÎÔÛ][A-Za-zÀ-ÖØ-öø-ÿİıĞğŞşÇçÜüÖöÂâÊêÎîÔôÛû\.'\-]*(?:\s+[A-ZÀ-ÖØ-ÞİĞŞÇÜÖÂÊÎÔÛ][A-Za-zÀ-ÖØ-öø-ÿİıĞğŞşÇçÜüÖöÂâÊêÎîÔôÛû\.'\-]*){1,4})\b",
+        )
+        .unwrap();
+        if let Some(cap) = title_then_name_re.captures(&plain) {
+            let title = cap.get(1).map(|m| normalize_contact_title(m.as_str()));
+            let name = cap
+                .get(2)
+                .and_then(|m| normalize_person_name(m.as_str().trim()));
+            if title
+                .as_deref()
+                .map(|t| title_allowed_for_policy(title_policy, t))
+                .unwrap_or(false)
+            {
+                if name.is_some() {
+                    contact_name = name;
+                }
+                contact_title = title;
+            }
+        } else {
+            let title_punct_name_re = regex_lite::Regex::new(
+                r"(?is)\b(CEO|Chief Executive Officer|Founder|Co[- ]Founder|Managing Director|COO|Chief Operating Officer|Head of Operations|Operations Director)\b\s*[:\-–]\s*([A-ZÀ-ÖØ-ÞİĞŞÇÜÖÂÊÎÔÛ][A-Za-zÀ-ÖØ-öø-ÿİıĞğŞşÇçÜüÖöÂâÊêÎîÔôÛû\.'\-]*(?:\s+[A-ZÀ-ÖØ-ÞİĞŞÇÜÖÂÊÎÔÛ][A-Za-zÀ-ÖØ-öø-ÿİıĞğŞşÇçÜüÖöÂâÊêÎîÔôÛû\.'\-]*){1,4})\b",
+            )
+            .unwrap();
+            if let Some(cap) = title_punct_name_re.captures(&plain) {
+                let title = cap.get(1).map(|m| normalize_contact_title(m.as_str()));
+                let name = cap
+                    .get(2)
+                    .and_then(|m| normalize_person_name(m.as_str().trim()));
+                if title
+                    .as_deref()
+                    .map(|t| title_allowed_for_policy(title_policy, t))
+                    .unwrap_or(false)
+                {
+                    if name.is_some() {
+                        contact_name = name;
+                    }
+                    contact_title = title;
+                }
+            }
+        }
+    }
+
+    let email = extract_email_from_text(&plain).or_else(|| extract_email_from_text(html));
+    let evidence = [
+        "field service",
+        "on-site",
+        "onsite",
+        "dispatch",
+        "maintenance",
+        "installation",
+        "facility",
+        "construction",
+        "operations",
+    ]
+    .iter()
+    .find_map(|kw| {
+        if lower_plain.contains(kw) {
+            Some(format!("Company website mentions '{}'", kw))
+        } else {
+            None
+        }
+    });
+
+    (contact_name, contact_title, linkedin_url, email, evidence)
 }
 
 fn guessed_email(contact_name: Option<&str>, domain: &str) -> Option<String> {
     let name = contact_name?;
-    let parts: Vec<&str> = name
+    let normalized = normalize_person_name(name)?;
+    let parts: Vec<&str> = normalized
         .split_whitespace()
         .filter(|p| p.chars().all(|c| c.is_ascii_alphabetic()))
         .collect();
-    if parts.len() < 2 {
+    if parts.len() < 2 || parts.len() > 3 {
         return None;
     }
     let first = parts[0].to_lowercase();
@@ -1555,6 +3025,33 @@ pub struct SalesProfileAutofillRequest {
     pub brief: String,
     #[serde(default)]
     pub persist: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SalesOnboardingBriefRequest {
+    pub brief: String,
+    #[serde(default)]
+    pub persist: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SalesOnboardingStep {
+    pub key: String,
+    pub title: String,
+    pub done: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SalesOnboardingStatusResponse {
+    pub completed: bool,
+    pub active_step: u8,
+    pub steps: Vec<SalesOnboardingStep>,
+    pub oauth_connected: bool,
+    pub has_brief: bool,
+    pub profile_ready: bool,
+    pub first_run_ready: bool,
+    pub brief: Option<String>,
+    pub last_successful_run_id: Option<String>,
 }
 
 fn de_opt_u64_loose<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
@@ -1650,16 +3147,148 @@ fn cleaned_opt(v: Option<String>) -> Option<String> {
     })
 }
 
+fn is_profile_ready_for_outbound(profile: &SalesProfile) -> bool {
+    !profile.product_name.trim().is_empty()
+        && !profile.product_description.trim().is_empty()
+        && !profile.target_industry.trim().is_empty()
+        && !profile.target_geo.trim().is_empty()
+        && !profile.sender_name.trim().is_empty()
+        && !profile.sender_email.trim().is_empty()
+}
+
+fn is_codex_oauth_connected(home_dir: &FsPath) -> bool {
+    if std::env::var("OPENAI_CODEX_ACCESS_TOKEN")
+        .ok()
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let path = home_dir.join("auth").join("codex_oauth.json");
+    let raw = match std::fs::read_to_string(path) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    serde_json::from_str::<StoredCodexAuth>(&raw)
+        .map(|auth| !auth.access_token.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn onboarding_active_step(steps: &[SalesOnboardingStep]) -> u8 {
+    for (idx, step) in steps.iter().enumerate() {
+        if !step.done {
+            return (idx + 1) as u8;
+        }
+    }
+    steps.len().max(1) as u8
+}
+
+fn build_onboarding_status(
+    home_dir: &FsPath,
+    profile: Option<SalesProfile>,
+    brief: Option<String>,
+    last_successful_run_id: Option<String>,
+) -> SalesOnboardingStatusResponse {
+    let oauth_connected = is_codex_oauth_connected(home_dir);
+    let has_brief = brief
+        .as_ref()
+        .map(|b| b.trim().chars().count() >= 20)
+        .unwrap_or(false);
+    let profile_ready = profile
+        .as_ref()
+        .map(is_profile_ready_for_outbound)
+        .unwrap_or(false);
+    let first_run_ready = has_brief && last_successful_run_id.is_some();
+    let scoped_last_run_id = if has_brief {
+        last_successful_run_id
+    } else {
+        None
+    };
+
+    let steps = vec![
+        SalesOnboardingStep {
+            key: "oauth".to_string(),
+            title: "Codex OAuth bagla".to_string(),
+            done: oauth_connected,
+        },
+        SalesOnboardingStep {
+            key: "brief".to_string(),
+            title: "Sirket briefini gir".to_string(),
+            done: has_brief,
+        },
+        SalesOnboardingStep {
+            key: "profile".to_string(),
+            title: "Profili dogrula ve kaydet".to_string(),
+            done: profile_ready,
+        },
+        SalesOnboardingStep {
+            key: "first_run".to_string(),
+            title: "Ilk lead uretimini tamamla".to_string(),
+            done: first_run_ready,
+        },
+    ];
+
+    let completed = steps.iter().all(|s| s.done);
+    SalesOnboardingStatusResponse {
+        completed,
+        active_step: onboarding_active_step(&steps),
+        steps,
+        oauth_connected,
+        has_brief,
+        profile_ready,
+        first_run_ready,
+        brief,
+        last_successful_run_id: scoped_last_run_id,
+    }
+}
+
+async fn apply_brief_to_profile(
+    state: &AppState,
+    engine: &SalesEngine,
+    brief: &str,
+    persist: bool,
+) -> Result<(SalesProfile, &'static str, Vec<String>), String> {
+    let base = match engine.get_profile() {
+        Ok(Some(p)) => p,
+        Ok(None) => SalesProfile::default(),
+        Err(e) => return Err(e),
+    };
+    let mut warnings = Vec::<String>::new();
+    let (profile, source) = match llm_autofill_profile(state, brief).await {
+        Ok(draft) => (merge_profile(base, draft, brief), "llm"),
+        Err(e) => {
+            warnings.push(e);
+            (heuristic_profile_from_brief(base, brief), "heuristic")
+        }
+    };
+
+    if persist {
+        engine.upsert_profile(&profile)?;
+    }
+    Ok((profile, source, warnings))
+}
+
 fn extract_json_payload(raw: &str) -> Option<String> {
     let text = raw.trim();
-    if text.starts_with('{') && text.ends_with('}') {
+    if text.starts_with('{')
+        && text.ends_with('}')
+        && serde_json::from_str::<serde_json::Value>(text).is_ok()
+    {
         return Some(text.to_string());
     }
-    if let Some(start) = text.find('{') {
-        if let Some(end) = text.rfind('}') {
-            if end > start {
-                return Some(text[start..=end].to_string());
-            }
+
+    for (idx, ch) in text.char_indices() {
+        if ch != '{' {
+            continue;
+        }
+        let candidate = &text[idx..];
+        let mut de = serde_json::Deserializer::from_str(candidate);
+        let parsed = match serde_json::Value::deserialize(&mut de) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if parsed.is_object() {
+            return serde_json::to_string(&parsed).ok();
         }
     }
     None
@@ -1722,6 +3351,16 @@ fn detect_geo(brief: &str) -> Option<String> {
     if b.contains("usa") || b.contains("united states") || b.contains("north america") {
         return Some("US".to_string());
     }
+    let tr_keyword_hits = [
+        "saha", "takim", "ekip", "proje", "yonetim", "fiyat", "kurulum", "gonderim", "toplanti",
+        "sirket",
+    ]
+    .iter()
+    .filter(|kw| b.contains(**kw))
+    .count();
+    if tr_keyword_hits >= 3 {
+        return Some("TR".to_string());
+    }
     None
 }
 
@@ -1758,6 +3397,23 @@ fn brief_summary(brief: &str, max_len: usize) -> String {
     truncate_cleaned_text(&single_line, max_len)
 }
 
+fn sanitize_profile_description(candidate: &str, brief: &str) -> String {
+    let mut text = truncate_cleaned_text(candidate, 450);
+    if text.ends_with(',') || text.ends_with(';') || text.ends_with(':') {
+        text = text
+            .trim_end_matches([',', ';', ':', ' '])
+            .trim()
+            .to_string();
+    }
+    if text.chars().count() < 40 {
+        text = brief_summary(brief, 320);
+    }
+    if text.is_empty() {
+        text = "AI-based operations coordination for project teams.".to_string();
+    }
+    text
+}
+
 fn merge_profile(base: SalesProfile, draft: SalesProfileDraft, brief: &str) -> SalesProfile {
     let mut p = base;
 
@@ -1765,9 +3421,11 @@ fn merge_profile(base: SalesProfile, draft: SalesProfileDraft, brief: &str) -> S
         p.product_name = v;
     }
     if let Some(v) = cleaned_opt(draft.product_description) {
-        p.product_description = v;
+        p.product_description = sanitize_profile_description(&v, brief);
     } else if p.product_description.trim().is_empty() {
-        p.product_description = brief.trim().to_string();
+        p.product_description = sanitize_profile_description(brief.trim(), brief);
+    } else {
+        p.product_description = sanitize_profile_description(&p.product_description, brief);
     }
     if let Some(v) = cleaned_opt(draft.target_industry) {
         p.target_industry = v;
@@ -1940,6 +3598,168 @@ fn candidate_has_relaxed_field_ops_signal(candidate: &DomainCandidate) -> bool {
         })
 }
 
+fn deterministic_seed_domains_for_profile(
+    profile: &SalesProfile,
+    run_sequence: usize,
+) -> Vec<String> {
+    let geo = profile.target_geo.to_lowercase();
+    let is_field_ops = profile_targets_field_ops(profile);
+    let mut seeds = Vec::<String>::new();
+
+    if is_field_ops {
+        seeds.extend(
+            [
+                "johnsoncontrols.com",
+                "schneider-electric.com",
+                "siemens.com",
+                "abb.com",
+                "honeywell.com",
+                "emerson.com",
+                "carrier.com",
+                "trane.com",
+                "otis.com",
+                "kone.com",
+                "schindler.com",
+                "dormakaba.com",
+                "sodexo.com",
+                "issworld.com",
+                "veolia.com",
+                "bilfinger.com",
+                "cbre.com",
+                "jll.com",
+                "cushmanwakefield.com",
+                "mitie.com",
+                "serco.com",
+                "fluor.com",
+                "bechtel.com",
+                "kbr.com",
+                "vinci.com",
+                "ferrovial.com",
+                "skanska.com",
+                "strabag.com",
+                "bouygues.com",
+                "eiffage.com",
+                "hochtief.com",
+                "balfourbeatty.com",
+                "wsp.com",
+                "stantec.com",
+                "aecom.com",
+                "jacobs.com",
+                "emcor.net",
+                "comfortsystemsusa.com",
+                "prim.com",
+                "myrgroup.com",
+                "mastec.com",
+                "quanta.com",
+                "dycomind.com",
+                "apigroupinc.com",
+                "g4s.com",
+                "securitas.com",
+                "tk-elevator.com",
+            ]
+            .iter()
+            .map(|d| d.to_string()),
+        );
+
+        if geo.contains("tr")
+            || geo.contains("turkiye")
+            || geo.contains("türkiye")
+            || geo.contains("turkey")
+        {
+            seeds.extend(
+                [
+                    "enerjisa.com.tr",
+                    "aksaenerji.com.tr",
+                    "tekfen.com.tr",
+                    "limak.com.tr",
+                    "koc.com.tr",
+                    "enka.com",
+                    "ronesans.com",
+                    "yapimerkezi.com.tr",
+                    "dogusinsaat.com.tr",
+                    "kalyoninsaat.com.tr",
+                    "gama.com.tr",
+                    "icictaas.com.tr",
+                    "kolin.com.tr",
+                    "nurol.com.tr",
+                    "stfa.com",
+                    "yukselinsaat.com.tr",
+                ]
+                .iter()
+                .map(|d| d.to_string()),
+            );
+        } else if geo.contains("eu") || geo.contains("europe") || geo.contains("avrupa") {
+            seeds.extend(
+                [
+                    "vinci.com",
+                    "ferrovial.com",
+                    "skanska.com",
+                    "strabag.com",
+                    "bouygues-construction.com",
+                    "eiffage.com",
+                    "hochtief.com",
+                    "mitie.com",
+                    "serco.com",
+                    "wates.co.uk",
+                    "macegroup.com",
+                    "interserve.com",
+                    "spiie.com",
+                ]
+                .iter()
+                .map(|d| d.to_string()),
+            );
+        } else {
+            seeds.extend(
+                [
+                    "quanta.com",
+                    "mastec.com",
+                    "dycomind.com",
+                    "aecom.com",
+                    "jacobs.com",
+                    "emcor.net",
+                    "comfortsystemsusa.com",
+                    "prim.com",
+                    "myrgroup.com",
+                    "apigroupinc.com",
+                    "unisys.com",
+                    "steris.com",
+                    "eosits.com",
+                ]
+                .iter()
+                .map(|d| d.to_string()),
+            );
+        }
+    } else {
+        seeds.extend(
+            [
+                "ge.com",
+                "3m.com",
+                "bosch.com",
+                "siemens.com",
+                "honeywell.com",
+                "emerson.com",
+                "abb.com",
+                "schneider-electric.com",
+            ]
+            .iter()
+            .map(|d| d.to_string()),
+        );
+    }
+
+    let mut unique = dedupe_strings(
+        seeds
+            .into_iter()
+            .filter(|d| !is_blocked_company_domain(d))
+            .filter(|d| d.split('.').count() >= 2)
+            .collect(),
+    );
+    if !unique.is_empty() {
+        let offset = run_sequence % unique.len();
+        unique.rotate_left(offset);
+    }
+    unique
+}
+
 fn heuristic_lead_query_plan(profile: &SalesProfile) -> LeadQueryPlanDraft {
     let is_field_ops = profile_targets_field_ops(profile);
     let geo = if profile.target_geo.trim().is_empty() {
@@ -1947,31 +3767,40 @@ fn heuristic_lead_query_plan(profile: &SalesProfile) -> LeadQueryPlanDraft {
     } else {
         profile.target_geo.clone()
     };
+    let discovery_topic = if is_field_ops {
+        "field service maintenance installation facility management construction".to_string()
+    } else {
+        profile.target_industry.clone()
+    };
 
     let mut discovery_queries = vec![
-        format!(
-            "{} companies {} COO CEO operations",
-            profile.target_industry, geo
-        ),
+        format!("{discovery_topic} companies {geo} COO CEO operations"),
         format!(
             "{} organizations {} project operations teams",
-            profile.target_industry, geo
+            discovery_topic, geo
         ),
         format!(
             "{} firms {} operational excellence transformation",
-            profile.target_industry, geo
+            discovery_topic, geo
         ),
     ];
 
     if is_field_ops {
         discovery_queries.extend([
-            format!("field service companies {} operations director", geo),
+            format!(
+                "field service companies {} (CEO OR COO OR Operations Director)",
+                geo
+            ),
             format!(
                 "construction facility maintenance companies {} operations",
                 geo
             ),
+            format!(
+                "facility management companies {} leadership team operations",
+                geo
+            ),
             format!("companies with on-site teams {} project coordination", geo),
-            format!("mobile workforce companies {} operations", geo),
+            format!("mobile workforce companies {} operations executive", geo),
         ]);
     }
 
@@ -2003,6 +3832,10 @@ fn heuristic_lead_query_plan(profile: &SalesProfile) -> LeadQueryPlanDraft {
         "news".to_string(),
         "directory".to_string(),
         "review".to_string(),
+        "dictionary".to_string(),
+        "definition".to_string(),
+        "meaning".to_string(),
+        "forum".to_string(),
         "job".to_string(),
         "careers".to_string(),
         "consulting agency".to_string(),
@@ -2025,38 +3858,21 @@ fn heuristic_lead_query_plan(profile: &SalesProfile) -> LeadQueryPlanDraft {
     }
 }
 
-fn build_llm_driver_from_default_model(
-    provider: &str,
-    _model: &str,
-    base_url: Option<String>,
-    api_key_env: &str,
-) -> Result<Arc<dyn openfang_runtime::llm_driver::LlmDriver>, String> {
-    let api_key = if api_key_env.trim().is_empty() {
-        None
-    } else {
-        std::env::var(api_key_env).ok()
-    };
-
+fn build_sales_llm_driver() -> Result<Arc<dyn openfang_runtime::llm_driver::LlmDriver>, String> {
     let cfg = DriverConfig {
-        provider: provider.to_string(),
-        api_key,
-        base_url,
+        provider: SALES_LLM_PROVIDER.to_string(),
+        api_key: None,
+        base_url: None,
     };
     openfang_runtime::drivers::create_driver(&cfg)
         .map_err(|e| format!("LLM driver init failed: {e}"))
 }
 
 async fn llm_build_lead_query_plan(
-    kernel: &openfang_kernel::OpenFangKernel,
+    _kernel: &openfang_kernel::OpenFangKernel,
     profile: &SalesProfile,
 ) -> Result<LeadQueryPlanDraft, String> {
-    let dm = &kernel.config.default_model;
-    let driver = build_llm_driver_from_default_model(
-        &dm.provider,
-        &dm.model,
-        dm.base_url.clone(),
-        &dm.api_key_env,
-    )?;
+    let driver = build_sales_llm_driver()?;
 
     let prompt = format!(
         "You are generating a B2B outbound lead discovery plan.\n\
@@ -2083,7 +3899,7 @@ async fn llm_build_lead_query_plan(
     );
 
     let req = CompletionRequest {
-        model: dm.model.clone(),
+        model: SALES_LLM_MODEL.to_string(),
         messages: vec![LlmMessage::user(prompt)],
         tools: vec![],
         max_tokens: 1200,
@@ -2093,7 +3909,7 @@ async fn llm_build_lead_query_plan(
                 .to_string(),
         ),
         thinking: None,
-        reasoning_effort: dm.reasoning_effort.clone(),
+        reasoning_effort: Some(ReasoningEffort::High),
     };
 
     let resp = driver
@@ -2153,17 +3969,11 @@ async fn llm_build_lead_query_plan(
 }
 
 async fn llm_generate_company_candidates(
-    kernel: &openfang_kernel::OpenFangKernel,
+    _kernel: &openfang_kernel::OpenFangKernel,
     profile: &SalesProfile,
     max_companies: usize,
 ) -> Result<Vec<DomainCandidate>, String> {
-    let dm = &kernel.config.default_model;
-    let driver = build_llm_driver_from_default_model(
-        &dm.provider,
-        &dm.model,
-        dm.base_url.clone(),
-        &dm.api_key_env,
-    )?;
+    let driver = build_sales_llm_driver()?;
 
     let is_field_ops = profile_targets_field_ops(profile);
     let prompt = format!(
@@ -2188,7 +3998,7 @@ async fn llm_generate_company_candidates(
     );
 
     let req = CompletionRequest {
-        model: dm.model.clone(),
+        model: SALES_LLM_MODEL.to_string(),
         messages: vec![LlmMessage::user(prompt)],
         tools: vec![],
         max_tokens: 1400,
@@ -2197,7 +4007,7 @@ async fn llm_generate_company_candidates(
             "You are a B2B outbound researcher. Output strict valid JSON only.".to_string(),
         ),
         thinking: None,
-        reasoning_effort: dm.reasoning_effort.clone(),
+        reasoning_effort: Some(ReasoningEffort::High),
     };
 
     let resp = driver
@@ -2245,14 +4055,8 @@ async fn llm_generate_company_candidates(
     Ok(out)
 }
 
-async fn llm_autofill_profile(state: &AppState, brief: &str) -> Result<SalesProfileDraft, String> {
-    let dm = &state.kernel.config.default_model;
-    let driver = build_llm_driver_from_default_model(
-        &dm.provider,
-        &dm.model,
-        dm.base_url.clone(),
-        &dm.api_key_env,
-    )?;
+async fn llm_autofill_profile(_state: &AppState, brief: &str) -> Result<SalesProfileDraft, String> {
+    let driver = build_sales_llm_driver()?;
 
     let prompt = format!(
         "Extract a high-quality outbound sales profile from the brief.\n\
@@ -2273,7 +4077,7 @@ async fn llm_autofill_profile(state: &AppState, brief: &str) -> Result<SalesProf
     );
 
     let req = CompletionRequest {
-        model: dm.model.clone(),
+        model: SALES_LLM_MODEL.to_string(),
         messages: vec![LlmMessage::user(prompt)],
         tools: vec![],
         max_tokens: 900,
@@ -2283,7 +4087,7 @@ async fn llm_autofill_profile(state: &AppState, brief: &str) -> Result<SalesProf
                 .to_string(),
         ),
         thinking: None,
-        reasoning_effort: dm.reasoning_effort.clone(),
+        reasoning_effort: Some(ReasoningEffort::High),
     };
 
     let resp = driver
@@ -2309,7 +4113,7 @@ async fn llm_autofill_profile(state: &AppState, brief: &str) -> Result<SalesProf
                 text
             );
             let repair_req = CompletionRequest {
-                model: dm.model.clone(),
+                model: SALES_LLM_MODEL.to_string(),
                 messages: vec![LlmMessage::user(repair_prompt)],
                 tools: vec![],
                 max_tokens: 700,
@@ -2318,7 +4122,7 @@ async fn llm_autofill_profile(state: &AppState, brief: &str) -> Result<SalesProf
                     "You are a JSON repair assistant. Always output strict valid JSON.".to_string(),
                 ),
                 thinking: None,
-                reasoning_effort: dm.reasoning_effort.clone(),
+                reasoning_effort: Some(ReasoningEffort::High),
             };
             let repaired = driver
                 .complete(repair_req)
@@ -2353,35 +4157,39 @@ pub async fn autofill_sales_profile(
         }
     };
 
-    let base = match engine.get_profile() {
-        Ok(Some(p)) => p,
-        Ok(None) => SalesProfile::default(),
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e})),
-            )
-        }
-    };
-
-    let mut warnings = Vec::<String>::new();
-    let (profile, source) = match llm_autofill_profile(&state, &body.brief).await {
-        Ok(draft) => (merge_profile(base, draft, &body.brief), "llm"),
-        Err(e) => {
-            warnings.push(e);
-            (heuristic_profile_from_brief(base, &body.brief), "heuristic")
-        }
-    };
-
-    let persist = body.persist.unwrap_or(true);
-    if persist {
-        if let Err(e) = engine.upsert_profile(&profile) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": e})),
-            );
-        }
+    if let Err(e) = engine.set_onboarding_brief(body.brief.trim()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        );
     }
+    let persist = body.persist.unwrap_or(true);
+    let (profile, source, warnings) =
+        match apply_brief_to_profile(&state, &engine, body.brief.trim(), persist).await {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": e})),
+                )
+            }
+        };
+
+    let onboarding = match (engine.get_profile(), engine.get_onboarding_brief_state()) {
+        (Ok(profile_opt), Ok(brief_state)) => {
+            let last_run_id = engine
+                .latest_successful_run_id_since(brief_state.updated_at.as_deref())
+                .ok()
+                .flatten();
+            Some(build_onboarding_status(
+                &state.kernel.config.home_dir,
+                profile_opt,
+                brief_state.brief,
+                last_run_id,
+            ))
+        }
+        _ => None,
+    };
 
     (
         StatusCode::OK,
@@ -2389,8 +4197,118 @@ pub async fn autofill_sales_profile(
             "profile": profile,
             "persisted": persist,
             "source": source,
-            "warnings": warnings
+            "warnings": warnings,
+            "onboarding": onboarding
         })),
+    )
+}
+
+pub async fn put_sales_onboarding_brief(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SalesOnboardingBriefRequest>,
+) -> impl IntoResponse {
+    let brief = body.brief.trim();
+    if brief.len() < 20 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Brief en az 20 karakter olmali."})),
+        );
+    }
+    let engine = match engine_from_state(&state) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+        }
+    };
+    if let Err(e) = engine.set_onboarding_brief(brief) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        );
+    }
+    let persist = body.persist.unwrap_or(true);
+    let (profile, source, warnings) =
+        match apply_brief_to_profile(&state, &engine, brief, persist).await {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": e})),
+                )
+            }
+        };
+    let brief_state = engine.get_onboarding_brief_state().ok().unwrap_or_default();
+    let status = build_onboarding_status(
+        &state.kernel.config.home_dir,
+        engine.get_profile().ok().flatten(),
+        brief_state.brief,
+        engine
+            .latest_successful_run_id_since(brief_state.updated_at.as_deref())
+            .ok()
+            .flatten(),
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "profile": profile,
+            "persisted": persist,
+            "source": source,
+            "warnings": warnings,
+            "onboarding": status
+        })),
+    )
+}
+
+pub async fn get_sales_onboarding_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let engine = match engine_from_state(&state) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+        }
+    };
+    let profile = match engine.get_profile() {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+        }
+    };
+    let brief_state = match engine.get_onboarding_brief_state() {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+        }
+    };
+    let last_successful_run_id =
+        match engine.latest_successful_run_id_since(brief_state.updated_at.as_deref()) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e})),
+                )
+            }
+        };
+    let status = build_onboarding_status(
+        &state.kernel.config.home_dir,
+        profile,
+        brief_state.brief,
+        last_successful_run_id,
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "status": status })),
     )
 }
 
@@ -2451,11 +4369,22 @@ pub async fn run_sales_now(State(state): State<Arc<AppState>>) -> impl IntoRespo
         }
     };
 
-    match engine.run_generation(&state.kernel).await {
-        Ok(run) => (StatusCode::OK, Json(serde_json::json!({"run": run}))),
-        Err(e) => (
+    match tokio::time::timeout(
+        Duration::from_secs(240),
+        engine.run_generation(&state.kernel),
+    )
+    .await
+    {
+        Ok(Ok(run)) => (StatusCode::OK, Json(serde_json::json!({"run": run}))),
+        Ok(Err(e)) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": e})),
+        ),
+        Err(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Sales run timed out while collecting leads. Check network/search availability and retry."
+            })),
         ),
     }
 }
@@ -2502,7 +4431,7 @@ pub async fn list_sales_leads(
     };
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).min(500);
 
-    match engine.list_leads(limit) {
+    match engine.list_leads(limit, q.run_id.as_deref()) {
         Ok(leads) => (
             StatusCode::OK,
             Json(serde_json::json!({"leads": leads, "total": leads.len()})),
@@ -2653,8 +4582,12 @@ pub fn spawn_sales_scheduler(kernel: Arc<openfang_kernel::OpenFangKernel>) {
             }
 
             info!("Sales scheduler: triggering daily run");
-            if let Err(e) = engine.run_generation(&kernel).await {
-                error!(error = %e, "Sales scheduler: run failed");
+            match tokio::time::timeout(Duration::from_secs(120), engine.run_generation(&kernel))
+                .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => error!(error = %e, "Sales scheduler: run failed"),
+                Err(_) => error!("Sales scheduler: run timed out"),
             }
         }
     });
@@ -2716,5 +4649,42 @@ mod tests {
             matched_keywords: vec!["Field Operations".to_string()],
         };
         assert!(!candidate_has_field_ops_signal(&only_generic));
+    }
+
+    #[test]
+    fn normalize_person_name_rejects_business_phrase() {
+        assert!(normalize_person_name("TechEx Sustainable Legacies Welcoming Workplace").is_none());
+    }
+
+    #[test]
+    fn extract_contact_from_search_supports_unicode_name_patterns() {
+        let sample = r#"
+1. Enerjisa Leadership Team
+   URL: https://www.enerjisa.com.tr/leadership
+   CEO: Emre Erdoğan
+"#;
+        let (name, title, _) = extract_contact_from_search(sample, "ceo_only");
+        assert_eq!(name.as_deref(), Some("Emre Erdoğan"));
+        assert_eq!(title.as_deref(), Some("CEO"));
+    }
+
+    #[test]
+    fn normalize_contact_email_for_domain_rejects_external_domain() {
+        let kept = normalize_contact_email_for_domain(
+            Some("ceo@sub.example.com".to_string()),
+            "example.com",
+        );
+        let dropped =
+            normalize_contact_email_for_domain(Some("ceo@other.com".to_string()), "example.com");
+        assert_eq!(kept.as_deref(), Some("ceo@sub.example.com"));
+        assert!(dropped.is_none());
+    }
+
+    #[test]
+    fn guessed_email_requires_plausible_person_name() {
+        let ok = guessed_email(Some("John Doe"), "example.com");
+        let bad = guessed_email(Some("Experience Like No Other"), "example.com");
+        assert_eq!(ok.as_deref(), Some("john.doe@example.com"));
+        assert!(bad.is_none());
     }
 }

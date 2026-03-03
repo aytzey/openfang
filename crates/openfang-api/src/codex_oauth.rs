@@ -23,7 +23,8 @@ const DEFAULT_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const FALLBACK_TOKEN_URL: &str = "https://auth0.openai.com/oauth/token";
 const DEFAULT_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEFAULT_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
-const DEFAULT_SCOPES: &str = "openid profile email offline_access";
+const DEFAULT_SCOPES: &str = "openid profile email offline_access model.request";
+const REQUIRED_SCOPE_MODEL_REQUEST: &str = "model.request";
 const MAX_PENDING_AGE_SECS: i64 = 15 * 60;
 
 #[derive(Debug, Clone)]
@@ -259,12 +260,18 @@ fn auth_client_id(auth: &StoredCodexAuth, fallback: &str) -> String {
 }
 
 fn normalize_scope_tokens(scope: &str) -> Vec<String> {
-    scope
+    let mut out: Vec<String> = Vec::new();
+    for token in scope
         .split(|c: char| c.is_whitespace() || c == ',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
-        .collect()
+    {
+        if !out.iter().any(|s| s == &token) {
+            out.push(token);
+        }
+    }
+    out
 }
 
 fn jwt_scope_from_token(token: &str) -> Option<String> {
@@ -329,7 +336,7 @@ fn oauth_callback_html(title: &str, message: &str, success: bool) -> String {
 (() => {
   try {
     if (window.opener && !window.opener.closed) {
-      window.opener.postMessage({ type: "openfang:codex_oauth", status: "connected" }, window.location.origin);
+      window.opener.postMessage({ type: "openfang:codex_oauth", status: "connected" }, "*");
       setTimeout(() => window.close(), 300);
       return;
     }
@@ -441,7 +448,19 @@ fn oauth_token_urls() -> Vec<String> {
 
 fn oauth_scopes() -> String {
     let raw = std::env::var("OPENAI_OAUTH_SCOPES").unwrap_or_else(|_| DEFAULT_SCOPES.to_string());
-    normalize_scope_tokens(&raw).join(" ")
+    let mut scopes = normalize_scope_tokens(&raw);
+    for required in [
+        "openid",
+        "profile",
+        "email",
+        "offline_access",
+        REQUIRED_SCOPE_MODEL_REQUEST,
+    ] {
+        if !scopes.iter().any(|s| s == required) {
+            scopes.push(required.to_string());
+        }
+    }
+    scopes.join(" ")
 }
 
 fn oauth_originator() -> String {
