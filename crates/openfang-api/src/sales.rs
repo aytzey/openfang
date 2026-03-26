@@ -938,7 +938,8 @@ impl SalesEngine {
                 .map_err(|e| format!("Query prospect_profiles by run failed: {e}"))?;
             for row in rows {
                 let raw = row.map_err(|e| format!("Read prospect_profiles row failed: {e}"))?;
-                if let Ok(profile) = serde_json::from_str::<SalesProspectProfile>(&raw) {
+                if let Ok(mut profile) = serde_json::from_str::<SalesProspectProfile>(&raw) {
+                    sanitize_prospect_profile(&mut profile);
                     out.push(profile);
                 }
             }
@@ -948,7 +949,8 @@ impl SalesEngine {
                 .map_err(|e| format!("Query prospect_profiles failed: {e}"))?;
             for row in rows {
                 let raw = row.map_err(|e| format!("Read prospect_profiles row failed: {e}"))?;
-                if let Ok(profile) = serde_json::from_str::<SalesProspectProfile>(&raw) {
+                if let Ok(mut profile) = serde_json::from_str::<SalesProspectProfile>(&raw) {
+                    sanitize_prospect_profile(&mut profile);
                     out.push(profile);
                 }
             }
@@ -971,6 +973,10 @@ impl SalesEngine {
             .map_err(|e| format!("Prospect profile lookup failed: {e}"))?;
         raw.map(|payload| {
             serde_json::from_str::<SalesProspectProfile>(&payload)
+                .map(|mut profile| {
+                    sanitize_prospect_profile(&mut profile);
+                    profile
+                })
                 .map_err(|e| format!("Prospect profile JSON decode failed: {e}"))
         })
         .transpose()
@@ -987,7 +993,9 @@ impl SalesEngine {
             .map_err(|e| format!("Begin prospect_profiles transaction failed: {e}"))?;
 
         for profile in profiles {
-            let payload = serde_json::to_string(profile)
+            let mut sanitized = profile.clone();
+            sanitize_prospect_profile(&mut sanitized);
+            let payload = serde_json::to_string(&sanitized)
                 .map_err(|e| format!("Serialize prospect profile failed: {e}"))?;
             tx.execute(
                 "INSERT INTO prospect_profiles (company_domain, run_id, json, created_at, updated_at)
@@ -997,11 +1005,11 @@ impl SalesEngine {
                     json = excluded.json,
                     updated_at = excluded.updated_at",
                 params![
-                    profile.company_domain,
-                    profile.run_id,
+                    sanitized.company_domain,
+                    sanitized.run_id,
                     payload,
-                    profile.created_at,
-                    profile.updated_at
+                    sanitized.created_at,
+                    sanitized.updated_at
                 ],
             )
             .map_err(|e| format!("Upsert prospect profile failed: {e}"))?;
@@ -1047,13 +1055,17 @@ impl SalesEngine {
             .next()
             .map_err(|e| format!("Approvals row read failed: {e}"))?
         {
+            let channel: String = r.get(2).unwrap_or_default();
             let payload_raw: String = r.get(3).unwrap_or_else(|_| "{}".to_string());
             let payload = serde_json::from_str::<serde_json::Value>(&payload_raw)
                 .unwrap_or_else(|_| serde_json::json!({}));
+            let Some(payload) = sanitize_approval_payload(&channel, payload) else {
+                continue;
+            };
             out.push(SalesApproval {
                 id: r.get(0).unwrap_or_default(),
                 lead_id: r.get(1).unwrap_or_default(),
-                channel: r.get(2).unwrap_or_default(),
+                channel,
                 payload,
                 status: r.get(4).unwrap_or_default(),
                 created_at: r.get(5).unwrap_or_default(),
@@ -1791,18 +1803,12 @@ impl SalesEngine {
                 mut email,
                 search_osint_enrichment,
             ) = if skip_web_contact_search {
-                let default_title = if profile.target_title_policy == "ceo_only" {
-                    Some("CEO".to_string())
-                } else {
-                    Some("CEO/Founder".to_string())
-                };
-                // Use info@domain as fallback email so the lead has an outreach channel
-                let fallback_email = Some(format!("info@{domain}"));
                 (
                     seeded_name,
-                    seeded_title.or(default_title),
+                    seeded_title
+                        .or_else(|| default_contact_title(profile.target_title_policy.as_str())),
                     seeded_linkedin,
-                    seeded_email.or(fallback_email),
+                    seeded_email,
                     SiteContactEnrichment::default(),
                 )
             } else {
@@ -2227,15 +2233,8 @@ impl SalesEngine {
 
             // For validated companies: fill missing fields with reasonable defaults.
             if is_llm_validated || is_verified_by_memory {
-                if email.is_none() && linkedin_url.is_none() {
-                    email = Some(format!("info@{domain}"));
-                }
                 if contact_name.is_none() || contact_name_is_placeholder(contact_name.as_deref()) {
-                    contact_title = Some(if profile.target_title_policy == "ceo_only" {
-                        "CEO".to_string()
-                    } else {
-                        "CEO/Founder".to_string()
-                    });
+                    contact_title = default_contact_title(profile.target_title_policy.as_str());
                 }
             }
 
@@ -2274,50 +2273,27 @@ impl SalesEngine {
                     .join(", ")
             };
 
-            let reasons = vec![
-                format!(
-                    "{} matched ICP keywords: {}",
-                    company, matched
-                ),
-                format!(
-                    "Observed public signal: {}",
-                    truncate_text_for_reason(&evidence, 220)
-                ),
-                format!(
-                    "{} is a decision-maker role that typically owns operations/process adoption priorities.",
-                    contact_title
-                        .clone()
-                        .unwrap_or_else(|| "Leadership".to_string())
-                ),
-                format!(
-                    "{} helps teams with: {}",
-                    profile.product_name,
-                    truncate_text_for_reason(&profile.product_description, 220)
-                ),
-            ];
+            let reasons = build_sales_lead_reasons(
+                &profile,
+                &company,
+                &matched,
+                &evidence,
+                contact_title.as_deref(),
+            );
 
-            let recipient_name = contact_name.clone().unwrap_or_else(|| "there".to_string());
-            let email_subject = format!(
-                "{} for {} operations coordination",
-                profile.product_name, company
+            let email_subject = build_sales_email_subject(&profile, &company);
+            let email_body = build_sales_email_body(
+                &profile,
+                &company,
+                contact_name.as_deref(),
+                &matched,
+                &evidence,
             );
-            let email_body = format!(
-                "Hi {},\n\nI came across {} and noticed this signal: {}.\n\n{} could likely help your team by {}.\n\nIf helpful, I can share a short plan specifically for your operation model in {}.\n\nBest,\n{}",
-                recipient_name,
-                company,
-                truncate_text_for_reason(&evidence, 180),
-                profile.product_name,
-                truncate_text_for_reason(&profile.product_description, 220),
-                profile.target_industry,
-                profile.sender_name
-            );
-            let linkedin_message = format!(
-                "Hi {}, saw {} and a signal around {}. {} could be relevant for your {} workflows. Open to a quick exchange?",
-                recipient_name,
-                company,
-                truncate_text_for_reason(&matched, 80),
-                profile.product_name,
-                profile.target_industry
+            let linkedin_message = build_sales_linkedin_message(
+                &profile,
+                &company,
+                contact_name.as_deref(),
+                &evidence,
             );
 
             let lead = SalesLead {
@@ -2804,8 +2780,7 @@ fn build_prospect_profiles(
             acc.primary_contact_score = contact_score;
             acc.primary_contact_name = clean_profile_contact_name(&lead.contact_name);
             acc.primary_contact_title = clean_profile_contact_field(&lead.contact_title);
-            acc.primary_email =
-                clean_profile_contact_field(lead.email.as_deref().unwrap_or_default());
+            acc.primary_email = normalize_actionable_outreach_email(lead.email.as_deref());
             acc.primary_linkedin_url = lead
                 .linkedin_url
                 .as_deref()
@@ -2898,6 +2873,51 @@ fn build_prospect_profiles(
     sort_prospect_profiles_for_harness(&mut profiles, sales_profile);
     profiles.truncate(limit);
     profiles
+}
+
+fn sanitize_prospect_profile(profile: &mut SalesProspectProfile) {
+    let previous_email = profile.primary_email.clone();
+    profile.primary_email = normalize_actionable_outreach_email(profile.primary_email.as_deref());
+    profile.primary_linkedin_url = profile
+        .primary_linkedin_url
+        .clone()
+        .and_then(|value| normalize_outreach_linkedin_url(&value));
+    profile.company_linkedin_url = profile
+        .company_linkedin_url
+        .clone()
+        .and_then(|value| normalize_company_linkedin_url(&value));
+    profile.osint_links = merge_osint_links(Vec::new(), profile.osint_links.clone());
+    profile.profile_status = prospect_status(
+        profile.primary_contact_name.as_deref(),
+        profile.primary_email.as_deref(),
+        profile.primary_linkedin_url.as_deref(),
+    )
+    .to_string();
+    profile.recommended_channel = build_recommended_channel(
+        profile.primary_email.as_deref(),
+        profile.primary_linkedin_url.as_deref(),
+    );
+    if previous_email != profile.primary_email
+        || profile.summary.trim().is_empty()
+        || profile.research_status != "llm_enriched"
+    {
+        profile.summary = build_prospect_summary(
+            &profile.company,
+            &profile.matched_signals,
+            profile.primary_contact_name.as_deref(),
+            profile.primary_contact_title.as_deref(),
+            profile.primary_email.as_deref(),
+            profile.primary_linkedin_url.as_deref(),
+        );
+    }
+    profile.research_confidence = profile
+        .research_confidence
+        .max(heuristic_research_confidence(
+            profile.fit_score,
+            &profile.profile_status,
+            profile.source_count as usize,
+            profile.contact_count as usize,
+        ));
 }
 
 fn build_candidate_prospect_profiles(
@@ -3073,7 +3093,12 @@ fn prospect_harness_priority(
     };
     priority += (profile.source_count.min(4) as i32) * 3;
     priority += (profile.contact_count.min(3) as i32) * 4;
-    if profile.primary_email.is_some() {
+    if profile
+        .primary_email
+        .as_deref()
+        .map(email_is_actionable_outreach_email)
+        .unwrap_or(false)
+    {
         priority += 6;
     }
     if profile
@@ -3163,7 +3188,7 @@ fn prospect_contact_score(lead: &SalesLead) -> i32 {
     if lead
         .email
         .as_deref()
-        .map(|v| !v.trim().is_empty())
+        .map(email_is_actionable_outreach_email)
         .unwrap_or(false)
     {
         score += 4;
@@ -3188,7 +3213,7 @@ fn prospect_status(
     primary_linkedin_url: Option<&str>,
 ) -> &'static str {
     if primary_email
-        .map(|value| !value.trim().is_empty())
+        .map(email_is_actionable_outreach_email)
         .unwrap_or(false)
         || primary_linkedin_url
             .and_then(normalize_outreach_linkedin_url)
@@ -3277,7 +3302,7 @@ fn build_recommended_channel(
     primary_linkedin_url: Option<&str>,
 ) -> String {
     let has_email = primary_email
-        .map(|value| !value.trim().is_empty())
+        .map(email_is_actionable_outreach_email)
         .unwrap_or(false);
     let has_linkedin = primary_linkedin_url
         .and_then(normalize_outreach_linkedin_url)
@@ -3565,6 +3590,9 @@ fn extract_domain(raw_url: &str) -> Option<String> {
     if host.contains("duckduckgo.com") || host.contains("linkedin.com") {
         return None;
     }
+    if is_blocked_company_domain(&host) {
+        return None;
+    }
     if has_blocked_asset_tld(&host) {
         return None;
     }
@@ -3629,6 +3657,38 @@ fn is_directory_domain(domain: &str) -> bool {
     DIRECTORY_HINTS.iter().any(|hint| {
         domain == *hint || domain.ends_with(&format!(".{hint}")) || domain.contains(hint)
     })
+}
+
+fn is_consumer_email_domain(domain: &str) -> bool {
+    const CONSUMER_EMAIL_DOMAINS: &[&str] = &[
+        "gmail.com",
+        "googlemail.com",
+        "yahoo.com",
+        "ymail.com",
+        "rocketmail.com",
+        "hotmail.com",
+        "outlook.com",
+        "live.com",
+        "msn.com",
+        "icloud.com",
+        "me.com",
+        "mac.com",
+        "protonmail.com",
+        "proton.me",
+        "mail.com",
+        "aol.com",
+        "gmx.com",
+        "gmx.net",
+        "yandex.com",
+        "yandex.ru",
+        "qq.com",
+        "163.com",
+    ];
+
+    let normalized = domain.trim().trim_start_matches("www.").to_lowercase();
+    CONSUMER_EMAIL_DOMAINS
+        .iter()
+        .any(|blocked| normalized == *blocked || normalized.ends_with(&format!(".{blocked}")))
 }
 
 fn is_blocked_company_domain(domain: &str) -> bool {
@@ -3715,7 +3775,8 @@ fn is_blocked_company_domain(domain: &str) -> bool {
         return true;
     }
 
-    domain.starts_with("blog.")
+    is_consumer_email_domain(domain)
+        || domain.starts_with("blog.")
         || domain.contains("dictionary")
         || domain.contains("definitions")
         || domain.contains("wiktionary")
@@ -5798,6 +5859,124 @@ fn domain_to_company(domain: &str) -> String {
         .join(" ")
 }
 
+fn outreach_recipient_name(contact_name: Option<&str>, company: &str, target_geo: &str) -> String {
+    if let Some(first_name) = contact_name
+        .and_then(normalize_person_name)
+        .and_then(|value| value.split_whitespace().next().map(|part| part.to_string()))
+    {
+        return first_name;
+    }
+    if geo_is_turkey(target_geo) {
+        format!("{} ekibi", company)
+    } else {
+        format!("{} team", company)
+    }
+}
+
+fn build_sales_lead_reasons(
+    profile: &SalesProfile,
+    company: &str,
+    matched: &str,
+    evidence: &str,
+    contact_title: Option<&str>,
+) -> Vec<String> {
+    let mut reasons = vec![
+        format!("ICP fit: {}", truncate_text_for_reason(matched, 140)),
+        format!(
+            "Public evidence: {}",
+            truncate_text_for_reason(evidence, 220)
+        ),
+    ];
+    if let Some(title) = contact_title
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !contact_title_is_generic_default(Some(value)))
+    {
+        reasons.push(format!("Potential buyer role: {title}"));
+    }
+    reasons.push(format!(
+        "Value hypothesis: {} could help {} with {}",
+        profile.product_name,
+        company,
+        truncate_text_for_reason(&profile.product_description, 140)
+    ));
+    dedupe_strings(reasons)
+}
+
+fn build_sales_email_subject(profile: &SalesProfile, company: &str) -> String {
+    if geo_is_turkey(&profile.target_geo) {
+        format!("{company} icin saha operasyon koordinasyonu")
+    } else {
+        format!("{company}: field ops coordination")
+    }
+}
+
+fn build_sales_email_body(
+    profile: &SalesProfile,
+    company: &str,
+    contact_name: Option<&str>,
+    matched: &str,
+    evidence: &str,
+) -> String {
+    let recipient = outreach_recipient_name(contact_name, company, &profile.target_geo);
+    let evidence_short = truncate_text_for_reason(evidence, 160);
+    let matched_short = truncate_text_for_reason(matched, 90);
+    let value_short = truncate_text_for_reason(&profile.product_description, 150);
+
+    if geo_is_turkey(&profile.target_geo) {
+        format!(
+            "Merhaba {},\n\n{} ile ilgili su sinyali gordum: {}.\n\n{} tarafinda {} operasyonlarinda is atama, takip ve gecikme yonetimi kolayca daginik hale gelebiliyor. {} burada su ise yarayabilir: {}.\n\nUygunsa {} icin 3 maddelik kisa bir operasyon akisi onerisi paylasabilirim.\n\nSelamlar,\n{}",
+            recipient,
+            company,
+            evidence_short,
+            company,
+            matched_short,
+            profile.product_name,
+            value_short,
+            company,
+            profile.sender_name
+        )
+    } else {
+        format!(
+            "Hi {},\n\nI came across {} through this public signal: {}.\n\nFor teams running {}, the friction is usually around task ownership, follow-up, and delay recovery across email, phone, and chat. {} could help here: {}.\n\nIf useful, I can send a short 3-point workflow teardown for {}.\n\nBest,\n{}",
+            recipient,
+            company,
+            evidence_short,
+            matched_short,
+            profile.product_name,
+            value_short,
+            company,
+            profile.sender_name
+        )
+    }
+}
+
+fn build_sales_linkedin_message(
+    profile: &SalesProfile,
+    company: &str,
+    contact_name: Option<&str>,
+    evidence: &str,
+) -> String {
+    let recipient = outreach_recipient_name(contact_name, company, &profile.target_geo);
+    let evidence_short = truncate_text_for_reason(evidence, 110);
+    if geo_is_turkey(&profile.target_geo) {
+        truncate_cleaned_text(
+            &format!(
+                "Merhaba {}, {} ile ilgili su sinyali gordum: {}. {} saha ekiplerinde takip ve koordinasyonu toparlamaya yardimci oluyor. Uygunsa kisa bir akis onerisi paylasabilirim.",
+                recipient, company, evidence_short, profile.product_name
+            ),
+            300,
+        )
+    } else {
+        truncate_cleaned_text(
+            &format!(
+                "Hi {}, noticed {} through this signal: {}. {} helps field teams tighten follow-up and coordination. Happy to share a short workflow teardown if relevant.",
+                recipient, company, evidence_short, profile.product_name
+            ),
+            300,
+        )
+    }
+}
+
 fn extract_contact_from_search(
     search_output: &str,
     title_policy: &str,
@@ -6892,12 +7071,110 @@ fn normalize_email_candidate(email: Option<String>) -> Option<String> {
             || trimmed.ends_with("@example.com")
             || trimmed.contains("noreply")
             || trimmed.contains("no-reply")
+            || is_consumer_email_domain(domain)
             || blocked_tlds.contains(&tld)
         {
             return None;
         }
         Some(trimmed)
     })
+}
+
+fn email_domain(email: &str) -> Option<String> {
+    email
+        .rsplit_once('@')
+        .map(|(_, domain)| domain.trim().to_lowercase())
+        .filter(|domain| !domain.is_empty())
+}
+
+fn email_local_part(email: &str) -> Option<String> {
+    email
+        .rsplit_once('@')
+        .map(|(local, _)| local.trim().to_lowercase())
+        .filter(|local| !local.is_empty())
+}
+
+fn email_is_generic_role_mailbox(email: &str) -> bool {
+    let Some(local) = email_local_part(email) else {
+        return false;
+    };
+    let normalized = local
+        .split(['+', '.', '-', '_'])
+        .next()
+        .unwrap_or(local.as_str())
+        .trim();
+    matches!(
+        normalized,
+        "info"
+            | "hello"
+            | "contact"
+            | "office"
+            | "mail"
+            | "admin"
+            | "support"
+            | "sales"
+            | "team"
+            | "general"
+            | "iletisim"
+            | "merhaba"
+    )
+}
+
+fn email_is_actionable_outreach_email(email: &str) -> bool {
+    let Some(domain) = email_domain(email) else {
+        return false;
+    };
+    !is_consumer_email_domain(&domain) && !email_is_generic_role_mailbox(email)
+}
+
+fn normalize_actionable_outreach_email(email: Option<&str>) -> Option<String> {
+    normalize_email_candidate(email.map(|value| value.to_string()))
+        .filter(|value| email_is_actionable_outreach_email(value))
+}
+
+fn sanitize_approval_payload(
+    channel: &str,
+    payload: serde_json::Value,
+) -> Option<serde_json::Value> {
+    match channel {
+        "email" => {
+            let to = payload
+                .get("to")
+                .and_then(|value| value.as_str())
+                .and_then(|value| normalize_actionable_outreach_email(Some(value)))?;
+            let subject = payload
+                .get("subject")
+                .and_then(|value| value.as_str())?
+                .trim();
+            let body = payload.get("body").and_then(|value| value.as_str())?.trim();
+            if subject.is_empty() || body.is_empty() {
+                return None;
+            }
+            Some(serde_json::json!({
+                "to": to,
+                "subject": subject,
+                "body": body,
+            }))
+        }
+        "linkedin" => {
+            let profile_url = payload
+                .get("profile_url")
+                .and_then(|value| value.as_str())
+                .and_then(normalize_outreach_linkedin_url)?;
+            let message = payload
+                .get("message")
+                .and_then(|value| value.as_str())?
+                .trim();
+            if message.is_empty() {
+                return None;
+            }
+            Some(serde_json::json!({
+                "profile_url": profile_url,
+                "message": message,
+            }))
+        }
+        _ => Some(payload),
+    }
 }
 
 fn count_mojibake_markers(text: &str) -> usize {
@@ -7038,10 +7315,7 @@ fn decode_basic_html_entities(text: &str) -> String {
 }
 
 fn email_matches_company_domain(email: &str, company_domain: &str) -> bool {
-    let domain = email
-        .rsplit_once('@')
-        .map(|(_, d)| d.trim().to_lowercase())
-        .unwrap_or_default();
+    let domain = email_domain(email).unwrap_or_default();
     if domain.is_empty() {
         return false;
     }
@@ -7054,7 +7328,9 @@ fn normalize_contact_email_for_domain(
     company_domain: &str,
 ) -> Option<String> {
     normalize_email_candidate(email).and_then(|trimmed| {
-        if !email_matches_company_domain(&trimmed, company_domain) {
+        if !email_matches_company_domain(&trimmed, company_domain)
+            || !email_is_actionable_outreach_email(&trimmed)
+        {
             return None;
         }
         Some(trimmed)
@@ -7062,7 +7338,7 @@ fn normalize_contact_email_for_domain(
 }
 
 fn normalize_site_contact_email(email: Option<String>) -> Option<String> {
-    normalize_email_candidate(email)
+    normalize_email_candidate(email).filter(|trimmed| email_is_actionable_outreach_email(trimmed))
 }
 
 fn normalize_outreach_linkedin_url(raw: &str) -> Option<String> {
@@ -7347,7 +7623,13 @@ fn merge_osint_links(existing: Vec<String>, extra: Vec<String>) -> Vec<String> {
 }
 
 fn lead_has_outreach_channel(email: Option<&String>, linkedin_url: Option<&String>) -> bool {
-    email.is_some() || linkedin_url.is_some()
+    email
+        .map(String::as_str)
+        .map(email_is_actionable_outreach_email)
+        .unwrap_or(false)
+        || linkedin_url
+            .and_then(|value| normalize_outreach_linkedin_url(value))
+            .is_some()
 }
 
 fn lead_has_verified_company_signal(
@@ -11858,6 +12140,8 @@ mod tests {
     fn blocked_company_domain_rejects_global_giants() {
         assert!(is_blocked_company_domain("boschrexroth.com"));
         assert!(is_blocked_company_domain("cargill.com.tr"));
+        assert!(is_blocked_company_domain("gmail.com"));
+        assert!(is_blocked_company_domain("outlook.com"));
         assert!(!is_blocked_company_domain("altanhidrolik.com.tr"));
     }
 
@@ -12592,6 +12876,74 @@ mod tests {
     }
 
     #[test]
+    fn list_approvals_skips_non_actionable_email_payloads() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let engine = SalesEngine::new(temp.path());
+        engine.init().expect("init");
+
+        let conn = engine.open().expect("open db");
+        let created_at = "2026-03-26T10:00:00Z";
+        conn.execute(
+            "INSERT INTO approvals (id, lead_id, channel, payload_json, status, created_at) VALUES (?, ?, 'email', ?, 'pending', ?)",
+            params![
+                "approval-bad-generic",
+                "lead-1",
+                serde_json::json!({
+                    "to": "info@acme.example",
+                    "subject": "Generic subject",
+                    "body": "Generic body",
+                })
+                .to_string(),
+                created_at
+            ],
+        )
+        .expect("insert generic approval");
+        conn.execute(
+            "INSERT INTO approvals (id, lead_id, channel, payload_json, status, created_at) VALUES (?, ?, 'email', ?, 'pending', ?)",
+            params![
+                "approval-bad-consumer",
+                "lead-2",
+                serde_json::json!({
+                    "to": "owner@gmail.com",
+                    "subject": "Consumer subject",
+                    "body": "Consumer body",
+                })
+                .to_string(),
+                created_at
+            ],
+        )
+        .expect("insert consumer approval");
+        conn.execute(
+            "INSERT INTO approvals (id, lead_id, channel, payload_json, status, created_at) VALUES (?, ?, 'email', ?, 'pending', ?)",
+            params![
+                "approval-good",
+                "lead-3",
+                serde_json::json!({
+                    "to": "eray@artiplatform.com.tr",
+                    "subject": "Relevant subject",
+                    "body": "Relevant body",
+                })
+                .to_string(),
+                created_at
+            ],
+        )
+        .expect("insert valid approval");
+
+        let approvals = engine
+            .list_approvals(Some("pending"), 10)
+            .expect("list approvals");
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0].id, "approval-good");
+        assert_eq!(
+            approvals[0]
+                .payload
+                .get("to")
+                .and_then(|value| value.as_str()),
+            Some("eray@artiplatform.com.tr")
+        );
+    }
+
+    #[test]
     fn extract_contact_from_search_for_company_rejects_company_phrases_as_names() {
         let sample = r#"
 1. Rakamlarla Rönesans - Yönetim Kurulu
@@ -13310,7 +13662,7 @@ mod tests {
 
         assert_eq!(contact_name.as_deref(), Some("Ahmet Yılmaz"));
         assert_eq!(contact_title.as_deref(), Some("Chairman"));
-        assert_eq!(email.as_deref(), Some("info@acmeinsaat.com.tr"));
+        assert!(email.is_none());
     }
 
     #[test]
@@ -13335,7 +13687,7 @@ mod tests {
 
         assert_eq!(contact_name.as_deref(), Some("Ahmet Yılmaz"));
         assert_eq!(contact_title.as_deref(), Some("Chairman"));
-        assert_eq!(email.as_deref(), Some("info@acmeinsaat.com.tr"));
+        assert!(email.is_none());
     }
 
     #[test]
@@ -13550,6 +13902,28 @@ mod tests {
     }
 
     #[test]
+    fn normalize_contact_email_for_domain_rejects_generic_or_consumer_inboxes() {
+        assert!(normalize_contact_email_for_domain(
+            Some("info@ornekbakim.com.tr".to_string()),
+            "ornekbakim.com.tr"
+        )
+        .is_none());
+        assert!(normalize_contact_email_for_domain(
+            Some("info@gmail.com".to_string()),
+            "gmail.com"
+        )
+        .is_none());
+        assert_eq!(
+            normalize_contact_email_for_domain(
+                Some("kiralama@artiplatform.com.tr".to_string()),
+                "artiplatform.com.tr"
+            )
+            .as_deref(),
+            Some("kiralama@artiplatform.com.tr")
+        );
+    }
+
+    #[test]
     fn guessed_email_requires_plausible_person_name() {
         let ok = guessed_email(Some("John Doe"), "example.com");
         let bad = guessed_email(Some("Experience Like No Other"), "example.com");
@@ -13580,7 +13954,39 @@ mod tests {
             None,
             Some(&"https://www.linkedin.com/in/jane-doe".to_string())
         ));
+        assert!(!lead_has_outreach_channel(
+            Some(&"info@example.com".to_string()),
+            None
+        ));
         assert!(!lead_has_outreach_channel(None, None));
+    }
+
+    #[test]
+    fn build_prospect_profiles_downgrades_generic_inbox_only_contacts() {
+        let leads = vec![SalesLead {
+            id: "lead-1".to_string(),
+            run_id: "run-1".to_string(),
+            company: "Acme".to_string(),
+            website: "https://acme.example".to_string(),
+            company_domain: "acme.example".to_string(),
+            contact_name: "Leadership Team".to_string(),
+            contact_title: "CEO/Founder".to_string(),
+            linkedin_url: None,
+            email: Some("info@acme.example".to_string()),
+            phone: None,
+            reasons: vec!["Public evidence: listed in sector directory".to_string()],
+            email_subject: String::new(),
+            email_body: String::new(),
+            linkedin_message: String::new(),
+            score: 84,
+            status: "draft_ready".to_string(),
+            created_at: "2026-03-25T10:00:00Z".to_string(),
+        }];
+
+        let profiles = build_prospect_profiles(leads, 10, None);
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].profile_status, "company_only");
+        assert!(profiles[0].primary_email.is_none());
     }
 
     #[test]
