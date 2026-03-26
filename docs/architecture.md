@@ -31,7 +31,7 @@ openfang-cli            CLI interface, daemon auto-detect, MCP server
     |
 openfang-desktop        Tauri 2.0 desktop app (WebView + system tray)
     |
-openfang-api            REST/WS/SSE API server (Axum 0.8), 76 endpoints
+openfang-api            REST/WS/SSE API server (Axum 0.8), 77 endpoints
     |
 openfang-kernel         Kernel: assembles all subsystems, workflow engine, RBAC, metering
     |
@@ -41,7 +41,7 @@ openfang-kernel         Kernel: assembles all subsystems, workflow engine, RBAC,
     +-- openfang-migrate    Migration engine (OpenClaw YAML->TOML)
     +-- openfang-skills     60 bundled skills, FangHub marketplace, ClawHub client
     |
-openfang-memory         SQLite memory substrate, sessions, semantic search, usage tracking
+openfang-memory         SQLite memory substrate, hybrid lookup+semantic recall, usage tracking
     |
 openfang-types          Shared types: Agent, Capability, Event, Memory, Message, Tool, Config,
                         Taint, ManifestSigning, ModelCatalog, MCP/A2A config, Web config
@@ -52,10 +52,10 @@ openfang-types          Shared types: Agent, Capability, Event, Memory, Message,
 | Crate | Description |
 |-------|-------------|
 | **openfang-types** | Core type definitions used across all crates. Defines `AgentManifest`, `AgentId`, `Capability`, `Event`, `ToolDefinition`, `KernelConfig`, `OpenFangError`, taint tracking (`TaintLabel`, `TaintSet`), Ed25519 manifest signing, model catalog types (`ModelCatalogEntry`, `ProviderInfo`, `ModelTier`), tool compatibility mappings (21 OpenClaw-to-OpenFang), MCP/A2A config types, and web config types. All config structs use `#[serde(default)]` for forward-compatible TOML parsing. |
-| **openfang-memory** | SQLite-backed memory substrate (schema v5). Uses `Arc<Mutex<Connection>>` with `spawn_blocking` for async bridge. Provides structured KV storage, semantic search with vector embeddings, knowledge graph (entities and relations), session management, task board, usage event persistence (`usage_events` table, `UsageStore`), and canonical sessions for cross-channel memory. Five schema versions: V1 core, V2 collab, V3 embeddings, V4 usage, V5 canonical_sessions. |
+| **openfang-memory** | SQLite-backed memory substrate (schema v8). Uses `Arc<Mutex<Connection>>` with `spawn_blocking` for async bridge. Provides structured KV storage, hybrid semantic recall with deterministic hashed 2/3-gram lookup plus vector reranking, knowledge graph (entities and relations), session management, task board, usage event persistence (`usage_events` table, `UsageStore`), paired-device persistence, and canonical sessions for cross-channel memory. Eight schema versions: V1 core, V2 collab, V3 embeddings, V4 usage, V5 canonical_sessions, V6 session labels, V7 paired_devices, V8 memory_lookup_index. |
 | **openfang-runtime** | Agent execution engine. Contains the agent loop (`run_agent_loop`, `run_agent_loop_streaming`), 3 native LLM drivers (Anthropic, Gemini, OpenAI-compatible covering 20 providers), 23 built-in tools, WASM sandbox (Wasmtime with dual fuel+epoch metering), MCP client/server (JSON-RPC 2.0 over stdio/SSE), A2A protocol (AgentCard, task management), web search engine (4 providers: Tavily/Brave/Perplexity/DuckDuckGo), web fetch with SSRF protection, loop guard (SHA256-based tool loop detection), session repair (history validation), LLM session compactor (block-aware), Merkle hash chain audit trail, and embedding driver. Defines the `KernelHandle` trait that enables inter-agent tools without circular crate dependencies. |
 | **openfang-kernel** | The central coordinator. `OpenFangKernel` assembles all subsystems: `AgentRegistry`, `AgentScheduler`, `CapabilityManager`, `EventBus`, `Supervisor`, `WorkflowEngine`, `TriggerEngine`, `BackgroundExecutor`, `WasmSandbox`, `ModelCatalog`, `MeteringEngine`, `ModelRouter`, `AuthManager` (RBAC), `HeartbeatMonitor`, `SetupWizard`, `SkillRegistry`, MCP connections, and `WebToolsContext`. Implements `KernelHandle` for inter-agent operations. Handles agent spawn/kill, message dispatch, workflow execution, trigger evaluation, capability inheritance validation, and graceful shutdown with state persistence. |
-| **openfang-api** | HTTP API server built on Axum 0.8 with 76 endpoints. Routes for agents, workflows, triggers, memory, channels, templates, models, providers, skills, ClawHub, MCP, health, status, version, and shutdown. WebSocket handler for real-time agent chat with streaming. SSE endpoint for streaming responses. OpenAI-compatible endpoints (`POST /v1/chat/completions`, `GET /v1/models`). A2A endpoints (`/.well-known/agent.json`, `/a2a/*`). Middleware: Bearer token auth, request ID injection, structured request logging, GCRA rate limiter (cost-aware), security headers (CSP, X-Frame-Options, etc.), health endpoint redaction. |
+| **openfang-api** | HTTP API server built on Axum 0.8 with 77 endpoints. Routes for agents, workflows, triggers, memory, channels, templates, models, providers, skills, ClawHub, MCP, health, status, version, and shutdown. WebSocket handler for real-time agent chat with streaming. SSE endpoint for streaming responses. OpenAI-compatible endpoints (`POST /v1/chat/completions`, `GET /v1/models`). A2A endpoints (`/.well-known/agent.json`, `/a2a/*`). Middleware: Bearer token auth, request ID injection, structured request logging, GCRA rate limiter (cost-aware), security headers (CSP, X-Frame-Options, etc.), health endpoint redaction. |
 | **openfang-channels** | Channel bridge layer with 40 adapters. Each adapter implements the `ChannelAdapter` trait. Includes: Telegram, Discord, Slack, WhatsApp, Signal, Matrix, Email, SMS, Webhook, Teams, Mattermost, IRC, Google Chat, Twitch, Rocket.Chat, Zulip, XMPP, LINE, Viber, Messenger, Reddit, Mastodon, Bluesky, Feishu, Revolt, Nextcloud, Guilded, Keybase, Threema, Nostr, Webex, Pumble, Flock, Twist, Mumble, DingTalk, Discourse, Gitter, Ntfy, Gotify, LinkedIn. Features: `AgentRouter` for message routing, `BridgeManager` for lifecycle coordination, `ChannelRateLimiter` (per-user DashMap tracking), `formatter.rs` (Markdown to TelegramHTML/SlackMrkdwn/PlainText), `ChannelOverrides` (model/system_prompt/dm_policy/group_policy/rate_limit/threading/output_format), DM/group policy enforcement. |
 | **openfang-wire** | OpenFang Protocol (OFP) for peer-to-peer agent communication. JSON-framed messages over TCP with HMAC-SHA256 mutual authentication (nonce + constant-time verify via `subtle`). `PeerNode` listens for connections and manages peers. `PeerRegistry` tracks known remote peers and their agents. |
 | **openfang-cli** | Clap-based CLI. Supports all commands: `init`, `start`, `status`, `doctor`, `agent spawn/list/chat/kill`, `workflow list/create/run`, `trigger list/create/delete`, `migrate`, `skill install/list/remove/search/create`, `channel list/setup/test/enable/disable`, `config show/edit`, `chat`, `mcp`. Daemon auto-detect: checks `~/.openfang/daemon.json` and health pings; uses HTTP when a daemon is running, boots an in-process kernel as fallback. Built-in MCP server mode. |
@@ -295,9 +295,14 @@ uuid-b   | state       | {"step": 3}
 shared   | project     | {"name": "foo"}
 ```
 
-### 2. Semantic Search
+### 2. Hybrid Semantic Recall
 
-Vector embeddings for similarity-based memory retrieval. Documents are embedded using the configured embedding driver and stored with their vectors. Queries are embedded at search time and matched by cosine similarity.
+Semantic recall follows a two-stage conditional-memory path inspired by large-scale lookup architectures:
+
+- **Deterministic lookup**: memory contents are normalized into a compressed token space (NFKC + lowercase + punctuation collapse), then indexed as hashed 2/3-grams across multiple hash heads in `memory_lookup_index`.
+- **Context-aware reranking**: candidate memories are re-scored with semantic similarity when embeddings are available, then fused with the lexical prior via a gate-like scoring function.
+
+This means old but highly specific memories can still be surfaced even when they would be buried by recency alone.
 
 ### 3. Knowledge Graph
 
@@ -318,11 +323,11 @@ A shared task queue for multi-agent collaboration:
 ### 6. Usage and Canonical Sessions
 
 - **Usage tracking**: `usage_events` table persists token counts, cost estimates, and model usage per agent. `UsageStore` provides query and aggregation APIs.
-- **Canonical sessions**: Cross-channel memory. `CanonicalSession` tracks a user's conversation context across multiple channels. Compaction produces summaries that are injected into system prompts. Stored in `canonical_sessions` table (schema v5).
+- **Canonical sessions**: Cross-channel memory. `CanonicalSession` tracks a user's conversation context across multiple channels. Compaction produces summaries that are injected into system prompts. Stored in `canonical_sessions` table.
 
 ### SQLite Architecture
 
-All memory operations go through `Arc<Mutex<Connection>>` with Tokio's `spawn_blocking` for async bridging. This ensures thread safety without requiring an async SQLite driver. Schema migrations run automatically through five versions.
+All memory operations go through `Arc<Mutex<Connection>>` with Tokio's `spawn_blocking` for async bridging. This ensures thread safety without requiring an async SQLite driver. Schema migrations run automatically through eight versions, including the `memory_lookup_index` table that powers deterministic recall.
 
 ---
 
@@ -800,7 +805,7 @@ The desktop app (`openfang-desktop`) wraps the full OpenFang stack in a native T
 |                         openfang-api                                |
 |  +-------------+  +----------+  +--------+  +------------------+   |
 |  | REST Routes |  | WS Chat  |  | SSE    |  | OpenAI /v1/      |   |
-|  | (76 endpts) |  +----------+  +--------+  +------------------+   |
+|  | (77 endpts) |  +----------+  +--------+  +------------------+   |
 |  +-------------+  +------------------+  +-----------------------+   |
 |  | Auth+RBAC   |  | Security Headers |  | GCRA Rate Limiter    |   |
 |  +-------------+  +------------------+  +-----------------------+   |

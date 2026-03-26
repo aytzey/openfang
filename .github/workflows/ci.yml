@@ -63,6 +63,17 @@ jobs:
       # Tests that need a display (Tauri) are skipped in headless CI via cfg
       - run: cargo test --workspace
 
+  smoke:
+    name: Smoke Harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: smoke-harness
+      - run: cargo xtask test-smoke
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

@@ -29,6 +29,23 @@ pub struct DaemonInfo {
     pub platform: String,
 }
 
+/// Options for building the API router in different environments.
+///
+/// Production uses the default settings. Test harnesses can disable or replace
+/// the rate limiter while keeping the production route and middleware shape.
+#[derive(Clone)]
+pub struct RouterBuildOptions {
+    pub rate_limiter: Option<std::sync::Arc<rate_limiter::KeyedRateLimiter>>,
+}
+
+impl Default for RouterBuildOptions {
+    fn default() -> Self {
+        Self {
+            rate_limiter: Some(rate_limiter::create_rate_limiter()),
+        }
+    }
+}
+
 /// Build the full API router with all routes, middleware, and state.
 ///
 /// This is extracted from `run_daemon()` so that embedders (e.g. openfang-desktop)
@@ -39,6 +56,15 @@ pub struct DaemonInfo {
 pub async fn build_router(
     kernel: Arc<OpenFangKernel>,
     listen_addr: SocketAddr,
+) -> (Router<()>, Arc<AppState>) {
+    build_router_with_options(kernel, listen_addr, RouterBuildOptions::default()).await
+}
+
+/// Build the full API router with optional test-oriented overrides.
+pub async fn build_router_with_options(
+    kernel: Arc<OpenFangKernel>,
+    listen_addr: SocketAddr,
+    options: RouterBuildOptions,
 ) -> (Router<()>, Arc<AppState>) {
     // Start channel bridges (Telegram, etc.)
     let bridge = channel_bridge::start_channel_bridge(kernel.clone()).await;
@@ -104,7 +130,6 @@ pub async fn build_router(
     };
 
     let api_key = state.kernel.config.api_key.clone();
-    let gcra_limiter = rate_limiter::create_rate_limiter();
 
     let app = Router::new()
         .route("/", axum::routing::get(webchat::webchat_page))
@@ -251,6 +276,10 @@ pub async fn build_router(
             axum::routing::get(routes::get_agent_kv_key)
                 .put(routes::set_agent_kv_key)
                 .delete(routes::delete_agent_kv_key),
+        )
+        .route(
+            "/api/memory/agents/{id}/search",
+            axum::routing::get(routes::search_agent_memories),
         )
         // Trigger endpoints
         .route(
@@ -442,6 +471,10 @@ pub async fn build_router(
         .route(
             "/api/sales/leads",
             axum::routing::get(sales::list_sales_leads),
+        )
+        .route(
+            "/api/sales/prospects",
+            axum::routing::get(sales::list_sales_prospects),
         )
         .route(
             "/api/sales/approvals",
@@ -680,17 +713,24 @@ pub async fn build_router(
         .layer(axum::middleware::from_fn_with_state(
             api_key,
             middleware::auth,
-        ))
-        .layer(axum::middleware::from_fn_with_state(
+        ));
+
+    let app = if let Some(gcra_limiter) = options.rate_limiter {
+        app.layer(axum::middleware::from_fn_with_state(
             gcra_limiter,
             rate_limiter::gcra_rate_limit,
         ))
+    } else {
+        app
+    };
+
+    let app = app
         .layer(axum::middleware::from_fn(middleware::security_headers))
         .layer(axum::middleware::from_fn(middleware::request_logging))
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
         .layer(cors)
-        .with_state(state.clone());
+        .with_state::<()>(state.clone());
 
     (app, state)
 }

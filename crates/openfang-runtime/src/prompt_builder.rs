@@ -208,6 +208,8 @@ const TOOL_CALL_BEHAVIOR: &str = "\
 - When you need to use a tool, call it immediately. Do not narrate or explain routine tool calls.
 - Only explain tool calls when the action is destructive, unusual, or the user explicitly asked for an explanation.
 - Prefer action over narration. If you can answer by using a tool, do it.
+- If the path is unclear, do focused discovery first to reduce uncertainty before committing to an answer.
+- Work in a tight loop: inspect, test, observe, then adapt.
 - When executing multiple sequential tool calls, batch them — don't output reasoning between each call.
 - If a tool returns useful results, present the KEY information, not the raw output.
 - Start with the answer, not meta-commentary about how you'll help.";
@@ -251,7 +253,8 @@ pub fn build_tools_section(granted_tools: &[String]) -> String {
 pub fn build_memory_section(memories: &[(String, String)]) -> String {
     let mut out = String::from(
         "## Memory\n\
-         - When the user asks about something from a previous conversation, use memory_recall first.\n\
+         - Shared memory is key-based: use memory_recall when you know the key or saved preference name.\n\
+         - Relevant conversation memories may already be auto-recalled into this prompt; use them before asking the user to repeat themselves.\n\
          - Store important preferences, decisions, and context with memory_store for future use.",
     );
     if !memories.is_empty() {
@@ -398,11 +401,14 @@ const SAFETY_SECTION: &str = "\
 /// Static operational guidelines (replaces STABILITY_GUIDELINES).
 const OPERATIONAL_GUIDELINES: &str = "\
 ## Operational Guidelines
-- Do NOT retry a tool call with identical parameters if it failed. Try a different approach.
+- Start with the most relevant discovery path for the task; avoid broad, low-signal exploration.
+- Build progress through small experiments: inspect the state, try a targeted action, observe the result, then refine.
+- Do NOT retry a tool call with identical parameters if it failed. Change the query, inputs, or tool choice.
 - If a tool returns an error, analyze the error before calling it again.
 - Prefer targeted, specific tool calls over broad ones.
-- Plan your approach before executing multiple tool calls.
-- If you cannot accomplish a task after a few attempts, explain what went wrong instead of looping.
+- Plan your approach before executing multiple tool calls, but keep adapting as new evidence appears.
+- If one approach fails, try the next most plausible approach while it is still relevant and informative.
+- If you cannot accomplish a task after several materially different attempts, explain what went wrong instead of looping.
 - Never call the same tool more than 3 times with the same parameters.
 - If a message requires no response (simple acknowledgments, reactions, messages not directed at you), respond with exactly NO_REPLY.";
 
@@ -479,7 +485,7 @@ pub fn tool_hint(name: &str) -> &'static str {
 
         // Memory
         "memory_store" => "save a key-value pair to memory",
-        "memory_recall" => "search memory for relevant context",
+        "memory_recall" => "recall a shared memory value by key",
         "memory_delete" => "delete a memory entry",
         "memory_list" => "list stored memory keys",
 
@@ -841,5 +847,14 @@ mod tests {
         assert_eq!(capitalize("files"), "Files");
         assert_eq!(capitalize(""), "");
         assert_eq!(capitalize("MCP"), "MCP");
+    }
+
+    #[test]
+    fn test_prompt_includes_iterative_discovery_guidance() {
+        let prompt = build_system_prompt(&basic_ctx());
+        assert!(prompt.contains("focused discovery first"));
+        assert!(prompt.contains("inspect, test, observe, then adapt"));
+        assert!(prompt.contains("small experiments"));
+        assert!(prompt.contains("next most plausible approach"));
     }
 }

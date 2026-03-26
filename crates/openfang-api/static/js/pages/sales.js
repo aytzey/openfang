@@ -49,7 +49,11 @@ function salesPage() {
     },
 
     manualCode: '',
+    selectedRunId: '',
+    selectedProspectId: '',
     runs: [],
+    prospects: [],
+    runProspects: [],
     leads: [],
     runLeads: [],
     approvals: [],
@@ -61,6 +65,31 @@ function salesPage() {
 
     get pendingApprovals() {
       return this.approvals.filter(function(a) { return a.status === 'pending'; }).length;
+    },
+
+    get pendingApprovalItems() {
+      return this.approvals.filter(function(a) { return a.status === 'pending'; });
+    },
+
+    get contactReadyProspects() {
+      return this.prospects.filter(function(p) { return p.profile_status === 'contact_ready'; }).length;
+    },
+
+    get companyOnlyProspects() {
+      return this.prospects.filter(function(p) { return p.profile_status === 'company_only'; }).length;
+    },
+
+    selectedProspectRecord() {
+      var pools = [this.runProspects, this.prospects];
+      for (var i = 0; i < pools.length; i++) {
+        var pool = pools[i] || [];
+        for (var j = 0; j < pool.length; j++) {
+          if (pool[j].id === this.selectedProspectId) return pool[j];
+        }
+      }
+      if (this.runProspects.length > 0) return this.runProspects[0];
+      if (this.prospects.length > 0) return this.prospects[0];
+      return null;
     },
 
     stepDone(key) {
@@ -108,6 +137,7 @@ function salesPage() {
           this.checkOAuthStatus(),
           this.loadProfile(),
           this.loadRuns(),
+          this.loadProspects(),
           this.loadLeads(),
           this.loadApprovals(),
           this.loadDeliveries(),
@@ -137,7 +167,14 @@ function salesPage() {
         this.profileBrief = this.onboarding.brief;
       }
       if (this.onboarding.last_successful_run_id) {
-        await this.loadRunLeads(this.onboarding.last_successful_run_id);
+        await Promise.all([
+          this.loadRunProspects(this.onboarding.last_successful_run_id),
+          this.loadRunLeads(this.onboarding.last_successful_run_id)
+        ]);
+      } else {
+        this.selectedRunId = '';
+        this.runProspects = [];
+        this.runLeads = [];
       }
     },
 
@@ -150,13 +187,16 @@ function salesPage() {
       this.savingProfile = true;
       try {
         var payload = this.normalizeProfile(this.profile);
-        if (!payload.product_name.trim() || !payload.product_description.trim() || !payload.target_industry.trim() || !payload.sender_name.trim() || !payload.sender_email.trim()) {
-          throw new Error('Profil eksik: urun, aciklama, sektor, gonderen adi ve e-posta zorunlu.');
+        if (!payload.product_name.trim() || !payload.product_description.trim() || !payload.target_industry.trim() || !payload.target_geo.trim() || !payload.sender_name.trim() || !payload.sender_email.trim()) {
+          throw new Error('Profil eksik: urun, aciklama, sektor, cografi hedef, gonderen adi ve e-posta zorunlu.');
         }
         if (payload.schedule_hour_local < 0 || payload.schedule_hour_local > 23) {
           throw new Error('Gunluk calisma saati 0-23 araliginda olmali.');
         }
-        await OpenFangAPI.put('/api/sales/profile', payload);
+        var data = await OpenFangAPI.put('/api/sales/profile', payload);
+        if (data && data.profile) {
+          this.profile = this.normalizeProfile(data.profile);
+        }
         OpenFangToast.success('Profil kaydedildi');
         await this.loadOnboardingStatus();
       } catch (e) {
@@ -198,21 +238,37 @@ function salesPage() {
       try {
         var data = await OpenFangAPI.post('/api/sales/run', {});
         var run = (data && data.run) || {};
-        OpenFangToast.success('Lead uretimi tamamlandi. Eklenen: ' + String(run.inserted || 0));
         if (run.id) {
-          await this.loadRunLeads(run.id);
+          await Promise.all([
+            this.loadRunProspects(run.id),
+            this.loadRunLeads(run.id)
+          ]);
         }
-        await Promise.all([
-          this.loadRuns(),
-          this.loadLeads(),
-          this.loadApprovals(),
-          this.loadDeliveries(),
-          this.loadOnboardingStatus()
-        ]);
+        var companyOnly = this.runProspects.filter(function(p) { return p.profile_status === 'company_only'; }).length;
+        OpenFangToast.success(
+          'Prospecting run tamamlandi. Profil: ' + String(this.runProspects.length) +
+          ' / action-ready lead: ' + String(run.inserted || 0) +
+          ' / backlog: ' + String(companyOnly)
+        );
+        if (run.error) {
+          OpenFangToast.warn(run.error, 9000);
+        }
       } catch (e) {
-        OpenFangToast.error(e && e.message ? e.message : 'Lead uretimi basarisiz');
+        OpenFangToast.error(e && e.message ? e.message : 'Aday musteri kesfi basarisiz');
+      } finally {
+        try {
+          await Promise.all([
+            this.loadRuns(),
+            this.loadProspects(),
+            this.loadLeads(),
+            this.loadApprovals(),
+            this.loadDeliveries(),
+            this.loadOnboardingStatus()
+          ]);
+        } finally {
+          this.runningNow = false;
+        }
       }
-      this.runningNow = false;
     },
 
     async loadRuns() {
@@ -220,12 +276,31 @@ function salesPage() {
       this.runs = data.runs || [];
     },
 
+    async loadProspects() {
+      var data = await OpenFangAPI.get('/api/sales/prospects?limit=200');
+      this.prospects = data.prospects || [];
+      this.ensureProspectSelection();
+    },
+
     async loadLeads() {
       var data = await OpenFangAPI.get('/api/sales/leads?limit=200');
       this.leads = data.leads || [];
     },
 
+    async loadRunProspects(runId) {
+      this.selectedRunId = runId || '';
+      if (!runId) {
+        this.runProspects = [];
+        this.ensureProspectSelection();
+        return;
+      }
+      var data = await OpenFangAPI.get('/api/sales/prospects?limit=100&run_id=' + encodeURIComponent(runId));
+      this.runProspects = data.prospects || [];
+      this.ensureProspectSelection();
+    },
+
     async loadRunLeads(runId) {
+      this.selectedRunId = runId || '';
       if (!runId) {
         this.runLeads = [];
         return;
@@ -249,6 +324,121 @@ function salesPage() {
       if (a.channel === 'email') return a.payload.to || '-';
       if (a.channel === 'linkedin') return a.payload.profile_url || '-';
       return '-';
+    },
+
+    approvalTitle(a) {
+      if (!a || !a.payload) return 'Taslak';
+      if (a.channel === 'email') return a.payload.subject || 'E-posta taslagi';
+      if (a.channel === 'linkedin') return 'LinkedIn mesaji';
+      return 'Taslak';
+    },
+
+    approvalBody(a) {
+      if (!a || !a.payload) return '';
+      if (a.channel === 'email') return a.payload.body || '';
+      if (a.channel === 'linkedin') return a.payload.message || '';
+      return '';
+    },
+
+    leadReasonsPreview(lead) {
+      if (!lead || !Array.isArray(lead.reasons)) return [];
+      return lead.reasons.slice(0, 2);
+    },
+
+    prospectSignalsPreview(prospect) {
+      if (!prospect || !Array.isArray(prospect.matched_signals)) return [];
+      return prospect.matched_signals.slice(0, 3);
+    },
+
+    prospectPrimaryContact(prospect) {
+      if (!prospect) return '-';
+      var name = prospect.primary_contact_name || 'Temas yok';
+      var title = prospect.primary_contact_title || '';
+      return title ? (name + ' / ' + title) : name;
+    },
+
+    prospectChannels(prospect) {
+      if (!prospect) return '-';
+      var channels = [];
+      if (prospect.primary_email) channels.push('email');
+      if (prospect.primary_linkedin_url) channels.push('linkedin');
+      return channels.length ? channels.join(' + ') : 'sirket seviyesi';
+    },
+
+    prospectNextAction(prospect) {
+      if (!prospect) return '-';
+      if (prospect.profile_status === 'contact_ready') {
+        if (prospect.primary_email && prospect.primary_linkedin_url) return 'Email ile basla, LinkedIn follow-up';
+        if (prospect.primary_email) return 'Email taslagini onaya gonder';
+        if (prospect.primary_linkedin_url) return 'LinkedIn mesajini onaya gonder';
+      }
+      if (prospect.profile_status === 'contact_identified') return "Kanal dogrulama yap ve lead'e yuksel";
+      return 'Buying committee ve temas kanali cikar';
+    },
+
+    prospectOsintLinks(prospect) {
+      if (!prospect) return [];
+      var links = [];
+      if (prospect.primary_linkedin_url) links.push(prospect.primary_linkedin_url);
+      if (prospect.company_linkedin_url) links.push(prospect.company_linkedin_url);
+      if (Array.isArray(prospect.osint_links)) {
+        links = links.concat(prospect.osint_links);
+      }
+      var seen = new Set();
+      return links
+        .filter(function(link) { return typeof link === 'string' && link.trim().length > 0; })
+        .map(function(link) { return link.trim(); })
+        .filter(function(link) {
+          if (seen.has(link)) return false;
+          seen.add(link);
+          return true;
+        })
+        .slice(0, 6);
+    },
+
+    prospectStatusClass(status) {
+      if (status === 'contact_ready') return 'badge-success';
+      if (status === 'contact_identified') return 'badge-warn';
+      return 'badge-muted';
+    },
+
+    prospectResearchClass(status) {
+      return status === 'llm_enriched' ? 'badge-success' : 'badge-muted';
+    },
+
+    prospectConfidencePct(prospect) {
+      if (!prospect || typeof prospect.research_confidence !== 'number') return '0%';
+      return String(Math.round(prospect.research_confidence * 100)) + '%';
+    },
+
+    selectProspect(prospect) {
+      if (!prospect || !prospect.id) return;
+      this.selectedProspectId = prospect.id;
+    },
+
+    ensureProspectSelection() {
+      var current = this.selectedProspectRecord();
+      if (current && current.id) {
+        this.selectedProspectId = current.id;
+        return;
+      }
+      if (this.runProspects.length > 0) {
+        this.selectedProspectId = this.runProspects[0].id;
+        return;
+      }
+      if (this.prospects.length > 0) {
+        this.selectedProspectId = this.prospects[0].id;
+        return;
+      }
+      this.selectedProspectId = '';
+    },
+
+    runBadgeClass(run) {
+      if (!run) return 'badge-muted';
+      if (run.status === 'completed') return 'badge-success';
+      if (run.status === 'running') return 'badge-warn';
+      if (run.status === 'failed') return 'badge-error';
+      return 'badge-muted';
     },
 
     async approve(id) {
@@ -289,7 +479,16 @@ function salesPage() {
           state: this.oauth.state || ''
         };
       } catch (_) {
-        this.oauth.connected = false;
+        this.oauth = {
+          connected: false,
+          source: '',
+          reason: '',
+          issued_at: null,
+          expires_at: null,
+          has_refresh_token: false,
+          auth_url: '',
+          state: ''
+        };
       }
       this.oauthBusy = false;
     },

@@ -2,41 +2,18 @@
 //!
 //! Run with: GROQ_API_KEY=gsk_... cargo test -p openfang-kernel --test multi_agent_test -- --nocapture
 
-use openfang_kernel::OpenFangKernel;
-use openfang_types::agent::AgentManifest;
-use openfang_types::config::{DefaultModelConfig, KernelConfig};
+mod support;
 
-fn test_config() -> KernelConfig {
-    let tmp = std::env::temp_dir().join("openfang-multi-agent-test");
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).unwrap();
-
-    KernelConfig {
-        home_dir: tmp.clone(),
-        data_dir: tmp.join("data"),
-        default_model: DefaultModelConfig {
-            provider: "groq".to_string(),
-            model: "llama-3.3-70b-versatile".to_string(),
-            api_key_env: "GROQ_API_KEY".to_string(),
-            base_url: None,
-            reasoning_effort: None,
-        },
-        ..KernelConfig::default()
-    }
-}
-
-fn load_manifest(toml_str: &str) -> AgentManifest {
-    toml::from_str(toml_str).expect("Should parse manifest")
-}
+use support::{parse_manifest, skip_if_env_missing, TestKernelHarness, GROQ_TEST_MODEL};
 
 #[tokio::test]
 async fn test_six_agent_fleet() {
-    if std::env::var("GROQ_API_KEY").is_err() {
-        eprintln!("GROQ_API_KEY not set, skipping multi-agent test");
+    if skip_if_env_missing("GROQ_API_KEY", "multi-agent live integration test") {
         return;
     }
 
-    let kernel = OpenFangKernel::boot_with_config(test_config()).expect("Kernel should boot");
+    let harness = TestKernelHarness::boot(GROQ_TEST_MODEL);
+    let kernel = harness.kernel.as_ref();
 
     // Define all 6 agents with different roles and models
     let agents = vec![
@@ -145,7 +122,7 @@ memory_write = ["self.*"]
     // Spawn all agents
     let mut agent_ids = Vec::new();
     for (name, manifest_str, _) in &agents {
-        let manifest = load_manifest(manifest_str);
+        let manifest = parse_manifest(manifest_str);
         let id = kernel
             .spawn_agent(manifest)
             .unwrap_or_else(|e| panic!("Failed to spawn {name}: {e}"));
@@ -198,5 +175,4 @@ memory_write = ["self.*"]
     for id in agent_ids {
         kernel.kill_agent(id).unwrap();
     }
-    kernel.shutdown();
 }

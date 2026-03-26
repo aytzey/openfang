@@ -64,6 +64,31 @@ cargo test --workspace
 
 The test suite is currently 1,744+ tests. All must pass before merging.
 
+### Run The Smoke Harness
+
+Use the shared harness entrypoints when you want the daemon/API and kernel
+smoke suites without remembering individual test files:
+
+```bash
+cargo xtask test-smoke
+```
+
+This runs the deterministic, secret-free smoke path built around the shared
+test harnesses for `openfang-api` and `openfang-kernel`.
+
+### Run The Live Smoke Harness
+
+For real-provider validation, run the gated live smoke suite:
+
+```bash
+export GROQ_API_KEY=gsk_...
+cargo xtask test-live-smoke
+```
+
+These tests skip cleanly if the required provider key is absent. GitHub Actions
+also runs the same suite in the separate `Live Smoke` workflow on a schedule or
+manual dispatch when the secret is configured.
+
 ### Run Tests for a Single Crate
 
 ```bash
@@ -111,6 +136,7 @@ cargo run -- doctor
   - Crate names: `openfang-{name}` (kebab-case)
 - **Dependencies**: Workspace dependencies are declared in the root `Cargo.toml`. Prefer reusing workspace deps over adding new ones. If you need a new dependency, justify it in the PR.
 - **Testing**: Every new feature must include tests. Use `tempfile::TempDir` for filesystem isolation and random port binding for network tests.
+- **Harnesses**: Prefer the shared support modules in `crates/openfang-api/tests/support/` and `crates/openfang-kernel/tests/support/` over copy-pasting kernel/router bootstrap code into each integration test file.
 - **Serde**: All config structs use `#[serde(default)]` for forward compatibility with partial TOML.
 
 ---

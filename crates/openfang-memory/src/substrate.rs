@@ -6,7 +6,7 @@
 use crate::consolidation::ConsolidationEngine;
 use crate::knowledge::KnowledgeStore;
 use crate::migration::run_migrations;
-use crate::semantic::SemanticStore;
+use crate::semantic::{ScoredMemoryMatch, SemanticStore};
 use crate::session::{Session, SessionStore};
 use crate::structured::StructuredStore;
 use crate::usage::UsageStore;
@@ -343,6 +343,18 @@ impl MemorySubstrate {
             .recall_with_embedding(query, limit, filter, query_embedding)
     }
 
+    /// Recall memories with score details for debugging and observability.
+    pub fn recall_scored_with_embedding(
+        &self,
+        query: &str,
+        limit: usize,
+        filter: Option<MemoryFilter>,
+        query_embedding: Option<&[f32]>,
+    ) -> OpenFangResult<Vec<ScoredMemoryMatch>> {
+        self.semantic
+            .recall_scored_with_embedding(query, limit, filter, query_embedding)
+    }
+
     /// Update the embedding for an existing memory.
     pub fn update_embedding(&self, id: MemoryId, embedding: &[f32]) -> OpenFangResult<()> {
         self.semantic.update_embedding(id, embedding)
@@ -361,6 +373,24 @@ impl MemorySubstrate {
         let embedding_owned = query_embedding.map(|e| e.to_vec());
         tokio::task::spawn_blocking(move || {
             store.recall_with_embedding(&query, limit, filter, embedding_owned.as_deref())
+        })
+        .await
+        .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// Async wrapper for `recall_scored_with_embedding`.
+    pub async fn recall_scored_with_embedding_async(
+        &self,
+        query: &str,
+        limit: usize,
+        filter: Option<MemoryFilter>,
+        query_embedding: Option<&[f32]>,
+    ) -> OpenFangResult<Vec<ScoredMemoryMatch>> {
+        let store = self.semantic.clone();
+        let query = query.to_string();
+        let embedding_owned = query_embedding.map(|e| e.to_vec());
+        tokio::task::spawn_blocking(move || {
+            store.recall_scored_with_embedding(&query, limit, filter, embedding_owned.as_deref())
         })
         .await
         .map_err(|e| OpenFangError::Internal(e.to_string()))?

@@ -121,6 +121,7 @@ argon2 = "0.5"
 
 # Lightweight regex
 regex-lite = "0.1"
+unicode-normalization = "0.1"
 
 # Testing
 tokio-test = "0.4"

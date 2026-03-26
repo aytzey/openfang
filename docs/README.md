@@ -1,6 +1,6 @@
 # OpenFang Documentation
 
-Welcome to the OpenFang documentation. OpenFang is the open-source Agent Operating System -- 14 Rust crates, 40 channels, 60 skills, 20 LLM providers, 76 API endpoints, and 16 security systems in a single binary.
+Welcome to the OpenFang documentation. OpenFang is the open-source Agent Operating System -- 14 Rust crates, 40 channels, 60 skills, 20 LLM providers, 77 API endpoints, and 16 security systems in a single binary.
 
 ---
 
@@ -35,7 +35,7 @@ Welcome to the OpenFang documentation. OpenFang is the open-source Agent Operati
 
 | Guide | Description |
 |-------|-------------|
-| [API Reference](api-reference.md) | All 76 REST/WS/SSE endpoints with request/response examples |
+| [API Reference](api-reference.md) | All 77 REST/WS/SSE endpoints with request/response examples |
 | [Desktop App](desktop.md) | Tauri 2.0 native app -- build, features, architecture |
 
 ## Release & Operations
@@ -77,7 +77,7 @@ openfang init && openfang start
 | LLM providers | 20 |
 | Models in catalog | 51 |
 | Model aliases | 23 |
-| API endpoints | 76 |
+| API endpoints | 77 |
 | Security systems | 16 |
 | Tests | 967 |
 

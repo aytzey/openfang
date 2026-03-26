@@ -5,9 +5,9 @@
 //! single-binary deployment while allowing organized source files.
 //!
 //! Features:
-//! - Alpine.js single-panel Sales UI
+//! - Alpine.js single-panel prospecting harness UI
 //! - Dark/light theme toggle with system preference detection
-//! - OAuth + onboarding + lead pipeline controls
+//! - OAuth + onboarding + prospect discovery / profiling controls
 //! - Vendor libraries bundled locally (no CDN dependency)
 
 use axum::http::header;

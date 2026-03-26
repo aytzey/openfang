@@ -7,7 +7,7 @@
           <span class="sales-brand-icon">&#9670;</span>
           <span class="sales-brand-name">OpenFang</span>
           <span class="sales-brand-sep">/</span>
-          <span class="sales-brand-page">Sales</span>
+          <span class="sales-brand-page">Prospecting Harness</span>
         </div>
       </div>
       <div class="sales-topbar-right">
@@ -44,8 +44,8 @@
 
           <!-- Progress header -->
           <div class="sales-section-header">
-            <h2>Kurulum</h2>
-            <p class="text-sm text-dim">Tum adimlar tamamlanmadan operasyon paneline gecilmez.</p>
+            <h2>Prospecting Harness Kurulumu</h2>
+            <p class="text-sm text-dim">Amac: ICP'nize uyan aday musteri hesaplarini bulmak, profillemek ve action-ready hale getirmek.</p>
           </div>
 
           <!-- Step progress bar -->
@@ -153,7 +153,7 @@
                     <option value="ceo_only">Sadece CEO</option>
                   </select>
                 </div>
-                <div class="form-group"><label>Gunluk lead hedefi</label><input type="number" min="1" max="200" class="form-input" x-model.number="profile.daily_target"></div>
+                <div class="form-group"><label>Gunluk profil hedefi</label><input type="number" min="1" max="200" class="form-input" x-model.number="profile.daily_target"></div>
                 <div class="form-group"><label>Gunluk gonderim limiti</label><input type="number" min="1" max="200" class="form-input" x-model.number="profile.daily_send_cap"></div>
                 <div class="form-group"><label>Calisma saati (0-23)</label><input type="number" min="0" max="23" class="form-input" x-model.number="profile.schedule_hour_local"></div>
               </div>
@@ -168,13 +168,13 @@
             </div>
           </section>
 
-          <!-- Step 4: First lead run -->
+          <!-- Step 4: First profiling run -->
           <section class="sales-step-section">
             <div class="sales-step-heading">
               <div class="sales-step-heading-num">4</div>
               <div>
-                <h3>Ilk lead run</h3>
-                <p class="text-xs text-dim">En az 1 lead insert edilince onboarding tamamlanir.</p>
+                <h3>Ilk aday musteri profili run'i</h3>
+                <p class="text-xs text-dim">En az 1 anlamli prospect profile cikinca onboarding tamamlanir.</p>
               </div>
               <button class="btn btn-primary btn-sm" @click="runNow()" :disabled="runningNow" style="margin-left:auto">
                 <span x-show="!runningNow">Ilk run'i baslat</span>
@@ -182,24 +182,30 @@
               </button>
             </div>
             <div class="sales-step-body">
-              <div class="table-wrap" x-show="runLeads.length > 0">
+              <div class="table-wrap" x-show="runProspects.length > 0">
                 <table>
-                  <thead><tr><th>Sirket</th><th>Kisi</th><th>E-posta</th><th>LinkedIn</th><th>Skor</th></tr></thead>
+                  <thead><tr><th>Sirket</th><th>Durum</th><th>Birincil temas</th><th>Kanal</th><th>Fit</th><th>ICP sinyali</th></tr></thead>
                   <tbody>
-                    <template x-for="l in runLeads" :key="l.id">
+                    <template x-for="p in runProspects" :key="p.id">
                       <tr>
-                        <td><span class="font-bold" x-text="l.company"></span><div class="text-xs text-dim" x-text="l.company_domain"></div></td>
-                        <td><span x-text="l.contact_name"></span><div class="text-xs text-dim" x-text="l.contact_title"></div></td>
-                        <td class="text-xs" x-text="l.email || '-'"></td>
-                        <td class="text-xs"><a x-show="l.linkedin_url" :href="l.linkedin_url" target="_blank" rel="noopener">Ac</a><span x-show="!l.linkedin_url">-</span></td>
-                        <td x-text="l.score"></td>
+                        <td><span class="font-bold" x-text="p.company"></span><div class="text-xs text-dim" x-text="p.company_domain"></div></td>
+                        <td><span class="badge" :class="prospectStatusClass(p.profile_status)" x-text="p.profile_status"></span></td>
+                        <td class="text-xs">
+                          <div x-text="prospectPrimaryContact(p)"></div>
+                          <div class="text-dim" x-text="p.contact_count + ' temas'"></div>
+                        </td>
+                        <td class="text-xs" x-text="prospectChannels(p)"></td>
+                        <td x-text="p.fit_score"></td>
+                        <td class="text-xs">
+                          <div class="sales-line-clamp" x-text="prospectSignalsPreview(p).join(' | ') || '-'"></div>
+                        </td>
                       </tr>
                     </template>
                   </tbody>
                 </table>
               </div>
-              <div class="sales-empty" x-show="runLeads.length === 0">
-                <p>Henuz lead yok. Profilinizi doldurup run baslatabilirsiniz.</p>
+              <div class="sales-empty" x-show="runProspects.length === 0">
+                <p>Henuz prospect profile yok. Profilinizi doldurup run baslatabilirsiniz.</p>
               </div>
             </div>
           </section>
@@ -209,7 +215,7 @@
         <div x-show="!showOnboarding">
 
           <div class="sales-section-header">
-            <h2>Operasyon Paneli</h2>
+            <h2>Prospecting Harness</h2>
             <div class="sales-btn-row">
               <button class="btn btn-primary btn-sm" @click="runNow()" :disabled="runningNow">
                 <span x-show="!runningNow">Yeni run al</span>
@@ -225,8 +231,16 @@
               <div class="sales-stat-value" x-text="runs.length"></div>
             </div>
             <div class="sales-stat-card">
-              <div class="sales-stat-label">Toplam lead</div>
-              <div class="sales-stat-value" x-text="leads.length"></div>
+              <div class="sales-stat-label">Prospect profile</div>
+              <div class="sales-stat-value" x-text="prospects.length"></div>
+            </div>
+            <div class="sales-stat-card">
+              <div class="sales-stat-label">Contact-ready</div>
+              <div class="sales-stat-value" x-text="contactReadyProspects"></div>
+            </div>
+            <div class="sales-stat-card">
+              <div class="sales-stat-label">Company-only backlog</div>
+              <div class="sales-stat-value" x-text="companyOnlyProspects"></div>
             </div>
             <div class="sales-stat-card">
               <div class="sales-stat-label">Bekleyen onay</div>
@@ -238,20 +252,154 @@
             </div>
           </div>
 
+          <section class="sales-panel-section">
+            <div class="sales-panel-header">
+              <h3>Run gecmisi</h3>
+              <button class="btn btn-ghost btn-sm" @click="loadRuns()">Yenile</button>
+            </div>
+            <div class="table-wrap" x-show="runs.length > 0">
+              <table>
+                <thead><tr><th>Baslangic</th><th>Durum</th><th>Profil kesfi</th><th>Action-ready</th><th>Onay</th><th>Not</th></tr></thead>
+                <tbody>
+                  <template x-for="r in runs" :key="r.id">
+                    <tr>
+                      <td class="text-xs">
+                        <div x-text="formatDateTime(r.started_at)"></div>
+                        <div class="text-dim sales-mono-id" x-text="r.id"></div>
+                      </td>
+                      <td><span class="badge" :class="runBadgeClass(r)" x-text="r.status"></span></td>
+                      <td x-text="r.discovered"></td>
+                      <td x-text="r.inserted"></td>
+                      <td x-text="r.approvals_queued"></td>
+                      <td class="text-xs">
+                        <div x-show="r.error" class="sales-line-clamp" x-text="r.error"></div>
+                        <button x-show="r.status === 'completed' && r.discovered > 0" class="btn btn-ghost btn-sm" @click="loadRunProspects(r.id)">Profilleri ac</button>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+            <div class="sales-empty" x-show="runs.length === 0">
+              <p>Henuz run yok. Ilk run tamamlandiginda burada listelenir.</p>
+            </div>
+          </section>
+
+          <section class="sales-panel-section">
+            <div class="sales-panel-header">
+              <h3>Aday musteri profilleri</h3>
+              <button class="btn btn-ghost btn-sm" @click="loadProspects()">Yenile</button>
+            </div>
+            <div class="table-wrap" x-show="prospects.length > 0">
+              <table>
+                <thead><tr><th>Sirket</th><th>Durum</th><th>Birincil temas</th><th>Kanal</th><th>Fit</th><th>ICP sinyali</th></tr></thead>
+                <tbody>
+                  <template x-for="p in prospects" :key="p.id">
+                    <tr>
+                        <td>
+                          <span class="font-bold" x-text="p.company"></span>
+                          <div class="text-xs text-dim" x-text="p.company_domain"></div>
+                          <div class="text-xs text-dim sales-line-clamp" x-text="p.summary"></div>
+                          <button class="btn btn-ghost btn-sm" style="margin-top:8px" @click="selectProspect(p)">Profili ac</button>
+                        </td>
+                      <td><span class="badge" :class="prospectStatusClass(p.profile_status)" x-text="p.profile_status"></span></td>
+                      <td class="text-xs">
+                        <div x-text="prospectPrimaryContact(p)"></div>
+                        <div class="text-dim" x-text="p.contact_count + ' temas'"></div>
+                      </td>
+                      <td class="text-xs" x-text="prospectChannels(p)"></td>
+                      <td x-text="p.fit_score"></td>
+                      <td class="text-xs"><div class="sales-line-clamp" x-text="prospectSignalsPreview(p).join(' | ') || '-'"></div></td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+            <div class="sales-empty" x-show="prospects.length === 0">
+              <p>Henuz aday musteri profili yok. Yeni run calistirin.</p>
+            </div>
+          </section>
+
+          <section class="sales-panel-section" x-show="selectedProspectRecord()">
+            <template x-if="selectedProspectRecord()">
+              <div>
+                <div class="sales-panel-header">
+                  <h3>Secili account dossier</h3>
+                  <div class="sales-btn-row">
+                    <span class="badge" :class="prospectResearchClass(selectedProspectRecord().research_status)" x-text="selectedProspectRecord().research_status"></span>
+                    <span class="badge badge-muted" x-text="prospectConfidencePct(selectedProspectRecord())"></span>
+                  </div>
+                </div>
+                <div>
+                  <div class="text-sm" style="margin-bottom:10px" x-text="selectedProspectRecord().summary"></div>
+                  <div class="sales-form-grid">
+                    <div class="form-group">
+                      <label>Birincil temas</label>
+                      <div class="text-sm" x-text="prospectPrimaryContact(selectedProspectRecord())"></div>
+                      <div class="text-xs text-dim" x-text="prospectChannels(selectedProspectRecord())"></div>
+                    </div>
+                    <div class="form-group">
+                      <label>Onerilen ilk kanal</label>
+                      <div class="text-sm" x-text="selectedProspectRecord().recommended_channel"></div>
+                      <div class="text-xs text-dim" x-text="selectedProspectRecord().contact_count + ' temas / ' + selectedProspectRecord().source_count + ' sinyal'"></div>
+                    </div>
+                    <div class="form-group">
+                      <label>Siradaki hamle</label>
+                      <div class="text-sm" x-text="prospectNextAction(selectedProspectRecord())"></div>
+                    </div>
+                    <div class="form-group">
+                      <label>Buyer roles</label>
+                      <div class="text-sm" x-text="(selectedProspectRecord().buyer_roles || []).join(' | ') || '-'"></div>
+                    </div>
+                    <div class="form-group">
+                      <label>Outreach angle</label>
+                      <div class="text-sm" x-text="selectedProspectRecord().outreach_angle || '-'"></div>
+                    </div>
+                    <div class="form-group">
+                      <label>Pain points</label>
+                      <div class="text-sm" x-text="(selectedProspectRecord().pain_points || []).join(' | ') || '-'"></div>
+                    </div>
+                    <div class="form-group">
+                      <label>Trigger events</label>
+                      <div class="text-sm" x-text="(selectedProspectRecord().trigger_events || []).join(' | ') || '-'"></div>
+                    </div>
+                    <div class="form-group">
+                      <label>OSINT baglantilar</label>
+                      <div class="text-xs" x-show="prospectOsintLinks(selectedProspectRecord()).length === 0">-</div>
+                      <div class="text-xs" x-show="prospectOsintLinks(selectedProspectRecord()).length > 0">
+                        <template x-for="link in prospectOsintLinks(selectedProspectRecord())" :key="link">
+                          <div><a :href="link" target="_blank" rel="noreferrer" x-text="link"></a></div>
+                        </template>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </template>
+          </section>
+
           <!-- Approval queue -->
           <section class="sales-panel-section">
             <div class="sales-panel-header">
               <h3>Mesaj onay kuyrugu</h3>
               <button class="btn btn-ghost btn-sm" @click="loadApprovals()">Yenile</button>
             </div>
-            <div class="table-wrap" x-show="approvals.length > 0">
+            <div class="table-wrap" x-show="pendingApprovalItems.length > 0">
               <table>
-                <thead><tr><th>Kanal</th><th>Alici</th><th>Durum</th><th>Olusma</th><th>Aksiyon</th></tr></thead>
+                <thead><tr><th>Kanal</th><th>Alici</th><th>Taslak</th><th>Durum</th><th>Olusma</th><th>Aksiyon</th></tr></thead>
                 <tbody>
-                  <template x-for="a in approvals" :key="a.id">
+                  <template x-for="a in pendingApprovalItems" :key="a.id">
                     <tr>
                       <td x-text="a.channel"></td>
                       <td class="text-xs" x-text="approvalRecipient(a)"></td>
+                      <td class="text-xs">
+                        <details class="sales-preview-card">
+                          <summary>
+                            <span class="font-bold" x-text="approvalTitle(a)"></span>
+                          </summary>
+                          <pre class="sales-preview-body" x-text="approvalBody(a) || '-'"></pre>
+                        </details>
+                      </td>
                       <td><span class="badge" :class="a.status === 'pending' ? 'badge-warn' : (a.status === 'approved' ? 'badge-success' : 'badge-muted')" x-text="a.status"></span></td>
                       <td class="text-xs" x-text="formatDateTime(a.created_at)"></td>
                       <td>
@@ -265,7 +413,7 @@
                 </tbody>
               </table>
             </div>
-            <div class="sales-empty" x-show="approvals.length === 0">
+            <div class="sales-empty" x-show="pendingApprovalItems.length === 0">
               <p>Bekleyen onay yok. Run alarak yeni taslaklar olusturun.</p>
             </div>
           </section>
@@ -273,12 +421,12 @@
           <!-- Leads list -->
           <section class="sales-panel-section">
             <div class="sales-panel-header">
-              <h3>Lead listesi</h3>
+              <h3>Ham contact adaylari</h3>
               <button class="btn btn-ghost btn-sm" @click="loadLeads()">Yenile</button>
             </div>
             <div class="table-wrap" x-show="leads.length > 0">
               <table>
-                <thead><tr><th>Sirket</th><th>Kisi</th><th>E-posta</th><th>LinkedIn</th><th>Skor</th></tr></thead>
+                <thead><tr><th>Sirket</th><th>Kisi</th><th>E-posta</th><th>LinkedIn</th><th>Skor</th><th>ICP sinyali</th></tr></thead>
                 <tbody>
                   <template x-for="l in leads" :key="l.id">
                     <tr>
@@ -287,6 +435,9 @@
                       <td class="text-xs" x-text="l.email || '-'"></td>
                       <td class="text-xs"><a x-show="l.linkedin_url" :href="l.linkedin_url" target="_blank" rel="noopener">Ac</a><span x-show="!l.linkedin_url">-</span></td>
                       <td x-text="l.score"></td>
+                      <td class="text-xs">
+                        <div class="sales-line-clamp" x-text="leadReasonsPreview(l).join(' | ') || '-'"></div>
+                      </td>
                     </tr>
                   </template>
                 </tbody>
@@ -294,6 +445,33 @@
             </div>
             <div class="sales-empty" x-show="leads.length === 0">
               <p>Henuz lead yok. Yeni run calistirin.</p>
+            </div>
+          </section>
+
+          <section class="sales-panel-section" x-show="selectedRunId">
+            <div class="sales-panel-header">
+              <h3>Secili run prospect profilleri</h3>
+              <button class="btn btn-ghost btn-sm" @click="loadRunProspects(selectedRunId)">Yenile</button>
+            </div>
+            <div class="table-wrap" x-show="runProspects.length > 0">
+              <table>
+                <thead><tr><th>Sirket</th><th>Durum</th><th>Birincil temas</th><th>Kanal</th><th>Fit</th><th>ICP sinyali</th></tr></thead>
+                <tbody>
+                  <template x-for="p in runProspects" :key="p.id">
+                    <tr>
+                      <td><span class="font-bold" x-text="p.company"></span><div class="text-xs text-dim" x-text="p.company_domain"></div><button class="btn btn-ghost btn-sm" style="margin-top:8px" @click="selectProspect(p)">Profili ac</button></td>
+                      <td><span class="badge" :class="prospectStatusClass(p.profile_status)" x-text="p.profile_status"></span></td>
+                      <td class="text-xs"><div x-text="prospectPrimaryContact(p)"></div><div class="text-dim" x-text="p.contact_count + ' temas'"></div></td>
+                      <td class="text-xs" x-text="prospectChannels(p)"></td>
+                      <td x-text="p.fit_score"></td>
+                      <td class="text-xs"><div class="sales-line-clamp" x-text="prospectSignalsPreview(p).join(' | ') || '-'"></div></td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+            <div class="sales-empty" x-show="runProspects.length === 0">
+              <p>Bu run icin goruntulenecek prospect profile yok.</p>
             </div>
           </section>
 
@@ -305,7 +483,7 @@
             </div>
             <div class="table-wrap" x-show="deliveries.length > 0">
               <table>
-                <thead><tr><th>Kanal</th><th>Alici</th><th>Durum</th><th>Zaman</th></tr></thead>
+                <thead><tr><th>Kanal</th><th>Alici</th><th>Durum</th><th>Zaman</th><th>Not</th></tr></thead>
                 <tbody>
                   <template x-for="d in deliveries" :key="d.id">
                     <tr>
@@ -313,6 +491,7 @@
                       <td class="text-xs" x-text="d.recipient"></td>
                       <td><span class="badge" :class="d.status === 'sent' ? 'badge-success' : 'badge-error'" x-text="d.status"></span></td>
                       <td class="text-xs" x-text="formatDateTime(d.sent_at)"></td>
+                      <td class="text-xs"><div class="sales-line-clamp" x-text="d.error || '-'"></div></td>
                     </tr>
                   </template>
                 </tbody>

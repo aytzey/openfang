@@ -3441,6 +3441,45 @@ mark.search-highlight {
   border-radius: 0;
 }
 
+.sales-preview-card {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 8px 10px;
+}
+
+.sales-preview-card summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+.sales-preview-card summary::-webkit-details-marker {
+  display: none;
+}
+
+.sales-preview-body {
+  margin: 8px 0 0;
+  white-space: pre-wrap;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.sales-line-clamp {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.sales-mono-id {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  margin-top: 4px;
+  word-break: break-all;
+}
+
 /* Empty states */
 .sales-empty {
   padding: 32px 18px;

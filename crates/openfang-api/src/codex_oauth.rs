@@ -115,9 +115,29 @@ fn auth_file(home_dir: &Path) -> PathBuf {
     home_dir.join("auth").join("codex_oauth.json")
 }
 
+fn logout_marker_file(home_dir: &Path) -> PathBuf {
+    home_dir.join("auth").join("codex_oauth.logged_out")
+}
+
 fn ensure_auth_dir(home_dir: &Path) -> Result<(), String> {
     let dir = home_dir.join("auth");
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create auth dir: {e}"))
+}
+
+fn logout_marker_exists(home_dir: &Path) -> bool {
+    logout_marker_file(home_dir).exists()
+}
+
+fn write_logout_marker(home_dir: &Path) -> Result<(), String> {
+    ensure_auth_dir(home_dir)?;
+    let path = logout_marker_file(home_dir);
+    std::fs::write(&path, b"logged_out")
+        .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+    Ok(())
+}
+
+fn clear_logout_marker(home_dir: &Path) {
+    let _ = std::fs::remove_file(logout_marker_file(home_dir));
 }
 
 fn load_stored_auth(home_dir: &Path) -> Result<Option<StoredCodexAuth>, String> {
@@ -132,7 +152,7 @@ fn load_stored_auth(home_dir: &Path) -> Result<Option<StoredCodexAuth>, String> 
     Ok(Some(auth))
 }
 
-fn save_stored_auth(home_dir: &Path, auth: &StoredCodexAuth) -> Result<(), String> {
+pub(crate) fn save_stored_auth(home_dir: &Path, auth: &StoredCodexAuth) -> Result<(), String> {
     ensure_auth_dir(home_dir)?;
     let path = auth_file(home_dir);
     let json = serde_json::to_string_pretty(auth)
@@ -143,6 +163,7 @@ fn save_stored_auth(home_dir: &Path, auth: &StoredCodexAuth) -> Result<(), Strin
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
+    clear_logout_marker(home_dir);
     Ok(())
 }
 
@@ -329,7 +350,7 @@ fn oauth_callback_html(title: &str, message: &str, success: bool) -> String {
     let action = if success {
         "You can close this tab."
     } else {
-        "Return to Sales and retry Connect OAuth."
+        "Return to Prospecting Harness and retry Connect OAuth."
     };
     let script = if success {
         r#"<script>
@@ -341,7 +362,7 @@ fn oauth_callback_html(title: &str, message: &str, success: bool) -> String {
       return;
     }
   } catch (_) {}
-  setTimeout(() => { window.location.href = "/#sales"; }, 1200);
+  setTimeout(() => { window.location.href = "/#prospecting"; }, 1200);
 })();
 </script>"#
     } else {
@@ -722,7 +743,10 @@ fn update_auth_from_token(auth: &mut StoredCodexAuth, token: TokenResponse, sour
     }
 }
 
-async fn refresh_auth_if_possible(auth: &mut StoredCodexAuth, fallback_client_id: &str) -> bool {
+pub(crate) async fn refresh_auth_if_possible(
+    auth: &mut StoredCodexAuth,
+    fallback_client_id: &str,
+) -> bool {
     let Some(refresh) = auth.refresh_token.clone() else {
         return false;
     };
@@ -820,14 +844,21 @@ fn extract_expiry(v: &serde_json::Value) -> Option<DateTime<Utc>> {
     expires_in.map(|secs| Utc::now() + ChronoDuration::seconds(secs))
 }
 
-fn import_codex_cli_auth(_home_dir: &Path) -> Result<StoredCodexAuth, String> {
-    let home = std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("~"));
-    let path = home.join(".codex").join("auth.json");
-    if !path.exists() {
-        return Err(format!("Codex auth file not found: {}", path.display()));
+pub(crate) fn import_codex_cli_auth(home_dir: &Path) -> Result<StoredCodexAuth, String> {
+    let mut candidates = vec![home_dir.join(".codex").join("auth.json")];
+    if let Ok(home) = std::env::var("HOME") {
+        let cli_path = PathBuf::from(home).join(".codex").join("auth.json");
+        if !candidates.iter().any(|existing| existing == &cli_path) {
+            candidates.push(cli_path);
+        }
     }
+    let path = candidates
+        .into_iter()
+        .find(|candidate| candidate.exists())
+        .ok_or_else(|| {
+            "Codex auth file not found in home_dir/.codex/auth.json or $HOME/.codex/auth.json"
+                .to_string()
+        })?;
 
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
@@ -1175,41 +1206,57 @@ pub async fn codex_oauth_status(State(state): State<Arc<AppState>>) -> impl Into
 
     let mut auth = match load_stored_auth(home) {
         Ok(Some(auth)) => auth,
-        Ok(None) => match import_codex_cli_auth(home) {
-            Ok(mut auth) => {
-                if let Err(e) = ensure_access_token_for_auth(&mut auth, &fallback_client_id).await {
-                    clear_codex_auth_from_runtime(&state);
-                    return (
-                        StatusCode::OK,
-                        Json(serde_json::json!({
-                            "connected": false,
-                            "provider": "openai-codex",
-                            "model": "gpt-5.3-codex",
-                            "reason": e,
-                            "source": auth.source
-                        })),
-                    );
-                }
-                auth.chatgpt_account_id = auth_account_id(&auth);
-                if auth.client_id.is_none() {
-                    auth.client_id = Some(fallback_client_id.clone());
-                }
-                if let Err(_e) = save_stored_auth(home, &auth) {
-                    clear_codex_auth_from_runtime(&state);
-                }
-                auth
-            }
-            Err(_) => {
+        Ok(None) => {
+            if logout_marker_exists(home) {
+                clear_codex_auth_from_runtime(&state);
                 return (
                     StatusCode::OK,
                     Json(serde_json::json!({
                         "connected": false,
                         "provider": "openai-codex",
-                        "model": "gpt-5.3-codex"
+                        "model": "gpt-5.3-codex",
+                        "source": "logged_out"
                     })),
                 );
             }
-        },
+            match import_codex_cli_auth(home) {
+                Ok(mut auth) => {
+                    if let Err(e) =
+                        ensure_access_token_for_auth(&mut auth, &fallback_client_id).await
+                    {
+                        clear_codex_auth_from_runtime(&state);
+                        return (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "connected": false,
+                                "provider": "openai-codex",
+                                "model": "gpt-5.3-codex",
+                                "reason": e,
+                                "source": auth.source
+                            })),
+                        );
+                    }
+                    auth.chatgpt_account_id = auth_account_id(&auth);
+                    if auth.client_id.is_none() {
+                        auth.client_id = Some(fallback_client_id.clone());
+                    }
+                    if let Err(_e) = save_stored_auth(home, &auth) {
+                        clear_codex_auth_from_runtime(&state);
+                    }
+                    auth
+                }
+                Err(_) => {
+                    return (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "connected": false,
+                            "provider": "openai-codex",
+                            "model": "gpt-5.3-codex"
+                        })),
+                    );
+                }
+            }
+        }
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1273,6 +1320,12 @@ pub async fn codex_oauth_status(State(state): State<Arc<AppState>>) -> impl Into
 pub async fn codex_oauth_logout(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let path = auth_file(&state.kernel.config.home_dir);
     let _ = std::fs::remove_file(&path);
+    if let Err(e) = write_logout_marker(&state.kernel.config.home_dir) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
+        );
+    }
     clear_codex_auth_from_runtime(&state);
 
     (

@@ -2,7 +2,7 @@
 
 function app() {
   return {
-    page: 'sales',
+    page: 'prospecting',
     themeMode: localStorage.getItem('openfang-theme-mode') || 'system',
     theme: (() => {
       var mode = localStorage.getItem('openfang-theme-mode') || 'system';
@@ -21,10 +21,10 @@ function app() {
 
       function enforceSalesHash() {
         var hash = (window.location.hash || '').replace('#', '').trim().toLowerCase();
-        if (!hash || hash !== 'sales') {
-          window.location.hash = 'sales';
+        if (!hash || hash !== 'prospecting') {
+          window.location.hash = 'prospecting';
         }
-        self.page = 'sales';
+        self.page = 'prospecting';
       }
 
       window.addEventListener('hashchange', enforceSalesHash);

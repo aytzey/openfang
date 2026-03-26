@@ -15,5 +15,6 @@ pub mod session;
 pub mod structured;
 pub mod usage;
 
+mod lookup;
 mod substrate;
 pub use substrate::MemorySubstrate;

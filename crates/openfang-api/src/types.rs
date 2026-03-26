@@ -48,6 +48,45 @@ pub struct MessageResponse {
     pub iterations: u32,
 }
 
+fn default_memory_search_limit() -> usize {
+    5
+}
+
+/// Query parameters for semantic memory search.
+#[derive(Debug, Deserialize)]
+pub struct MemorySearchQuery {
+    #[serde(rename = "q")]
+    pub query: String,
+    #[serde(default = "default_memory_search_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
+/// A single semantic memory hit returned by the API.
+#[derive(Debug, Serialize)]
+pub struct MemorySearchHit {
+    pub id: String,
+    pub content: String,
+    pub scope: String,
+    pub source: openfang_types::memory::MemorySource,
+    pub confidence: f32,
+    pub access_count: u64,
+    pub score: f32,
+    pub gate: f32,
+    pub lexical_confidence: f32,
+    pub semantic_score: f32,
+    pub lexical_hits: u32,
+}
+
+/// Response payload for semantic memory search.
+#[derive(Debug, Serialize)]
+pub struct MemorySearchResponse {
+    pub query: String,
+    pub strategy: String,
+    pub results: Vec<MemorySearchHit>,
+}
+
 /// Request to install a skill from the marketplace.
 #[derive(Debug, Deserialize)]
 pub struct SkillInstallRequest {

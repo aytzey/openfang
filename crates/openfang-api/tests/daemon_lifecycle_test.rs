@@ -3,16 +3,11 @@
 //! Tests the real daemon startup, PID file management, health serving,
 //! and graceful shutdown sequence.
 
-use axum::Router;
-use openfang_api::middleware;
-use openfang_api::routes::{self, AppState};
+mod support;
+
 use openfang_api::server::{read_daemon_info, DaemonInfo};
-use openfang_kernel::OpenFangKernel;
-use openfang_types::config::{DefaultModelConfig, KernelConfig};
-use std::sync::Arc;
 use std::time::Instant;
-use tower_http::cors::CorsLayer;
-use tower_http::trace::TraceLayer;
+use support::TestServerBuilder;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -89,55 +84,12 @@ fn test_read_daemon_info_corrupt_json() {
 async fn test_full_daemon_lifecycle() {
     let tmp = tempfile::tempdir().unwrap();
     let daemon_info_path = tmp.path().join("daemon.json");
-
-    let config = KernelConfig {
-        home_dir: tmp.path().to_path_buf(),
-        data_dir: tmp.path().join("data"),
-        default_model: DefaultModelConfig {
-            provider: "ollama".to_string(),
-            model: "test".to_string(),
-            api_key_env: "OLLAMA_API_KEY".to_string(),
-            base_url: None,
-            reasoning_effort: None,
-        },
-        ..KernelConfig::default()
-    };
-
-    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
-    let kernel = Arc::new(kernel);
-    kernel.set_self_handle();
-
-    let state = Arc::new(AppState {
-        kernel: kernel.clone(),
-        started_at: Instant::now(),
-        peer_registry: None,
-        bridge_manager: tokio::sync::Mutex::new(None),
-        channels_config: tokio::sync::RwLock::new(Default::default()),
-        shutdown_notify: Arc::new(tokio::sync::Notify::new()),
-    });
-
-    let app = Router::new()
-        .route("/api/health", axum::routing::get(routes::health))
-        .route("/api/status", axum::routing::get(routes::status))
-        .route("/api/shutdown", axum::routing::post(routes::shutdown))
-        .layer(axum::middleware::from_fn(middleware::request_logging))
-        .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
-        .with_state(state.clone());
-
-    // Bind to random port
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    // Spawn server
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+    let server = TestServerBuilder::default().start().await;
 
     // Write daemon info file (like run_daemon does)
     let daemon_info = DaemonInfo {
         pid: std::process::id(),
-        listen_addr: addr.to_string(),
+        listen_addr: server.addr.to_string(),
         started_at: chrono::Utc::now().to_rfc3339(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         platform: std::env::consts::OS.to_string(),
@@ -149,42 +101,35 @@ async fn test_full_daemon_lifecycle() {
     assert!(daemon_info_path.exists());
     let loaded = read_daemon_info(tmp.path()).unwrap();
     assert_eq!(loaded.pid, std::process::id());
-    assert_eq!(loaded.listen_addr, addr.to_string());
+    assert_eq!(loaded.listen_addr, server.addr.to_string());
 
     // --- Verify health endpoint ---
     let client = reqwest::Client::new();
-    let resp = client
-        .get(format!("http://{}/api/health", addr))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(server.url("/api/health")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["status"], "ok");
 
     // --- Verify status endpoint ---
-    let resp = client
-        .get(format!("http://{}/api/status", addr))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(server.url("/api/status")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["status"], "running");
 
     // --- Shutdown ---
     let resp = client
-        .post(format!("http://{}/api/shutdown", addr))
+        .post(server.url("/api/shutdown"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "shutting_down");
+    server.wait_until_stopped().await;
 
     // Clean up daemon info file (like run_daemon does)
     let _ = std::fs::remove_file(&daemon_info_path);
     assert!(!daemon_info_path.exists());
-
-    kernel.shutdown();
 }
 
 /// Test that stale daemon info is detected when no process is running at that PID.
@@ -214,51 +159,12 @@ fn test_stale_daemon_info_detection() {
 /// Test that the server starts and immediately responds to requests.
 #[tokio::test]
 async fn test_server_immediate_responsiveness() {
-    let tmp = tempfile::tempdir().unwrap();
-    let config = KernelConfig {
-        home_dir: tmp.path().to_path_buf(),
-        data_dir: tmp.path().join("data"),
-        default_model: DefaultModelConfig {
-            provider: "ollama".to_string(),
-            model: "test".to_string(),
-            api_key_env: "OLLAMA_API_KEY".to_string(),
-            base_url: None,
-            reasoning_effort: None,
-        },
-        ..KernelConfig::default()
-    };
-
-    let kernel = OpenFangKernel::boot_with_config(config).unwrap();
-    let kernel = Arc::new(kernel);
-
-    let state = Arc::new(AppState {
-        kernel: kernel.clone(),
-        started_at: Instant::now(),
-        peer_registry: None,
-        bridge_manager: tokio::sync::Mutex::new(None),
-        channels_config: tokio::sync::RwLock::new(Default::default()),
-        shutdown_notify: Arc::new(tokio::sync::Notify::new()),
-    });
-
-    let app = Router::new()
-        .route("/api/health", axum::routing::get(routes::health))
-        .with_state(state);
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+    let server = TestServerBuilder::default().start().await;
 
     // Hit health endpoint immediately — should respond fast
     let client = reqwest::Client::new();
     let start = Instant::now();
-    let resp = client
-        .get(format!("http://{}/api/health", addr))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(server.url("/api/health")).send().await.unwrap();
     let latency = start.elapsed();
 
     assert_eq!(resp.status(), 200);
@@ -267,6 +173,4 @@ async fn test_server_immediate_responsiveness() {
         "Health endpoint should respond in <1s, took {}ms",
         latency.as_millis()
     );
-
-    kernel.shutdown();
 }

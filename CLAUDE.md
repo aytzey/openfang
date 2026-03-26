@@ -12,6 +12,7 @@ After every feature implementation, run ALL THREE checks:
 cargo build --workspace --lib          # Must compile (use --lib if exe is locked)
 cargo test --workspace                 # All tests must pass (currently 1744+)
 cargo clippy --workspace --all-targets -- -D warnings  # Zero warnings
+cargo xtask test-smoke                 # Shared daemon/API + kernel smoke harness
 ```
 
 ## MANDATORY: Live Integration Testing
@@ -22,6 +23,16 @@ cargo clippy --workspace --all-targets -- -D warnings  # Zero warnings
 - Endpoints that compile but return wrong/empty data
 
 ### How to Run Live Integration Tests
+
+Prefer the shared live harness before dropping into ad hoc endpoint checks:
+
+```bash
+GROQ_API_KEY=<key> cargo xtask test-live-smoke
+```
+
+The live harness covers the real HTTP agent-message path plus direct kernel and
+workflow live checks. The manual steps below remain useful for endpoint-by-endpoint
+debugging after the harness has identified a failure.
 
 #### Step 1: Stop any running daemon
 ```bash

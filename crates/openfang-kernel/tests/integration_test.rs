@@ -2,39 +2,19 @@
 //!
 //! Run with: GROQ_API_KEY=gsk_... cargo test -p openfang-kernel --test integration_test -- --nocapture
 
-use openfang_kernel::OpenFangKernel;
 use openfang_types::agent::AgentManifest;
-use openfang_types::config::{DefaultModelConfig, KernelConfig};
+mod support;
 
-fn test_config() -> KernelConfig {
-    let tmp = std::env::temp_dir().join("openfang-integration-test");
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).unwrap();
-
-    KernelConfig {
-        home_dir: tmp.clone(),
-        data_dir: tmp.join("data"),
-        default_model: DefaultModelConfig {
-            provider: "groq".to_string(),
-            model: "llama-3.3-70b-versatile".to_string(),
-            api_key_env: "GROQ_API_KEY".to_string(),
-            base_url: None,
-            reasoning_effort: None,
-        },
-        ..KernelConfig::default()
-    }
-}
+use support::{skip_if_env_missing, TestKernelHarness, GROQ_TEST_MODEL};
 
 #[tokio::test]
 async fn test_full_pipeline_with_groq() {
-    if std::env::var("GROQ_API_KEY").is_err() {
-        eprintln!("GROQ_API_KEY not set, skipping integration test");
+    if skip_if_env_missing("GROQ_API_KEY", "kernel live integration test") {
         return;
     }
 
-    // Boot kernel
-    let config = test_config();
-    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+    let harness = TestKernelHarness::boot(GROQ_TEST_MODEL);
+    let kernel = harness.kernel.as_ref();
 
     // Spawn agent
     let manifest: AgentManifest = toml::from_str(
@@ -86,13 +66,12 @@ memory_write = ["self.*"]
 
 #[tokio::test]
 async fn test_multiple_agents_different_models() {
-    if std::env::var("GROQ_API_KEY").is_err() {
-        eprintln!("GROQ_API_KEY not set, skipping integration test");
+    if skip_if_env_missing("GROQ_API_KEY", "kernel multi-model live integration test") {
         return;
     }
 
-    let config = test_config();
-    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+    let harness = TestKernelHarness::boot(GROQ_TEST_MODEL);
+    let kernel = harness.kernel.as_ref();
 
     // Spawn agent 1: llama 70b
     let manifest1: AgentManifest = toml::from_str(
@@ -160,5 +139,4 @@ memory_write = ["self.*"]
     // Cleanup
     kernel.kill_agent(id1).unwrap();
     kernel.kill_agent(id2).unwrap();
-    kernel.shutdown();
 }

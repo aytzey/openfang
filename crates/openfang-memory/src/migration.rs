@@ -2,10 +2,11 @@
 //!
 //! Creates all tables needed by the memory substrate on first boot.
 
+use crate::lookup::extract_hashed_ngrams;
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -37,6 +38,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 7 {
         migrate_v7(conn)?;
+    }
+
+    if current_version < 8 {
+        migrate_v8(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -299,6 +304,57 @@ fn migrate_v7(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+/// Version 8: Add deterministic hashed n-gram lookup index for memory recall.
+fn migrate_v8(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS memory_lookup_index (
+            memory_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            ngram_hash INTEGER NOT NULL,
+            ngram_order INTEGER NOT NULL,
+            hash_head INTEGER NOT NULL,
+            PRIMARY KEY (memory_id, ngram_hash, ngram_order, hash_head)
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_lookup_agent_hash
+            ON memory_lookup_index(agent_id, ngram_hash, ngram_order, hash_head);
+        CREATE INDEX IF NOT EXISTS idx_memory_lookup_memory
+            ON memory_lookup_index(memory_id);
+        ",
+    )?;
+
+    let existing_memories: Vec<(String, String, String)> = conn
+        .prepare("SELECT id, agent_id, content FROM memories WHERE deleted = 0")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .filter_map(|row| row.ok())
+        .collect();
+
+    let mut insert = conn.prepare(
+        "INSERT OR IGNORE INTO memory_lookup_index
+         (memory_id, agent_id, ngram_hash, ngram_order, hash_head)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+
+    for (memory_id, agent_id, content) in existing_memories {
+        for slot in extract_hashed_ngrams(&content) {
+            insert.execute(rusqlite::params![
+                memory_id,
+                agent_id,
+                slot.hash,
+                slot.order as i64,
+                slot.head as i64,
+            ])?;
+        }
+    }
+
+    conn.execute(
+        "INSERT OR IGNORE INTO migrations (version, applied_at, description)
+         VALUES (8, datetime('now'), 'Add deterministic memory lookup index')",
+        [],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,6 +377,7 @@ mod tests {
         assert!(tables.contains(&"sessions".to_string()));
         assert!(tables.contains(&"kv_store".to_string()));
         assert!(tables.contains(&"memories".to_string()));
+        assert!(tables.contains(&"memory_lookup_index".to_string()));
         assert!(tables.contains(&"entities".to_string()));
         assert!(tables.contains(&"relations".to_string()));
     }

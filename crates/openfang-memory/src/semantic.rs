@@ -1,17 +1,21 @@
-//! Semantic memory store with vector embedding support.
+//! Semantic memory store with hybrid lookup support.
 //!
-//! Phase 1: SQLite LIKE matching (fallback when no embeddings).
-//! Phase 2: Vector cosine similarity search using stored embeddings.
+//! Recall uses a two-stage path:
+//! 1. Deterministic hashed n-gram lookup to fetch candidates cheaply.
+//! 2. Context-aware gating that fuses lexical priors with semantic similarity.
 //!
-//! Embeddings are stored as BLOBs in the `embedding` column of the memories table.
-//! When a query embedding is provided, recall uses cosine similarity ranking.
-//! When no embeddings are available, falls back to LIKE matching.
+//! This keeps memory recall fast and robust even when the store grows, while
+//! still using embeddings when they are available.
 
+use crate::lookup::{
+    canonical_tokens, extract_hashed_ngrams, token_overlap_score, total_slot_weight,
+};
 use chrono::Utc;
 use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::memory::{MemoryFilter, MemoryFragment, MemoryId, MemorySource};
-use rusqlite::Connection;
+use rusqlite::{types::Value, Connection};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tracing::debug;
@@ -20,6 +24,17 @@ use tracing::debug;
 #[derive(Clone)]
 pub struct SemanticStore {
     conn: Arc<Mutex<Connection>>,
+}
+
+/// Ranked semantic recall result with score breakdown.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScoredMemoryMatch {
+    pub fragment: MemoryFragment,
+    pub score: f32,
+    pub gate: f32,
+    pub lexical_confidence: f32,
+    pub semantic_score: f32,
+    pub lexical_hits: u32,
 }
 
 impl SemanticStore {
@@ -77,6 +92,8 @@ impl SemanticStore {
             ],
         )
         .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        index_memory_lookup_rows(&conn, &id.0.to_string(), &agent_id.0.to_string(), content)?;
         Ok(id)
     }
 
@@ -99,181 +116,133 @@ impl SemanticStore {
         filter: Option<MemoryFilter>,
         query_embedding: Option<&[f32]>,
     ) -> OpenFangResult<Vec<MemoryFragment>> {
+        Ok(self
+            .recall_scored_with_embedding(query, limit, filter, query_embedding)?
+            .into_iter()
+            .map(|hit| hit.fragment)
+            .collect())
+    }
+
+    /// Search for memories and return score details for observability/debugging.
+    pub fn recall_scored_with_embedding(
+        &self,
+        query: &str,
+        limit: usize,
+        filter: Option<MemoryFilter>,
+        query_embedding: Option<&[f32]>,
+    ) -> OpenFangResult<Vec<ScoredMemoryMatch>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| OpenFangError::Internal(e.to_string()))?;
 
-        // Build SQL: fetch candidates (broader than limit for vector re-ranking)
-        let fetch_limit = if query_embedding.is_some() {
-            // Fetch more candidates for vector search re-ranking
-            (limit * 10).max(100)
-        } else {
-            limit
-        };
+        let query_slots = extract_hashed_ngrams(query);
+        let query_tokens = canonical_tokens(query);
+        let query_slot_weight = total_slot_weight(&query_slots).max(1.0);
+        let candidate_limit = (limit * 8).max(40);
+        let lexical_limit = ((candidate_limit as f32) * 0.75).round() as usize;
 
-        let mut sql = String::from(
-            "SELECT id, agent_id, content, source, scope, confidence, metadata, created_at, accessed_at, access_count, embedding
-             FROM memories WHERE deleted = 0",
-        );
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        let mut param_idx = 1;
+        let mut candidate_signals = HashMap::<String, CandidateSignal>::new();
 
-        // Text search filter (only when no embeddings — vector search handles relevance)
-        if query_embedding.is_none() && !query.is_empty() {
-            sql.push_str(&format!(" AND content LIKE ?{param_idx}"));
-            params.push(Box::new(format!("%{query}%")));
-            param_idx += 1;
-        }
-
-        // Apply filters
-        if let Some(ref f) = filter {
-            if let Some(agent_id) = f.agent_id {
-                sql.push_str(&format!(" AND agent_id = ?{param_idx}"));
-                params.push(Box::new(agent_id.0.to_string()));
-                param_idx += 1;
-            }
-            if let Some(ref scope) = f.scope {
-                sql.push_str(&format!(" AND scope = ?{param_idx}"));
-                params.push(Box::new(scope.clone()));
-                param_idx += 1;
-            }
-            if let Some(min_conf) = f.min_confidence {
-                sql.push_str(&format!(" AND confidence >= ?{param_idx}"));
-                params.push(Box::new(min_conf as f64));
-                param_idx += 1;
-            }
-            if let Some(ref source) = f.source {
-                let source_str = serde_json::to_string(source)
-                    .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
-                sql.push_str(&format!(" AND source = ?{param_idx}"));
-                params.push(Box::new(source_str));
-                let _ = param_idx;
-            }
-        }
-
-        sql.push_str(" ORDER BY accessed_at DESC, access_count DESC");
-        sql.push_str(&format!(" LIMIT {fetch_limit}"));
-
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
-
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
-        let rows = stmt
-            .query_map(param_refs.as_slice(), |row| {
-                let id_str: String = row.get(0)?;
-                let agent_str: String = row.get(1)?;
-                let content: String = row.get(2)?;
-                let source_str: String = row.get(3)?;
-                let scope: String = row.get(4)?;
-                let confidence: f64 = row.get(5)?;
-                let meta_str: String = row.get(6)?;
-                let created_str: String = row.get(7)?;
-                let accessed_str: String = row.get(8)?;
-                let access_count: i64 = row.get(9)?;
-                let embedding_bytes: Option<Vec<u8>> = row.get(10)?;
-                Ok((
-                    id_str,
-                    agent_str,
-                    content,
-                    source_str,
-                    scope,
-                    confidence,
-                    meta_str,
-                    created_str,
-                    accessed_str,
-                    access_count,
-                    embedding_bytes,
-                ))
-            })
-            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
-
-        let mut fragments = Vec::new();
-        for row_result in rows {
-            let (
-                id_str,
-                agent_str,
-                content,
-                source_str,
-                scope,
-                confidence,
-                meta_str,
-                created_str,
-                accessed_str,
-                access_count,
-                embedding_bytes,
-            ) = row_result.map_err(|e| OpenFangError::Memory(e.to_string()))?;
-
-            let id = uuid::Uuid::parse_str(&id_str)
-                .map(MemoryId)
-                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
-            let agent_id = uuid::Uuid::parse_str(&agent_str)
-                .map(openfang_types::agent::AgentId)
-                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
-            let source: MemorySource =
-                serde_json::from_str(&source_str).unwrap_or(MemorySource::System);
-            let metadata: HashMap<String, serde_json::Value> =
-                serde_json::from_str(&meta_str).unwrap_or_default();
-            let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
-            let accessed_at = chrono::DateTime::parse_from_rfc3339(&accessed_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
-
-            let embedding = embedding_bytes.as_deref().map(embedding_from_bytes);
-
-            fragments.push(MemoryFragment {
-                id,
-                agent_id,
-                content,
-                embedding,
-                metadata,
-                source,
-                confidence: confidence as f32,
-                created_at,
-                accessed_at,
-                access_count: access_count as u64,
-                scope,
-            });
-        }
-
-        // If we have a query embedding, re-rank by cosine similarity
-        if let Some(qe) = query_embedding {
-            fragments.sort_by(|a, b| {
-                let sim_a = a
-                    .embedding
-                    .as_deref()
-                    .map(|e| cosine_similarity(qe, e))
-                    .unwrap_or(-1.0);
-                let sim_b = b
-                    .embedding
-                    .as_deref()
-                    .map(|e| cosine_similarity(qe, e))
-                    .unwrap_or(-1.0);
-                sim_b
-                    .partial_cmp(&sim_a)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            fragments.truncate(limit);
-            debug!(
-                "Vector recall: {} results from {} candidates",
-                fragments.len(),
-                fetch_limit
+        for candidate in lookup_candidates(
+            &conn,
+            &query_slots,
+            lexical_limit.max(limit),
+            filter.as_ref(),
+        )? {
+            candidate_signals.insert(
+                candidate.id.clone(),
+                CandidateSignal {
+                    lexical_weight: candidate.lexical_weight,
+                    lexical_hits: candidate.lexical_hits,
+                },
             );
         }
+
+        if candidate_signals.len() < candidate_limit {
+            let recent_candidates = recent_candidates(
+                &conn,
+                candidate_limit - candidate_signals.len(),
+                filter.as_ref(),
+                query_embedding.is_some(),
+            )?;
+            for id in recent_candidates {
+                candidate_signals.entry(id).or_default();
+            }
+        }
+
+        if query_embedding.is_some() && candidate_signals.len() < candidate_limit {
+            let recent_candidates = recent_candidates(
+                &conn,
+                candidate_limit - candidate_signals.len(),
+                filter.as_ref(),
+                false,
+            )?;
+            for id in recent_candidates {
+                candidate_signals.entry(id).or_default();
+            }
+        }
+
+        if candidate_signals.is_empty() && !query.is_empty() {
+            let fallback = text_match_candidates(&conn, query, candidate_limit, filter.as_ref())?;
+            for id in fallback {
+                candidate_signals.entry(id).or_default();
+            }
+        }
+
+        if candidate_signals.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let candidate_ids: Vec<String> = candidate_signals.keys().cloned().collect();
+        let mut scored: Vec<ScoredMemoryMatch> = fetch_fragments_by_ids(&conn, &candidate_ids)?
+            .into_iter()
+            .map(|fragment| {
+                let signal = candidate_signals
+                    .get(&fragment.id.0.to_string())
+                    .cloned()
+                    .unwrap_or_default();
+
+                let lexical_confidence =
+                    (signal.lexical_weight / query_slot_weight).clamp(0.0, 1.0);
+                let semantic_score = semantic_agreement(query_embedding, &query_tokens, &fragment);
+                let gate = sigmoid(4.0 * semantic_score + 2.0 * lexical_confidence - 2.0);
+                let access_boost =
+                    ((fragment.access_count as f32 + 1.0).ln() / 4.0).clamp(0.0, 1.0);
+                let recency_boost = recency_boost(fragment.accessed_at);
+                let score = gate * (0.55 * semantic_score + 0.45 * lexical_confidence)
+                    + 0.05 * access_boost
+                    + 0.05 * recency_boost
+                    + 0.01 * signal.lexical_hits as f32;
+
+                ScoredMemoryMatch {
+                    fragment,
+                    score,
+                    gate,
+                    lexical_confidence,
+                    semantic_score,
+                    lexical_hits: signal.lexical_hits,
+                }
+            })
+            .collect();
+
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let hits: Vec<ScoredMemoryMatch> = scored.into_iter().take(limit).collect();
 
         // Update access counts for returned memories
-        for frag in &fragments {
+        for hit in &hits {
             let _ = conn.execute(
                 "UPDATE memories SET access_count = access_count + 1, accessed_at = ?1 WHERE id = ?2",
-                rusqlite::params![Utc::now().to_rfc3339(), frag.id.0.to_string()],
+                rusqlite::params![Utc::now().to_rfc3339(), hit.fragment.id.0.to_string()],
             );
         }
 
-        Ok(fragments)
+        Ok(hits)
     }
 
     /// Soft-delete a memory fragment.
@@ -282,6 +251,11 @@ impl SemanticStore {
             .conn
             .lock()
             .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        conn.execute(
+            "DELETE FROM memory_lookup_index WHERE memory_id = ?1",
+            rusqlite::params![id.0.to_string()],
+        )
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
         conn.execute(
             "UPDATE memories SET deleted = 1 WHERE id = ?1",
             rusqlite::params![id.0.to_string()],
@@ -304,6 +278,313 @@ impl SemanticStore {
         .map_err(|e| OpenFangError::Memory(e.to_string()))?;
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct CandidateSignal {
+    lexical_weight: f32,
+    lexical_hits: u32,
+}
+
+#[derive(Debug, Clone)]
+struct LookupCandidate {
+    id: String,
+    lexical_weight: f32,
+    lexical_hits: u32,
+}
+
+fn lookup_candidates(
+    conn: &Connection,
+    query_slots: &[crate::lookup::HashedNgram],
+    limit: usize,
+    filter: Option<&MemoryFilter>,
+) -> OpenFangResult<Vec<LookupCandidate>> {
+    if query_slots.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let values_sql = std::iter::repeat_n("(?, ?, ?, ?)", query_slots.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut sql = format!(
+        "WITH lookup(ngram_hash, ngram_order, hash_head, weight) AS (VALUES {values_sql})
+         SELECT m.id, SUM(lookup.weight) AS lexical_weight, COUNT(*) AS lexical_hits
+         FROM lookup
+         JOIN memory_lookup_index idx
+           ON idx.ngram_hash = lookup.ngram_hash
+          AND idx.ngram_order = lookup.ngram_order
+          AND idx.hash_head = lookup.hash_head
+         JOIN memories m ON m.id = idx.memory_id
+         WHERE m.deleted = 0"
+    );
+
+    let mut params = Vec::<Value>::new();
+    for slot in query_slots {
+        params.push(Value::Integer(slot.hash));
+        params.push(Value::Integer(slot.order as i64));
+        params.push(Value::Integer(slot.head as i64));
+        params.push(Value::Real(slot.weight as f64));
+    }
+    append_filter_clauses(&mut sql, &mut params, filter)?;
+
+    sql.push_str(
+        " GROUP BY m.id ORDER BY lexical_weight DESC, lexical_hits DESC, MAX(m.accessed_at) DESC",
+    );
+    sql.push_str(&format!(" LIMIT {}", limit.max(1)));
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok(LookupCandidate {
+                id: row.get(0)?,
+                lexical_weight: row.get::<_, f64>(1)? as f32,
+                lexical_hits: row.get::<_, i64>(2)? as u32,
+            })
+        })
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+    let mut candidates = Vec::new();
+    for row in rows {
+        candidates.push(row.map_err(|e| OpenFangError::Memory(e.to_string()))?);
+    }
+
+    debug!(
+        hits = candidates.len(),
+        slots = query_slots.len(),
+        "Deterministic lexical lookup produced candidates"
+    );
+
+    Ok(candidates)
+}
+
+fn recent_candidates(
+    conn: &Connection,
+    limit: usize,
+    filter: Option<&MemoryFilter>,
+    require_embedding: bool,
+) -> OpenFangResult<Vec<String>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut sql = String::from("SELECT m.id FROM memories m WHERE m.deleted = 0");
+    let mut params = Vec::<Value>::new();
+    if require_embedding {
+        sql.push_str(" AND m.embedding IS NOT NULL");
+    }
+    append_filter_clauses(&mut sql, &mut params, filter)?;
+    sql.push_str(" ORDER BY accessed_at DESC, access_count DESC");
+    sql.push_str(&format!(" LIMIT {}", limit));
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| row.get(0))
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+    let mut ids = Vec::new();
+    for row in rows {
+        ids.push(row.map_err(|e| OpenFangError::Memory(e.to_string()))?);
+    }
+    Ok(ids)
+}
+
+fn text_match_candidates(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    filter: Option<&MemoryFilter>,
+) -> OpenFangResult<Vec<String>> {
+    let mut sql =
+        String::from("SELECT m.id FROM memories m WHERE m.deleted = 0 AND m.content LIKE ?");
+    let mut params = vec![Value::Text(format!("%{query}%"))];
+    append_filter_clauses(&mut sql, &mut params, filter)?;
+    sql.push_str(" ORDER BY accessed_at DESC, access_count DESC");
+    sql.push_str(&format!(" LIMIT {}", limit.max(1)));
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| row.get(0))
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+    let mut ids = Vec::new();
+    for row in rows {
+        ids.push(row.map_err(|e| OpenFangError::Memory(e.to_string()))?);
+    }
+    Ok(ids)
+}
+
+fn fetch_fragments_by_ids(
+    conn: &Connection,
+    ids: &[String],
+) -> OpenFangResult<Vec<MemoryFragment>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = std::iter::repeat_n("?", ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT id, agent_id, content, source, scope, confidence, metadata, created_at, accessed_at, access_count, embedding
+         FROM memories
+         WHERE deleted = 0 AND id IN ({placeholders})"
+    );
+
+    let params: Vec<Value> = ids.iter().cloned().map(Value::Text).collect();
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params_from_iter(params.iter()),
+            parse_memory_fragment,
+        )
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+    let mut fragments = Vec::new();
+    for row in rows {
+        fragments.push(row.map_err(|e| OpenFangError::Memory(e.to_string()))?);
+    }
+    Ok(fragments)
+}
+
+fn parse_memory_fragment(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryFragment> {
+    let id_str: String = row.get(0)?;
+    let agent_str: String = row.get(1)?;
+    let content: String = row.get(2)?;
+    let source_str: String = row.get(3)?;
+    let scope: String = row.get(4)?;
+    let confidence: f64 = row.get(5)?;
+    let meta_str: String = row.get(6)?;
+    let created_str: String = row.get(7)?;
+    let accessed_str: String = row.get(8)?;
+    let access_count: i64 = row.get(9)?;
+    let embedding_bytes: Option<Vec<u8>> = row.get(10)?;
+
+    let id = uuid::Uuid::parse_str(&id_str).map(MemoryId).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let agent_id = uuid::Uuid::parse_str(&agent_str)
+        .map(openfang_types::agent::AgentId)
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+    let source: MemorySource = serde_json::from_str(&source_str).unwrap_or(MemorySource::System);
+    let metadata: HashMap<String, serde_json::Value> =
+        serde_json::from_str(&meta_str).unwrap_or_default();
+    let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now());
+    let accessed_at = chrono::DateTime::parse_from_rfc3339(&accessed_str)
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now());
+    let embedding = embedding_bytes.as_deref().map(embedding_from_bytes);
+
+    Ok(MemoryFragment {
+        id,
+        agent_id,
+        content,
+        embedding,
+        metadata,
+        source,
+        confidence: confidence as f32,
+        created_at,
+        accessed_at,
+        access_count: access_count as u64,
+        scope,
+    })
+}
+
+fn append_filter_clauses(
+    sql: &mut String,
+    params: &mut Vec<Value>,
+    filter: Option<&MemoryFilter>,
+) -> OpenFangResult<()> {
+    if let Some(filter) = filter {
+        if let Some(agent_id) = filter.agent_id {
+            sql.push_str(" AND m.agent_id = ?");
+            params.push(Value::Text(agent_id.0.to_string()));
+        }
+        if let Some(scope) = &filter.scope {
+            sql.push_str(" AND m.scope = ?");
+            params.push(Value::Text(scope.clone()));
+        }
+        if let Some(min_conf) = filter.min_confidence {
+            sql.push_str(" AND m.confidence >= ?");
+            params.push(Value::Real(min_conf as f64));
+        }
+        if let Some(source) = &filter.source {
+            let source_str = serde_json::to_string(source)
+                .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
+            sql.push_str(" AND m.source = ?");
+            params.push(Value::Text(source_str));
+        }
+        if let Some(after) = filter.after {
+            sql.push_str(" AND m.created_at >= ?");
+            params.push(Value::Text(after.to_rfc3339()));
+        }
+        if let Some(before) = filter.before {
+            sql.push_str(" AND m.created_at <= ?");
+            params.push(Value::Text(before.to_rfc3339()));
+        }
+    }
+    Ok(())
+}
+
+fn index_memory_lookup_rows(
+    conn: &Connection,
+    memory_id: &str,
+    agent_id: &str,
+    content: &str,
+) -> OpenFangResult<()> {
+    let mut stmt = conn
+        .prepare(
+            "INSERT OR IGNORE INTO memory_lookup_index
+             (memory_id, agent_id, ngram_hash, ngram_order, hash_head)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+    for slot in extract_hashed_ngrams(content) {
+        stmt.execute(rusqlite::params![
+            memory_id,
+            agent_id,
+            slot.hash,
+            slot.order as i64,
+            slot.head as i64,
+        ])
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+    }
+
+    Ok(())
+}
+
+fn semantic_agreement(
+    query_embedding: Option<&[f32]>,
+    query_tokens: &[String],
+    fragment: &MemoryFragment,
+) -> f32 {
+    if let (Some(query), Some(embedding)) = (query_embedding, fragment.embedding.as_deref()) {
+        return cosine_similarity(query, embedding).clamp(0.0, 1.0);
+    }
+
+    token_overlap_score(query_tokens, &fragment.content)
+}
+
+fn recency_boost(accessed_at: chrono::DateTime<Utc>) -> f32 {
+    let age_hours = (Utc::now() - accessed_at).num_hours().max(0) as f32;
+    (1.0 / (1.0 + age_hours / (24.0 * 14.0))).clamp(0.0, 1.0)
+}
+
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
 }
 
 /// Compute cosine similarity between two vectors.
@@ -402,6 +683,32 @@ mod tests {
     }
 
     #[test]
+    fn test_recall_normalizes_unicode_and_case() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        store
+            .remember(
+                agent_id,
+                "Ａlexander THE Great could tame Bucephalus",
+                MemorySource::Conversation,
+                "episodic",
+                HashMap::new(),
+            )
+            .unwrap();
+
+        let results = store
+            .recall(
+                "alexander the great",
+                5,
+                Some(MemoryFilter::agent(agent_id)),
+            )
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].content.contains("Bucephalus"));
+    }
+
+    #[test]
     fn test_forget() {
         let store = setup();
         let agent_id = AgentId::new();
@@ -492,6 +799,55 @@ mod tests {
     }
 
     #[test]
+    fn test_lookup_retrieves_older_embedded_memory_beyond_recent_window() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        let target_embedding = vec![1.0, 0.0, 0.0, 0.0];
+        let target_content = "rare rust ownership lifetime pattern";
+
+        store
+            .remember_with_embedding(
+                agent_id,
+                target_content,
+                MemorySource::Conversation,
+                "episodic",
+                HashMap::new(),
+                Some(&target_embedding),
+            )
+            .unwrap();
+
+        for i in 0..150 {
+            let filler_embedding = if i % 2 == 0 {
+                vec![0.0, 1.0, 0.0, 0.0]
+            } else {
+                vec![0.0, 0.0, 1.0, 0.0]
+            };
+            store
+                .remember_with_embedding(
+                    agent_id,
+                    &format!("filler memory {i} unrelated topic"),
+                    MemorySource::Conversation,
+                    "episodic",
+                    HashMap::new(),
+                    Some(&filler_embedding),
+                )
+                .unwrap();
+        }
+
+        let results = store
+            .recall_with_embedding(
+                target_content,
+                5,
+                Some(MemoryFilter::agent(agent_id)),
+                Some(&target_embedding),
+            )
+            .unwrap();
+
+        assert!(!results.is_empty());
+        assert_eq!(results[0].content, target_content);
+    }
+
+    #[test]
     fn test_update_embedding() {
         let store = setup();
         let agent_id = AgentId::new();
@@ -552,5 +908,40 @@ mod tests {
         assert_eq!(results.len(), 2);
         // Embedded memory should rank first
         assert_eq!(results[0].content, "Has embedding");
+    }
+
+    #[test]
+    fn test_recall_scored_with_embedding_exposes_score_breakdown() {
+        let store = setup();
+        let agent_id = AgentId::new();
+
+        store
+            .remember(
+                agent_id,
+                "Alexander the Great defeated Darius",
+                MemorySource::Conversation,
+                "episodic",
+                HashMap::new(),
+            )
+            .unwrap();
+
+        let hits = store
+            .recall_scored_with_embedding(
+                "alexander the great",
+                3,
+                Some(MemoryFilter::agent(agent_id)),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].fragment.content,
+            "Alexander the Great defeated Darius"
+        );
+        assert!(hits[0].score > 0.0);
+        assert!(hits[0].gate > 0.0);
+        assert!(hits[0].lexical_confidence > 0.0);
+        assert!(hits[0].lexical_hits >= 1);
     }
 }

@@ -534,6 +534,42 @@ Delete a key-value pair.
 }
 ```
 
+### GET /api/memory/agents/{id}/search
+
+Search an agent's semantic memory using OpenFang's hybrid conditional-memory path. The endpoint first uses deterministic hashed 2/3-gram lookup to fetch cheap candidates, then re-ranks them with semantic similarity when an embedding driver is available.
+
+**Query Parameters**:
+
+- `q` (required): search text
+- `limit` (optional, default `5`, max `20`): number of results
+- `scope` (optional): restrict recall to a memory scope such as `episodic`
+
+**Response** `200 OK`:
+
+```json
+{
+  "query": "rare rust ownership lifetime pattern",
+  "strategy": "deterministic_lookup",
+  "results": [
+    {
+      "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "content": "rare rust ownership lifetime pattern",
+      "scope": "episodic",
+      "source": "conversation",
+      "confidence": 1.0,
+      "access_count": 0,
+      "score": 0.93,
+      "gate": 0.88,
+      "lexical_confidence": 1.0,
+      "semantic_score": 1.0,
+      "lexical_hits": 4
+    }
+  ]
+}
+```
+
+`strategy` is `hybrid_lookup_vector` when embedding-based reranking succeeds, and `deterministic_lookup` when the system falls back to lexical lookup only.
+
 ---
 
 ## Channel Endpoints
@@ -2136,7 +2172,7 @@ The `Retry-After` header indicates the window duration in seconds.
 
 ## Endpoint Summary
 
-**76 endpoints total** across 15 groups.
+**77 endpoints total** across 15 groups.
 
 | Method | Path | Description |
 |--------|------|-------------|

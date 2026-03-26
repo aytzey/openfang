@@ -6,32 +6,16 @@
 //! LLM tests require GROQ_API_KEY. Non-LLM tests verify the kernel-level
 //! workflow wiring without making real API calls.
 
+mod support;
+
 use openfang_kernel::workflow::{
     ErrorMode, StepAgent, StepMode, Workflow, WorkflowId, WorkflowStep,
 };
-use openfang_kernel::OpenFangKernel;
 use openfang_types::agent::AgentManifest;
-use openfang_types::config::{DefaultModelConfig, KernelConfig};
-use std::sync::Arc;
-
-fn test_config(provider: &str, model: &str, api_key_env: &str) -> KernelConfig {
-    let tmp = tempfile::tempdir().unwrap();
-    KernelConfig {
-        home_dir: tmp.path().to_path_buf(),
-        data_dir: tmp.path().join("data"),
-        default_model: DefaultModelConfig {
-            provider: provider.to_string(),
-            model: model.to_string(),
-            api_key_env: api_key_env.to_string(),
-            base_url: None,
-            reasoning_effort: None,
-        },
-        ..KernelConfig::default()
-    }
-}
+use support::{skip_if_env_missing, TestKernelHarness, GROQ_TEST_MODEL, OLLAMA_TEST_MODEL};
 
 fn spawn_test_agent(
-    kernel: &OpenFangKernel,
+    kernel: &openfang_kernel::OpenFangKernel,
     name: &str,
     system_prompt: &str,
 ) -> openfang_types::agent::AgentId {
@@ -64,9 +48,8 @@ memory_write = ["self.*"]
 /// Test that workflow registration and agent resolution work at the kernel level.
 #[tokio::test]
 async fn test_workflow_register_and_resolve() {
-    let config = test_config("ollama", "test-model", "OLLAMA_API_KEY");
-    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
-    let kernel = Arc::new(kernel);
+    let harness = TestKernelHarness::boot(OLLAMA_TEST_MODEL);
+    let kernel = harness.kernel.clone();
 
     // Spawn agents
     let manifest: AgentManifest = toml::from_str(
@@ -168,15 +151,13 @@ memory_write = ["self.*"]
 
     let run = kernel.workflows.get_run(run_id.unwrap()).await.unwrap();
     assert_eq!(run.input, "test input");
-
-    kernel.shutdown();
 }
 
 /// Test workflow with agent referenced by ID.
 #[tokio::test]
 async fn test_workflow_agent_by_id() {
-    let config = test_config("ollama", "test-model", "OLLAMA_API_KEY");
-    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+    let harness = TestKernelHarness::boot(OLLAMA_TEST_MODEL);
+    let kernel = harness.kernel.as_ref();
 
     let manifest: AgentManifest = toml::from_str(
         r#"
@@ -225,8 +206,6 @@ memory_write = ["self.*"]
         .create_run(wf_id, "hello".to_string())
         .await;
     assert!(run_id.is_some());
-
-    kernel.shutdown();
 }
 
 /// Test trigger registration and listing at kernel level.
@@ -234,8 +213,8 @@ memory_write = ["self.*"]
 async fn test_trigger_registration_with_kernel() {
     use openfang_kernel::triggers::TriggerPattern;
 
-    let config = test_config("ollama", "test-model", "OLLAMA_API_KEY");
-    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+    let harness = TestKernelHarness::boot(OLLAMA_TEST_MODEL);
+    let kernel = harness.kernel.as_ref();
 
     let manifest: AgentManifest = toml::from_str(
         r#"
@@ -292,8 +271,6 @@ memory_write = ["self.*"]
     let remaining = kernel.list_triggers(None);
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].id, t2);
-
-    kernel.shutdown();
 }
 
 // ---------------------------------------------------------------------------
@@ -304,15 +281,12 @@ memory_write = ["self.*"]
 /// run it through the real Groq LLM → verify output flows from step 1 to step 2.
 #[tokio::test]
 async fn test_workflow_e2e_with_groq() {
-    if std::env::var("GROQ_API_KEY").is_err() {
-        eprintln!("GROQ_API_KEY not set, skipping E2E workflow test");
+    if skip_if_env_missing("GROQ_API_KEY", "workflow E2E live integration test") {
         return;
     }
 
-    let config = test_config("groq", "llama-3.3-70b-versatile", "GROQ_API_KEY");
-    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
-    let kernel = Arc::new(kernel);
-    kernel.set_self_handle();
+    let harness = TestKernelHarness::boot(GROQ_TEST_MODEL).with_self_handle();
+    let kernel = harness.kernel.clone();
 
     // Spawn two agents with distinct roles
     let _analyst_id = spawn_test_agent(
@@ -400,6 +374,4 @@ async fn test_workflow_e2e_with_groq() {
     // List runs
     let runs = kernel.workflows.list_runs(None).await;
     assert_eq!(runs.len(), 1);
-
-    kernel.shutdown();
 }

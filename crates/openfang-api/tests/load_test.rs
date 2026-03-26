@@ -5,121 +5,17 @@
 //!
 //! Run: cargo test -p openfang-api --test load_test -- --nocapture
 
-use axum::Router;
-use openfang_api::middleware;
-use openfang_api::routes::{self, AppState};
-use openfang_kernel::OpenFangKernel;
-use openfang_types::config::{DefaultModelConfig, KernelConfig};
-use std::sync::Arc;
+mod support;
+
 use std::time::{Duration, Instant};
-use tower_http::cors::CorsLayer;
-use tower_http::trace::TraceLayer;
+use support::{TestServer, TestServerBuilder};
 
 // ---------------------------------------------------------------------------
 // Test infrastructure (mirrors api_integration_test.rs)
 // ---------------------------------------------------------------------------
 
-struct TestServer {
-    base_url: String,
-    state: Arc<AppState>,
-    _tmp: tempfile::TempDir,
-}
-
-impl Drop for TestServer {
-    fn drop(&mut self) {
-        self.state.kernel.shutdown();
-    }
-}
-
 async fn start_test_server() -> TestServer {
-    let tmp = tempfile::tempdir().expect("Failed to create temp dir");
-
-    let config = KernelConfig {
-        home_dir: tmp.path().to_path_buf(),
-        data_dir: tmp.path().join("data"),
-        default_model: DefaultModelConfig {
-            provider: "ollama".to_string(),
-            model: "test-model".to_string(),
-            api_key_env: "OLLAMA_API_KEY".to_string(),
-            base_url: None,
-            reasoning_effort: None,
-        },
-        ..KernelConfig::default()
-    };
-
-    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
-    let kernel = Arc::new(kernel);
-    kernel.set_self_handle();
-
-    let state = Arc::new(AppState {
-        kernel,
-        started_at: Instant::now(),
-        peer_registry: None,
-        bridge_manager: tokio::sync::Mutex::new(None),
-        channels_config: tokio::sync::RwLock::new(Default::default()),
-        shutdown_notify: Arc::new(tokio::sync::Notify::new()),
-    });
-
-    let app = Router::new()
-        .route("/api/health", axum::routing::get(routes::health))
-        .route("/api/status", axum::routing::get(routes::status))
-        .route("/api/version", axum::routing::get(routes::version))
-        .route(
-            "/api/metrics",
-            axum::routing::get(routes::prometheus_metrics),
-        )
-        .route(
-            "/api/agents",
-            axum::routing::get(routes::list_agents).post(routes::spawn_agent),
-        )
-        .route(
-            "/api/agents/{id}",
-            axum::routing::get(routes::get_agent).delete(routes::kill_agent),
-        )
-        .route(
-            "/api/agents/{id}/session",
-            axum::routing::get(routes::get_agent_session),
-        )
-        .route(
-            "/api/agents/{id}/session/reset",
-            axum::routing::post(routes::reset_session),
-        )
-        .route(
-            "/api/agents/{id}/sessions",
-            axum::routing::get(routes::list_agent_sessions).post(routes::create_agent_session),
-        )
-        .route("/api/tools", axum::routing::get(routes::list_tools))
-        .route("/api/models", axum::routing::get(routes::list_models))
-        .route("/api/providers", axum::routing::get(routes::list_providers))
-        .route("/api/usage", axum::routing::get(routes::usage_stats))
-        .route(
-            "/api/workflows",
-            axum::routing::get(routes::list_workflows).post(routes::create_workflow),
-        )
-        .route(
-            "/api/workflows/{id}/run",
-            axum::routing::post(routes::run_workflow),
-        )
-        .route("/api/config", axum::routing::get(routes::get_config))
-        .layer(axum::middleware::from_fn(middleware::request_logging))
-        .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
-        .with_state(state.clone());
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("Failed to bind test server");
-    let addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    TestServer {
-        base_url: format!("http://{}", addr),
-        state,
-        _tmp: tmp,
-    }
+    TestServerBuilder::default().start().await
 }
 
 const TEST_MANIFEST: &str = r#"

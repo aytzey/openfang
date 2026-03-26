@@ -14,6 +14,7 @@ use openfang_kernel::OpenFangKernel;
 use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_runtime::tool_runner::builtin_tool_definitions;
 use openfang_types::agent::{AgentId, AgentIdentity, AgentManifest, ReasoningEffort};
+use openfang_types::memory::MemoryFilter;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
@@ -2510,6 +2511,92 @@ pub async fn delete_agent_kv_key(
         ),
         Err(e) => {
             tracing::warn!("Memory delete failed for agent {id}, key '{key}': {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Memory operation failed"})),
+            )
+        }
+    }
+}
+
+/// GET /api/memory/agents/:id/search — Search semantic memory with lookup-aware scoring.
+pub async fn search_agent_memories(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<MemorySearchQuery>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            );
+        }
+    };
+
+    let query = params.query.trim();
+    if query.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Query must not be empty"})),
+        );
+    }
+
+    let limit = params.limit.clamp(1, 20);
+    let filter = Some(MemoryFilter {
+        agent_id: Some(agent_id),
+        scope: params.scope.clone(),
+        ..Default::default()
+    });
+
+    let (strategy, query_embedding) = if let Some(emb) = state.kernel.embedding_driver.as_deref() {
+        match emb.embed_one(query).await {
+            Ok(vector) => ("hybrid_lookup_vector".to_string(), Some(vector)),
+            Err(e) => {
+                tracing::warn!("Memory semantic search embedding failed for agent {id}: {e}");
+                ("deterministic_lookup".to_string(), None)
+            }
+        }
+    } else {
+        ("deterministic_lookup".to_string(), None)
+    };
+
+    match state
+        .kernel
+        .memory
+        .recall_scored_with_embedding_async(query, limit, filter, query_embedding.as_deref())
+        .await
+    {
+        Ok(results) => {
+            let hits = results
+                .into_iter()
+                .map(|hit| MemorySearchHit {
+                    id: hit.fragment.id.to_string(),
+                    content: hit.fragment.content,
+                    scope: hit.fragment.scope,
+                    source: hit.fragment.source,
+                    confidence: hit.fragment.confidence,
+                    access_count: hit.fragment.access_count,
+                    score: hit.score,
+                    gate: hit.gate,
+                    lexical_confidence: hit.lexical_confidence,
+                    semantic_score: hit.semantic_score,
+                    lexical_hits: hit.lexical_hits,
+                })
+                .collect();
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!(MemorySearchResponse {
+                    query: query.to_string(),
+                    strategy,
+                    results: hits,
+                })),
+            )
+        }
+        Err(e) => {
+            tracing::warn!("Memory semantic search failed for agent {id}: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "Memory operation failed"})),

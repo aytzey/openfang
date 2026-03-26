@@ -7,138 +7,88 @@
 //!
 //! Run: cargo test -p openfang-api --test api_integration_test -- --nocapture
 
-use axum::Router;
-use openfang_api::middleware;
-use openfang_api::routes::{self, AppState};
-use openfang_api::ws;
-use openfang_kernel::OpenFangKernel;
-use openfang_types::config::{DefaultModelConfig, KernelConfig};
-use std::sync::Arc;
-use std::time::Instant;
-use tower_http::cors::CorsLayer;
-use tower_http::trace::TraceLayer;
+mod support;
+
+use governor::{clock::DefaultClock, state::keyed::DashMapStateStore, Quota, RateLimiter};
+use openfang_types::memory::MemorySource;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{LazyLock, Mutex};
+use support::{
+    skip_if_env_missing, TestServer, TestServerBuilder, GROQ_TEST_MODEL, OLLAMA_TEST_MODEL,
+};
+
+static CODEX_AUTH_TEST_GUARD: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+struct EnvSnapshot {
+    vars: Vec<(&'static str, Option<String>)>,
+}
+
+impl EnvSnapshot {
+    fn capture(names: &[&'static str]) -> Self {
+        Self {
+            vars: names
+                .iter()
+                .map(|name| (*name, std::env::var(name).ok()))
+                .collect(),
+        }
+    }
+}
+
+impl Drop for EnvSnapshot {
+    fn drop(&mut self) {
+        for (name, value) in &self.vars {
+            if let Some(value) = value {
+                std::env::set_var(name, value);
+            } else {
+                std::env::remove_var(name);
+            }
+        }
+    }
+}
+
+fn codex_cli_auth_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let path = PathBuf::from(home).join(".codex").join("auth.json");
+    path.exists().then_some(path)
+}
+
+fn skip_if_codex_auth_missing(label: &str) -> bool {
+    if codex_cli_auth_path().is_some() {
+        return false;
+    }
+    eprintln!("~/.codex/auth.json not found, skipping {label}");
+    true
+}
 
 // ---------------------------------------------------------------------------
 // Test infrastructure
 // ---------------------------------------------------------------------------
 
-struct TestServer {
-    base_url: String,
-    state: Arc<AppState>,
-    _tmp: tempfile::TempDir,
-}
-
-impl Drop for TestServer {
-    fn drop(&mut self) {
-        self.state.kernel.shutdown();
-    }
-}
-
 /// Start a test server using ollama as default provider (no API key needed).
 /// This lets the kernel boot without any real LLM credentials.
 /// Tests that need actual LLM calls should use `start_test_server_with_llm()`.
 async fn start_test_server() -> TestServer {
-    start_test_server_with_provider("ollama", "test-model", "OLLAMA_API_KEY").await
+    TestServerBuilder::default()
+        .with_model(OLLAMA_TEST_MODEL)
+        .start()
+        .await
 }
 
 /// Start a test server with Groq as the LLM provider (requires GROQ_API_KEY).
 async fn start_test_server_with_llm() -> TestServer {
-    start_test_server_with_provider("groq", "llama-3.3-70b-versatile", "GROQ_API_KEY").await
+    TestServerBuilder::default()
+        .with_model(GROQ_TEST_MODEL)
+        .start()
+        .await
 }
 
-async fn start_test_server_with_provider(
-    provider: &str,
-    model: &str,
-    api_key_env: &str,
-) -> TestServer {
-    let tmp = tempfile::tempdir().expect("Failed to create temp dir");
-
-    let config = KernelConfig {
-        home_dir: tmp.path().to_path_buf(),
-        data_dir: tmp.path().join("data"),
-        default_model: DefaultModelConfig {
-            provider: provider.to_string(),
-            model: model.to_string(),
-            api_key_env: api_key_env.to_string(),
-            base_url: None,
-            reasoning_effort: None,
-        },
-        ..KernelConfig::default()
-    };
-
-    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
-    let kernel = Arc::new(kernel);
-    kernel.set_self_handle();
-
-    let state = Arc::new(AppState {
-        kernel,
-        started_at: Instant::now(),
-        peer_registry: None,
-        bridge_manager: tokio::sync::Mutex::new(None),
-        channels_config: tokio::sync::RwLock::new(Default::default()),
-        shutdown_notify: Arc::new(tokio::sync::Notify::new()),
-    });
-
-    let app = Router::new()
-        .route("/api/health", axum::routing::get(routes::health))
-        .route("/api/status", axum::routing::get(routes::status))
-        .route(
-            "/api/agents",
-            axum::routing::get(routes::list_agents).post(routes::spawn_agent),
-        )
-        .route(
-            "/api/agents/{id}/message",
-            axum::routing::post(routes::send_message),
-        )
-        .route(
-            "/api/agents/{id}/session",
-            axum::routing::get(routes::get_agent_session),
-        )
-        .route("/api/agents/{id}/ws", axum::routing::get(ws::agent_ws))
-        .route(
-            "/api/agents/{id}",
-            axum::routing::delete(routes::kill_agent),
-        )
-        .route(
-            "/api/triggers",
-            axum::routing::get(routes::list_triggers).post(routes::create_trigger),
-        )
-        .route(
-            "/api/triggers/{id}",
-            axum::routing::delete(routes::delete_trigger),
-        )
-        .route(
-            "/api/workflows",
-            axum::routing::get(routes::list_workflows).post(routes::create_workflow),
-        )
-        .route(
-            "/api/workflows/{id}/run",
-            axum::routing::post(routes::run_workflow),
-        )
-        .route(
-            "/api/workflows/{id}/runs",
-            axum::routing::get(routes::list_workflow_runs),
-        )
-        .route("/api/shutdown", axum::routing::post(routes::shutdown))
-        .layer(axum::middleware::from_fn(middleware::request_logging))
-        .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
-        .with_state(state.clone());
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+async fn start_test_server_with_auth(api_key: &str) -> TestServer {
+    TestServerBuilder::default()
+        .with_model(OLLAMA_TEST_MODEL)
+        .with_api_key(api_key)
+        .start()
         .await
-        .expect("Failed to bind test server");
-    let addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    TestServer {
-        base_url: format!("http://{}", addr),
-        state,
-        _tmp: tmp,
-    }
 }
 
 /// Manifest that uses ollama (no API key required, won't make real LLM calls).
@@ -177,6 +127,15 @@ system_prompt = "You are a test agent. Reply concisely."
 tools = ["file_read"]
 memory_read = ["*"]
 memory_write = ["self.*"]
+"#;
+
+const SALES_BRIEF: &str = r#"
+Yeni Takim Arkadasiniz: Machinity
+Projeleri takip etmek yerine projeleri yoneten bir AI ekip arkadasi.
+Toplantidan yonetime, WhatsApp'tan proje panosuna: uctan uca otonom koordinasyon.
+Saha operasyonu olan sirketlere odaklaniyoruz: field service, maintenance, installation, construction, facility management.
+Machinity toplantiya katilir, aksiyonlari yakalar, gorevleri olusturur, dogru kisilere atar ve WhatsApp uzerinden takip eder.
+Kurulum suresi 5 dakikanin altinda. Iletisim: machinity.ai info@machinity.ai
 "#;
 
 // ---------------------------------------------------------------------------
@@ -314,9 +273,259 @@ async fn test_agent_session_empty() {
 }
 
 #[tokio::test]
+async fn test_memory_search_endpoint_prefers_lookup_matched_memory() {
+    let server = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/api/agents", server.base_url))
+        .json(&serde_json::json!({"manifest_toml": TEST_MANIFEST}))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let agent_id = body["agent_id"].as_str().unwrap().to_string();
+    let parsed_agent_id: openfang_types::agent::AgentId = agent_id.parse().unwrap();
+
+    let target = "rare rust ownership lifetime pattern";
+    server
+        .state
+        .kernel
+        .memory
+        .remember_with_embedding(
+            parsed_agent_id,
+            target,
+            MemorySource::Conversation,
+            "episodic",
+            HashMap::new(),
+            None,
+        )
+        .unwrap();
+
+    for i in 0..120 {
+        server
+            .state
+            .kernel
+            .memory
+            .remember_with_embedding(
+                parsed_agent_id,
+                &format!("filler memory {i} unrelated topic"),
+                MemorySource::Conversation,
+                "episodic",
+                HashMap::new(),
+                None,
+            )
+            .unwrap();
+    }
+
+    let resp = client
+        .get(format!(
+            "{}/api/memory/agents/{}/search",
+            server.base_url, agent_id
+        ))
+        .query(&[("q", target), ("limit", "3")])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let results = body["results"].as_array().unwrap();
+    assert!(!results.is_empty());
+    assert_eq!(results[0]["content"], target);
+    assert!(body["strategy"].as_str().unwrap().contains("lookup"));
+    assert!(results[0]["score"].as_f64().unwrap() > 0.0);
+    assert!(results[0]["gate"].as_f64().unwrap() > 0.0);
+    assert!(results[0]["lexical_confidence"].as_f64().unwrap() > 0.0);
+}
+
+#[tokio::test]
+async fn test_codex_auth_import_status_and_logout_roundtrip() {
+    if skip_if_codex_auth_missing("Codex auth import integration test") {
+        return;
+    }
+
+    let _guard = CODEX_AUTH_TEST_GUARD.lock().unwrap();
+    let _env = EnvSnapshot::capture(&["OPENAI_CODEX_ACCESS_TOKEN", "OPENAI_CODEX_ACCOUNT_ID"]);
+    std::env::remove_var("OPENAI_CODEX_ACCESS_TOKEN");
+    std::env::remove_var("OPENAI_CODEX_ACCOUNT_ID");
+
+    let server = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/api/auth/codex/import-cli", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "connected");
+
+    let resp = client
+        .get(format!("{}/api/auth/codex/status", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["connected"], true);
+    assert_eq!(body["provider"], "openai-codex");
+
+    let resp = client
+        .get(format!("{}/api/sales/onboarding/status", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"]["oauth_connected"], true);
+
+    let resp = client
+        .post(format!("{}/api/auth/codex/logout", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "logged_out");
+
+    let resp = client
+        .get(format!("{}/api/auth/codex/status", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["connected"], false);
+    assert_eq!(body["source"], "logged_out");
+}
+
+#[tokio::test]
+async fn test_codex_auth_import_enables_real_agent_message() {
+    if skip_if_codex_auth_missing("Codex real message integration test") {
+        return;
+    }
+
+    let _guard = CODEX_AUTH_TEST_GUARD.lock().unwrap();
+    let _env = EnvSnapshot::capture(&["OPENAI_CODEX_ACCESS_TOKEN", "OPENAI_CODEX_ACCOUNT_ID"]);
+    std::env::remove_var("OPENAI_CODEX_ACCESS_TOKEN");
+    std::env::remove_var("OPENAI_CODEX_ACCOUNT_ID");
+
+    let server = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/api/auth/codex/import-cli", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp = client
+        .post(format!("{}/api/agents", server.base_url))
+        .json(&serde_json::json!({"manifest_toml": TEST_MANIFEST}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let agent_id = body["agent_id"].as_str().unwrap().to_string();
+
+    let resp = client
+        .post(format!(
+            "{}/api/agents/{}/message",
+            server.base_url, agent_id
+        ))
+        .json(&serde_json::json!({
+            "message": "Respond with only OPENFANG_AUTH_OK. No punctuation, no extra words."
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let response = body["response"].as_str().unwrap_or_default();
+    assert!(!response.trim().is_empty(), "response should not be empty");
+    assert!(
+        response.contains("OPENFANG_AUTH_OK"),
+        "unexpected response: {response}"
+    );
+    assert!(body["input_tokens"].as_u64().unwrap_or(0) > 0);
+    assert!(body["output_tokens"].as_u64().unwrap_or(0) > 0);
+}
+
+#[tokio::test]
+async fn test_sales_brief_autofill_with_codex_auth() {
+    if skip_if_codex_auth_missing("Sales autofill integration test") {
+        return;
+    }
+
+    let _guard = CODEX_AUTH_TEST_GUARD.lock().unwrap();
+    let _env = EnvSnapshot::capture(&["OPENAI_CODEX_ACCESS_TOKEN", "OPENAI_CODEX_ACCOUNT_ID"]);
+    std::env::remove_var("OPENAI_CODEX_ACCESS_TOKEN");
+    std::env::remove_var("OPENAI_CODEX_ACCOUNT_ID");
+
+    let server = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/api/auth/codex/import-cli", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp = client
+        .post(format!("{}/api/sales/onboarding/brief", server.base_url))
+        .json(&serde_json::json!({
+            "brief": SALES_BRIEF,
+            "persist": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(matches!(
+        body["source"].as_str(),
+        Some("llm") | Some("heuristic")
+    ));
+    assert!(!body["profile"]["product_name"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .is_empty());
+    assert!(!body["profile"]["product_description"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .is_empty());
+    assert!(!body["profile"]["target_industry"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .is_empty());
+    assert_eq!(body["profile"]["target_geo"], "TR");
+    assert_eq!(body["profile"]["sender_email"], "info@machinity.ai");
+    assert_eq!(body["onboarding"]["has_brief"], true);
+    assert_eq!(body["onboarding"]["profile_ready"], true);
+
+    let resp = client
+        .get(format!("{}/api/sales/profile", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let profile: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(profile["profile"]["target_geo"], "TR");
+    assert_eq!(profile["profile"]["sender_email"], "info@machinity.ai");
+}
+
+#[tokio::test]
 async fn test_send_message_with_llm() {
-    if std::env::var("GROQ_API_KEY").is_err() {
-        eprintln!("GROQ_API_KEY not set, skipping LLM integration test");
+    if skip_if_env_missing("GROQ_API_KEY", "LLM integration test") {
         return;
     }
 
@@ -582,6 +791,23 @@ async fn test_request_id_header_is_uuid() {
 }
 
 #[tokio::test]
+async fn test_rate_limit_returns_429_when_budget_is_exhausted() {
+    let limiter = RateLimiter::<_, DashMapStateStore<_>, DefaultClock>::keyed(Quota::per_minute(
+        std::num::NonZeroU32::new(1).unwrap(),
+    ));
+    let server = TestServerBuilder::default()
+        .with_rate_limiter(std::sync::Arc::new(limiter))
+        .start()
+        .await;
+    let client = reqwest::Client::new();
+
+    let response = client.get(server.url("/api/agents")).send().await.unwrap();
+    assert_eq!(response.status(), 429);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"], "Rate limit exceeded");
+}
+
+#[tokio::test]
 async fn test_multiple_agents_lifecycle() {
     let server = start_test_server().await;
     let client = reqwest::Client::new();
@@ -673,109 +899,6 @@ memory_write = ["self.*"]
     assert_eq!(agents.len(), 0);
 }
 
-// ---------------------------------------------------------------------------
-// Auth integration tests
-// ---------------------------------------------------------------------------
-
-/// Start a test server with Bearer-token authentication enabled.
-async fn start_test_server_with_auth(api_key: &str) -> TestServer {
-    let tmp = tempfile::tempdir().expect("Failed to create temp dir");
-
-    let config = KernelConfig {
-        home_dir: tmp.path().to_path_buf(),
-        data_dir: tmp.path().join("data"),
-        api_key: api_key.to_string(),
-        default_model: DefaultModelConfig {
-            provider: "ollama".to_string(),
-            model: "test-model".to_string(),
-            api_key_env: "OLLAMA_API_KEY".to_string(),
-            base_url: None,
-            reasoning_effort: None,
-        },
-        ..KernelConfig::default()
-    };
-
-    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
-    let kernel = Arc::new(kernel);
-    kernel.set_self_handle();
-
-    let state = Arc::new(AppState {
-        kernel,
-        started_at: Instant::now(),
-        peer_registry: None,
-        bridge_manager: tokio::sync::Mutex::new(None),
-        channels_config: tokio::sync::RwLock::new(Default::default()),
-        shutdown_notify: Arc::new(tokio::sync::Notify::new()),
-    });
-
-    let api_key_state = state.kernel.config.api_key.clone();
-
-    let app = Router::new()
-        .route("/api/health", axum::routing::get(routes::health))
-        .route("/api/status", axum::routing::get(routes::status))
-        .route(
-            "/api/agents",
-            axum::routing::get(routes::list_agents).post(routes::spawn_agent),
-        )
-        .route(
-            "/api/agents/{id}/message",
-            axum::routing::post(routes::send_message),
-        )
-        .route(
-            "/api/agents/{id}/session",
-            axum::routing::get(routes::get_agent_session),
-        )
-        .route("/api/agents/{id}/ws", axum::routing::get(ws::agent_ws))
-        .route(
-            "/api/agents/{id}",
-            axum::routing::delete(routes::kill_agent),
-        )
-        .route(
-            "/api/triggers",
-            axum::routing::get(routes::list_triggers).post(routes::create_trigger),
-        )
-        .route(
-            "/api/triggers/{id}",
-            axum::routing::delete(routes::delete_trigger),
-        )
-        .route(
-            "/api/workflows",
-            axum::routing::get(routes::list_workflows).post(routes::create_workflow),
-        )
-        .route(
-            "/api/workflows/{id}/run",
-            axum::routing::post(routes::run_workflow),
-        )
-        .route(
-            "/api/workflows/{id}/runs",
-            axum::routing::get(routes::list_workflow_runs),
-        )
-        .route("/api/shutdown", axum::routing::post(routes::shutdown))
-        .layer(axum::middleware::from_fn_with_state(
-            api_key_state,
-            middleware::auth,
-        ))
-        .layer(axum::middleware::from_fn(middleware::request_logging))
-        .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
-        .with_state(state.clone());
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("Failed to bind test server");
-    let addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    TestServer {
-        base_url: format!("http://{}", addr),
-        state,
-        _tmp: tmp,
-    }
-}
-
 #[tokio::test]
 async fn test_auth_health_is_public() {
     let server = start_test_server_with_auth("secret-key-123").await;
@@ -828,18 +951,17 @@ async fn test_auth_rejects_wrong_token() {
 #[tokio::test]
 async fn test_auth_accepts_correct_token() {
     let server = start_test_server_with_auth("secret-key-123").await;
-    let client = reqwest::Client::new();
+    let client = server.authed_client("secret-key-123");
 
     // Correct bearer token → 200
     let resp = client
-        .get(format!("{}/api/status", server.base_url))
-        .header("authorization", "Bearer secret-key-123")
+        .get(format!("{}/api/commands", server.base_url))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["status"], "running");
+    assert!(body["commands"].as_array().is_some());
 }
 
 #[tokio::test]
@@ -850,9 +972,11 @@ async fn test_auth_disabled_when_no_key() {
 
     // Protected endpoint accessible without auth when no key is configured
     let resp = client
-        .get(format!("{}/api/status", server.base_url))
+        .get(format!("{}/api/commands", server.base_url))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["commands"].as_array().is_some());
 }
