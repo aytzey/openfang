@@ -217,7 +217,7 @@ pub struct SalesLead {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SalesProspectProfile {
     pub id: String,
     pub run_id: String,
@@ -244,6 +244,8 @@ pub struct SalesProspectProfile {
     pub outreach_angle: String,
     pub research_status: String,
     pub research_confidence: f32,
+    #[serde(default)]
+    pub tech_stack: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -410,6 +412,151 @@ struct SourceHealthRow {
     auto_skip: bool,
 }
 
+// --- Mailbox Pool / Sender Config (TASK-13) ---
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct MailboxConfig {
+    /// Sending email address (e.g. "outreach1@send.machinity.com")
+    email: String,
+    /// SMTP host (falls back to global EmailConfig if empty)
+    #[serde(default)]
+    smtp_host: String,
+    /// SMTP port (falls back to global EmailConfig if 0)
+    #[serde(default)]
+    smtp_port: u16,
+    /// SMTP username (falls back to email if empty)
+    #[serde(default)]
+    smtp_user: String,
+    /// Env var name holding SMTP password
+    #[serde(default)]
+    smtp_pass_env: String,
+    /// Per-mailbox daily send cap
+    #[serde(default = "default_mailbox_daily_cap")]
+    daily_cap: u32,
+    /// Warm-up state: cold | warming | warm | hot
+    #[serde(default = "default_warm_state")]
+    warm_state: String,
+    /// Runtime counter — sends done today (not persisted to DB)
+    #[serde(default)]
+    sends_today: u32,
+    /// Date of the counter (YYYY-MM-DD)
+    #[serde(default)]
+    counter_date: String,
+}
+
+fn default_mailbox_daily_cap() -> u32 {
+    20
+}
+fn default_warm_state() -> String {
+    "cold".to_string()
+}
+
+impl MailboxConfig {
+    /// Effective daily cap based on warm-up state.
+    /// cold=0 (cannot send), warming ramps: 5→10→15→cap, warm/hot=cap.
+    fn effective_cap(&self) -> u32 {
+        match self.warm_state.as_str() {
+            "cold" => 0,
+            "warming" => self.daily_cap.min(15),
+            "warm" => self.daily_cap,
+            "hot" => self.daily_cap,
+            _ => 0,
+        }
+    }
+
+    fn can_send(&self) -> bool {
+        self.warm_state != "cold" && self.sends_today < self.effective_cap()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct SenderConfig {
+    /// Pool of sending mailboxes; round-robin across non-exhausted ones
+    #[serde(default)]
+    mailboxes: Vec<MailboxConfig>,
+}
+
+impl SenderConfig {
+    /// Select the best available mailbox: non-cold, with remaining capacity,
+    /// and lowest sends_today (spread load evenly).
+    fn select_mailbox(&mut self) -> Option<&mut MailboxConfig> {
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        // Reset counters if date changed
+        for mb in &mut self.mailboxes {
+            if mb.counter_date != today {
+                mb.sends_today = 0;
+                mb.counter_date = today.clone();
+            }
+        }
+        self.mailboxes
+            .iter_mut()
+            .filter(|m| m.can_send())
+            .min_by_key(|m| m.sends_today)
+    }
+
+    /// Total remaining capacity across all mailboxes
+    #[allow(dead_code)]
+    fn remaining_capacity(&self) -> u32 {
+        self.mailboxes
+            .iter()
+            .filter(|m| m.warm_state != "cold")
+            .map(|m| m.effective_cap().saturating_sub(m.sends_today))
+            .sum()
+    }
+}
+
+fn normalize_mailbox_address(email: &str) -> String {
+    email.trim().to_lowercase()
+}
+
+fn normalize_mailbox_config(mut mailbox: MailboxConfig) -> Option<MailboxConfig> {
+    mailbox.email = normalize_mailbox_address(&mailbox.email);
+    if mailbox.email.is_empty() {
+        return None;
+    }
+    if mailbox.daily_cap == 0 {
+        mailbox.daily_cap = default_mailbox_daily_cap();
+    }
+    if mailbox.warm_state.trim().is_empty() {
+        mailbox.warm_state = default_warm_state();
+    }
+    Some(mailbox)
+}
+
+fn mailbox_pool_from_json(pool_json: &str) -> Vec<MailboxConfig> {
+    let value: serde_json::Value = serde_json::from_str(pool_json)
+        .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
+    let serde_json::Value::Array(items) = value else {
+        return Vec::new();
+    };
+
+    items
+        .into_iter()
+        .filter_map(|item| match item {
+            serde_json::Value::String(email) => normalize_mailbox_config(MailboxConfig {
+                email,
+                warm_state: "warming".to_string(),
+                ..MailboxConfig::default()
+            }),
+            serde_json::Value::Object(_) => serde_json::from_value::<MailboxConfig>(item)
+                .ok()
+                .and_then(normalize_mailbox_config),
+            _ => None,
+        })
+        .collect()
+}
+
+fn default_mailbox_pool_from_profile(profile: &SalesProfile) -> Vec<MailboxConfig> {
+    normalize_mailbox_config(MailboxConfig {
+        email: profile.sender_email.clone(),
+        daily_cap: profile.daily_send_cap.max(1),
+        warm_state: "warming".to_string(),
+        ..MailboxConfig::default()
+    })
+    .into_iter()
+    .collect()
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct EmailValidation {
     email: String,
@@ -476,6 +623,8 @@ struct SiteContactEnrichment {
     evidence: Option<String>,
     osint_links: Vec<String>,
     signal: i32,
+    tech_stack: Vec<String>,
+    job_posting_signals: Vec<(String, String, f64, String)>, // (text, url, confidence, type)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1056,6 +1205,7 @@ impl SalesEngine {
         )
         .map_err(|e| format!("Failed to initialize sales db: {e}"))?;
         self.migrate_legacy_to_canonical_core()?;
+        seed_contextual_factors(&conn);
         Ok(())
     }
 
@@ -2161,7 +2311,8 @@ impl SalesEngine {
                 params![
                     "default_sender_policy",
                     icp_id,
-                    serde_json::json!([profile.sender_email]).to_string(),
+                    serde_json::to_string(&default_mailbox_pool_from_profile(profile))
+                        .map_err(|e| format!("Failed to encode default mailbox pool: {e}"))?,
                     profile.daily_send_cap as i64,
                     sender_domain,
                 ],
@@ -2336,6 +2487,7 @@ impl SalesEngine {
             outreach_angle: String::new(),
             research_status: "migration".to_string(),
             research_confidence: 0.7,
+            tech_stack: Vec::new(),
             created_at: lead.created_at.clone(),
             updated_at: lead.created_at.clone(),
         };
@@ -3250,6 +3402,15 @@ impl SalesEngine {
         )
         .map_err(|e| format!("Failed to ensure sequence instance: {e}"))?;
 
+        // Auto-assign to active experiment if one exists (TASK-37)
+        if let Ok(exp_id) = conn.query_row(
+            "SELECT id FROM experiments WHERE status = 'active' ORDER BY created_at DESC LIMIT 1",
+            [],
+            |r| r.get::<_, String>(0),
+        ) {
+            let _ = assign_experiment_variant(conn, &exp_id, &sequence_instance_id);
+        }
+
         let evidence_ids = thesis_id
             .as_deref()
             .and_then(|id| {
@@ -3292,6 +3453,212 @@ impl SalesEngine {
         )
         .map_err(|e| format!("Failed to ensure touch: {e}"))?;
         Ok(())
+    }
+
+    /// Check all active sequence instances and advance/cancel as needed (TASK-30).
+    /// Called periodically or after outcome processing.
+    fn advance_sequences(&self) -> Result<u32, String> {
+        let conn = self.open()?;
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let mut advanced = 0u32;
+
+        // Fetch active sequences with their template steps
+        let mut stmt = conn
+            .prepare(
+                "SELECT si.id, si.template_id, si.account_id, si.contact_id, si.thesis_id,
+                        si.current_step, si.status, st.steps_json,
+                        MAX(t.sent_at) as last_touch_sent
+                 FROM sequence_instances si
+                 JOIN sequence_templates st ON st.id = si.template_id
+                 LEFT JOIN touches t ON t.sequence_instance_id = si.id AND t.sent_at IS NOT NULL
+                 WHERE si.status = 'active'
+                 GROUP BY si.id",
+            )
+            .map_err(|e| format!("Failed to prepare sequence advancement query: {e}"))?;
+
+        type SeqRow = (String, String, String, String, Option<String>, i32, String, String, Option<String>);
+        let sequences: Vec<SeqRow> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                    row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?,
+                    row.get(8)?,
+                ))
+            })
+            .map_err(|e| format!("Sequence query failed: {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for (seq_id, _template_id, account_id, contact_id, thesis_id,
+             current_step, _status, steps_json, last_sent_at) in sequences
+        {
+            let steps: Vec<serde_json::Value> =
+                serde_json::from_str(&steps_json).unwrap_or_default();
+
+            // Check if there's a positive outcome that should end the sequence
+            let positive_outcome: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM outcomes o
+                     JOIN touches t ON t.id = o.touch_id
+                     WHERE t.sequence_instance_id = ?1
+                     AND o.outcome_type IN ('meeting_booked', 'interested', 'closed_won')",
+                    params![seq_id],
+                    |r| r.get::<_, i32>(0),
+                )
+                .unwrap_or(0)
+                > 0;
+
+            if positive_outcome {
+                let _ = conn.execute(
+                    "UPDATE sequence_instances SET status = 'completed', updated_at = ?1 WHERE id = ?2",
+                    params![now_str, seq_id],
+                );
+                advanced += 1;
+                continue;
+            }
+
+            // Check for unsubscribe/hard_bounce → cancel
+            let negative_outcome: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM outcomes o
+                     JOIN touches t ON t.id = o.touch_id
+                     WHERE t.sequence_instance_id = ?1
+                     AND o.outcome_type IN ('hard_bounce', 'unsubscribe', 'wrong_person')",
+                    params![seq_id],
+                    |r| r.get::<_, i32>(0),
+                )
+                .unwrap_or(0)
+                > 0;
+
+            if negative_outcome {
+                let _ = conn.execute(
+                    "UPDATE sequence_instances SET status = 'cancelled', updated_at = ?1 WHERE id = ?2",
+                    params![now_str, seq_id],
+                );
+                advanced += 1;
+                continue;
+            }
+
+            // Check if enough delay has elapsed for next step
+            let total_steps = steps.len() as i32;
+            let next_step = current_step + 1;
+            if next_step > total_steps {
+                // Sequence complete — all steps done
+                let _ = conn.execute(
+                    "UPDATE sequence_instances SET status = 'completed', updated_at = ?1 WHERE id = ?2",
+                    params![now_str, seq_id],
+                );
+                advanced += 1;
+                continue;
+            }
+
+            // Parse delay_days for next step
+            let delay_days = steps
+                .get((next_step - 1) as usize)
+                .and_then(|s| s.get("delay_days"))
+                .and_then(|d| d.as_i64())
+                .unwrap_or(3);
+
+            let ready_to_advance = match &last_sent_at {
+                Some(sent) => {
+                    chrono::DateTime::parse_from_rfc3339(sent)
+                        .map(|dt| now.signed_duration_since(dt.with_timezone(&Utc)).num_days() >= delay_days)
+                        .unwrap_or(false)
+                }
+                None => true, // No touch sent yet, first step is ready
+            };
+
+            if ready_to_advance {
+                let next_channel = steps
+                    .get((next_step - 1) as usize)
+                    .and_then(|s| s.get("channel"))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("email");
+
+                // Advance the step counter
+                let _ = conn.execute(
+                    "UPDATE sequence_instances SET current_step = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![next_step, now_str, seq_id],
+                );
+
+                // Queue approval for next touch
+                let approval_id = uuid::Uuid::new_v4().to_string();
+                let payload = serde_json::json!({
+                    "step": next_step,
+                    "channel": next_channel,
+                    "account_id": account_id,
+                    "contact_id": contact_id,
+                    "thesis_id": thesis_id,
+                    "sequence_instance_id": seq_id,
+                    "auto_generated": true,
+                });
+
+                // Find the lead for this account
+                let lead_id: String = conn
+                    .query_row(
+                        "SELECT l.id FROM leads l
+                         JOIN domains d ON d.domain = l.company_domain
+                         WHERE d.account_id = ?1
+                         LIMIT 1",
+                        params![account_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or_else(|_| format!("seq_{}", seq_id));
+
+                let _ = conn.execute(
+                    "INSERT OR IGNORE INTO approvals (id, lead_id, channel, payload_json, status, created_at)
+                     VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
+                    params![approval_id, lead_id, next_channel, payload.to_string(), now_str],
+                );
+
+                advanced += 1;
+            }
+        }
+
+        Ok(advanced)
+    }
+
+    /// Get sequence progress for an account.
+    #[allow(dead_code)]
+    fn get_sequence_progress(
+        &self,
+        account_id: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self.open()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT si.id, si.current_step, si.status, st.steps_json, si.started_at
+                 FROM sequence_instances si
+                 JOIN sequence_templates st ON st.id = si.template_id
+                 WHERE si.account_id = ?1
+                 ORDER BY si.started_at DESC",
+            )
+            .map_err(|e| format!("Failed to query sequence progress: {e}"))?;
+
+        let rows: Vec<serde_json::Value> = stmt
+            .query_map(params![account_id], |row| {
+                let seq_id: String = row.get(0)?;
+                let current_step: i32 = row.get(1)?;
+                let status: String = row.get(2)?;
+                let steps_json: String = row.get(3)?;
+                let started_at: String = row.get(4)?;
+                let steps: Vec<serde_json::Value> =
+                    serde_json::from_str(&steps_json).unwrap_or_default();
+                Ok(serde_json::json!({
+                    "sequence_id": seq_id,
+                    "current_step": current_step,
+                    "total_steps": steps.len(),
+                    "status": status,
+                    "started_at": started_at,
+                    "steps": steps,
+                }))
+            })
+            .map_err(|e| format!("Sequence progress query failed: {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(rows)
     }
 
     fn insert_lead(&self, lead: &SalesLead) -> Result<bool, String> {
@@ -4272,6 +4639,97 @@ impl SalesEngine {
         Ok(count)
     }
 
+    /// Load sender config from DB sender_policies table if available.
+    fn load_sender_config(&self) -> SenderConfig {
+        let conn = match self.open() {
+            Ok(c) => c,
+            Err(_) => return SenderConfig::default(),
+        };
+        let pool_json: String = conn
+            .query_row(
+                "SELECT COALESCE(mailbox_pool, '[]') FROM sender_policies ORDER BY rowid DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|_| "[]".to_string());
+        SenderConfig {
+            mailboxes: mailbox_pool_from_json(&pool_json),
+        }
+    }
+
+    fn save_sender_config(&self, sender_cfg: &SenderConfig) -> Result<(), String> {
+        let conn = self.open()?;
+        let row_id = conn
+            .query_row(
+                "SELECT id FROM sender_policies ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to load sender policy row: {e}"))?
+            .unwrap_or_else(|| "default_sender_policy".to_string());
+        let total_daily_cap = sender_cfg
+            .mailboxes
+            .iter()
+            .map(|mailbox| mailbox.daily_cap.max(1) as i64)
+            .sum::<i64>()
+            .max(1);
+        let subdomain = sender_cfg
+            .mailboxes
+            .iter()
+            .find_map(|mailbox| email_domain(&mailbox.email))
+            .unwrap_or_default();
+        let mailbox_pool = serde_json::to_string(&sender_cfg.mailboxes)
+            .map_err(|e| format!("Failed to encode sender mailbox pool: {e}"))?;
+        conn.execute(
+            "INSERT INTO sender_policies (id, icp_id, mailbox_pool, daily_cap, subdomain, warm_state)
+             VALUES (?1, NULL, ?2, ?3, ?4, 'warming')
+             ON CONFLICT(id) DO UPDATE SET
+                mailbox_pool = excluded.mailbox_pool,
+                daily_cap = excluded.daily_cap,
+                subdomain = CASE
+                    WHEN COALESCE(sender_policies.subdomain, '') = '' THEN excluded.subdomain
+                    ELSE sender_policies.subdomain
+                END",
+            params![row_id, mailbox_pool, total_daily_cap, subdomain],
+        )
+        .map_err(|e| format!("Failed to persist sender policy config: {e}"))?;
+        Ok(())
+    }
+
+    fn record_mailbox_send(&self, from_email: &str) -> Result<(), String> {
+        let normalized_email = normalize_mailbox_address(from_email);
+        if normalized_email.is_empty() {
+            return Ok(());
+        }
+
+        let mut sender_cfg = self.load_sender_config();
+        if sender_cfg.mailboxes.is_empty() {
+            return Ok(());
+        }
+
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let mut changed = false;
+        for mailbox in &mut sender_cfg.mailboxes {
+            if mailbox.counter_date != today {
+                mailbox.sends_today = 0;
+                mailbox.counter_date = today.clone();
+                changed = true;
+            }
+            if normalize_mailbox_address(&mailbox.email) == normalized_email {
+                mailbox.sends_today = mailbox.sends_today.saturating_add(1);
+                mailbox.counter_date = today.clone();
+                changed = true;
+                break;
+            }
+        }
+
+        if changed {
+            self.save_sender_config(&sender_cfg)?;
+        }
+        Ok(())
+    }
+
     async fn send_email(
         &self,
         state: &AppState,
@@ -4280,24 +4738,46 @@ impl SalesEngine {
         subject: &str,
         body: &str,
     ) -> Result<(), String> {
-        let channels = state.channels_config.read().await;
-        let cfg = channels
-            .email
-            .as_ref()
-            .ok_or_else(|| "Email channel is not configured".to_string())?;
-        let password = std::env::var(&cfg.password_env)
-            .map_err(|_| format!("Email password env '{}' is not set", cfg.password_env))?;
+        // Try mailbox pool first (TASK-13), fall back to global config
+        let mut sender_cfg = self.load_sender_config();
+        let selected_mailbox = sender_cfg.select_mailbox().cloned();
+        let (smtp_host, smtp_port, smtp_user, smtp_pass, from_email, used_mailbox_pool) =
+            if let Some(mb) = selected_mailbox {
+                let pass_env = if mb.smtp_pass_env.is_empty() {
+                    // Fall through to global config
+                    None
+                } else {
+                    std::env::var(&mb.smtp_pass_env).ok()
+                };
+                if let Some(pass) = pass_env {
+                    let host = mb.smtp_host.clone();
+                    let port = mb.smtp_port;
+                    let user = if mb.smtp_user.is_empty() {
+                        mb.email.clone()
+                    } else {
+                        mb.smtp_user.clone()
+                    };
+                    let email = mb.email.clone();
+                    (host, port, user, pass, email, true)
+                } else {
+                    let (host, port, user, pass, email) =
+                        self.resolve_global_email_config(state).await?;
+                    (host, port, user, pass, email, false)
+                }
+            } else {
+                let (host, port, user, pass, email) = self.resolve_global_email_config(state).await?;
+                (host, port, user, pass, email, false)
+            };
 
-        let from: Mailbox = cfg
-            .username
+        let from: Mailbox = from_email
             .parse()
-            .map_err(|e| format!("Invalid sender email '{}': {e}", cfg.username))?;
+            .map_err(|e| format!("Invalid sender email '{}': {e}", from_email))?;
         let recipient_email = to.trim().to_string();
         let to: Mailbox = to
             .parse()
             .map_err(|e| format!("Invalid recipient email '{to}': {e}"))?;
 
-        let sender_domain = email_domain(&cfg.username)
+        let sender_domain = email_domain(&from_email)
             .ok_or_else(|| "Configured sender mailbox is invalid".to_string())?;
         let brand_domain = email_domain(&profile.sender_email)
             .ok_or_else(|| "Sales profile sender_email is invalid".to_string())?;
@@ -4311,7 +4791,7 @@ impl SalesEngine {
         let unsubscribe_url = format!(
             "{}/api/sales/unsubscribe?token={}",
             sales_base_url(&state.kernel),
-            generate_unsubscribe_token(&recipient_email, &cfg.username)
+            generate_unsubscribe_token(&recipient_email, &from_email)
         );
 
         let msg = Message::builder()
@@ -4325,10 +4805,10 @@ impl SalesEngine {
             .body(body.to_string())
             .map_err(|e| format!("Failed to build email message: {e}"))?;
 
-        let transport = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&cfg.smtp_host)
-            .map_err(|e| format!("Failed to initialize SMTP relay '{}': {e}", cfg.smtp_host))?
-            .port(cfg.smtp_port)
-            .credentials(Credentials::new(cfg.username.clone(), password))
+        let transport = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&smtp_host)
+            .map_err(|e| format!("Failed to initialize SMTP relay '{}': {e}", smtp_host))?
+            .port(smtp_port)
+            .credentials(Credentials::new(smtp_user, smtp_pass))
             .build();
 
         transport
@@ -4336,7 +4816,32 @@ impl SalesEngine {
             .await
             .map_err(|e| format!("SMTP send failed: {e}"))?;
 
+        if used_mailbox_pool {
+            self.record_mailbox_send(&from_email)?;
+        }
+
         Ok(())
+    }
+
+    /// Resolve SMTP config from global email channel configuration.
+    async fn resolve_global_email_config(
+        &self,
+        state: &AppState,
+    ) -> Result<(String, u16, String, String, String), String> {
+        let channels = state.channels_config.read().await;
+        let cfg = channels
+            .email
+            .as_ref()
+            .ok_or_else(|| "Email channel is not configured".to_string())?;
+        let password = std::env::var(&cfg.password_env)
+            .map_err(|_| format!("Email password env '{}' is not set", cfg.password_env))?;
+        Ok((
+            cfg.smtp_host.clone(),
+            cfg.smtp_port,
+            cfg.username.clone(),
+            password,
+            cfg.username.clone(),
+        ))
     }
 
     async fn send_linkedin(
@@ -4613,6 +5118,13 @@ impl SalesEngine {
             .map_err(|e| format!("Failed to update suppressed contact method: {e}"))?;
         }
 
+        // Trigger score calibration when enough outcomes accumulate (TASK-36)
+        if let Ok(proposals) = calibrate_scoring_from_outcomes(&conn) {
+            for proposal in &proposals {
+                info!(proposal = %proposal, "Score calibration proposal created");
+            }
+        }
+
         Ok(serde_json::json!({
             "delivery_id": delivery_id,
             "touch_id": approval.0,
@@ -4859,6 +5371,70 @@ impl SalesEngine {
         self.run_generation_with_job(kernel, None).await
     }
 
+    /// Run only the discovery phase — fills the account reservoir without
+    /// limiting by daily_target. Returns the count of newly discovered accounts.
+    pub async fn run_discovery_only(
+        &self,
+        kernel: &openfang_kernel::OpenFangKernel,
+    ) -> Result<usize, String> {
+        // Discovery reuses the full pipeline but the reservoir pattern already
+        // discovers without daily_target limits (DISCOVERY_RESERVOIR_CANDIDATES).
+        // This wrapper makes the intent explicit for callers.
+        let record = self.run_generation(kernel).await?;
+        Ok(record.discovered as usize)
+    }
+
+    /// Select best accounts from the reservoir for today's activation.
+    /// Respects daily_target and applies 87/13 exploit/explore split.
+    pub fn select_for_activation(&self, daily_target: u32) -> Result<Vec<String>, String> {
+        let conn = self.open()?;
+        let exploit_count = (daily_target as f64 * ACTIVATION_EXPLOIT_RATIO).ceil() as u32;
+        let explore_count = daily_target.saturating_sub(exploit_count);
+
+        let mut exploit_stmt = conn
+            .prepare(
+                "SELECT account_id FROM activation_queue
+                 WHERE status = 'pending'
+                 ORDER BY priority DESC LIMIT ?1",
+            )
+            .map_err(|e| format!("Activation exploit query failed: {e}"))?;
+        let exploit_ids: Vec<String> = exploit_stmt
+            .query_map(params![exploit_count], |r| r.get(0))
+            .map_err(|e| format!("Activation exploit query failed: {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut explore_stmt = conn
+            .prepare(
+                "SELECT a.id FROM accounts a
+                 JOIN score_snapshots s ON s.account_id = a.id
+                 WHERE s.fit_score BETWEEN 0.3 AND 0.7
+                 AND a.id NOT IN (
+                     SELECT account_id FROM exploration_log
+                     WHERE created_at > datetime('now', '-30 days')
+                 )
+                 ORDER BY RANDOM() LIMIT ?1",
+            )
+            .map_err(|e| format!("Activation explore query failed: {e}"))?;
+        let explore_ids: Vec<String> = explore_stmt
+            .query_map(params![explore_count], |r| r.get(0))
+            .map_err(|e| format!("Activation explore query failed: {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for acc_id in &explore_ids {
+            let _ = conn.execute(
+                "INSERT INTO exploration_log (id, account_id, exploration_reason, exploration_type)
+                 VALUES (?1, ?2, 'scheduled_exploration', 'mid_score_random')",
+                params![uuid::Uuid::new_v4().to_string(), acc_id],
+            );
+        }
+
+        let mut selected = exploit_ids;
+        selected.extend(explore_ids);
+        Ok(selected)
+    }
+
     pub async fn run_generation_with_job(
         &self,
         kernel: &openfang_kernel::OpenFangKernel,
@@ -5027,6 +5603,26 @@ impl SalesEngine {
         }
         let _ = self.update_source_health("web_search", web_search_candidates.len());
         let _ = self.update_source_health("llm_generation", llm_candidates.len());
+
+        // --- LLM Hallucination Check (TASK-40): verify domains actually exist ---
+        let mut llm_candidates = llm_candidates;
+        if !llm_candidates.is_empty() {
+            let mut verified = Vec::with_capacity(llm_candidates.len());
+            let verify_futures: Vec<_> = llm_candidates
+                .iter()
+                .map(|c| verify_domain_exists(&c.domain))
+                .collect();
+            let results = futures::future::join_all(verify_futures).await;
+            for (candidate, exists) in llm_candidates.into_iter().zip(results) {
+                if exists {
+                    verified.push(candidate);
+                } else {
+                    info!(domain = %candidate.domain, "LLM candidate domain verification failed — skipping phantom");
+                }
+            }
+            llm_candidates = verified;
+        }
+
         if let Some(job_id) = job_id {
             self.complete_job_stage(
                 job_id,
@@ -5509,25 +6105,10 @@ impl SalesEngine {
                     )
                 };
                 if search_osint_enrichment.company_linkedin_url.is_none() {
-                    let company_linkedin_query = format!(
-                        "site:linkedin.com/company \"{}\" \"{}\"",
-                        company_search_name, domain
-                    );
-                    if let Ok(company_linkedin_res) = run_sales_search(
-                        &search_engine,
-                        &company_linkedin_query,
-                        6,
-                        Duration::from_secs(SALES_CONTACT_SEARCH_TIMEOUT_SECS),
-                    )
-                    .await
-                    {
-                        if !company_linkedin_res.trim().is_empty() {
-                            search_outputs.push(company_linkedin_res.clone());
-                        }
-                        search_osint_enrichment.company_linkedin_url =
-                            extract_company_linkedin_from_text(&company_linkedin_res)
-                                .and_then(|value| normalize_company_linkedin_url(&value));
-                    }
+                    // 4-Layer LinkedIn search fallback (TASK-24)
+                    search_osint_enrichment.company_linkedin_url =
+                        find_company_linkedin_url(&company_search_name, domain, &search_engine)
+                            .await;
                 }
                 search_osint_enrichment.osint_links = merge_osint_links(
                     search_osint_enrichment.osint_links.clone(),
@@ -5794,20 +6375,36 @@ impl SalesEngine {
                 contact_title.as_deref(),
             );
 
-            let email_subject = build_sales_email_subject(&profile, &company);
-            let email_body = build_sales_email_body(
+            // Evidence-bound message generation (TASK-29): try strategy+copy first,
+            // fall back to direct templates if evidence is insufficient.
+            let strategy = generate_message_strategy(
                 &profile,
                 &company,
                 contact_name.as_deref(),
+                &evidence,
                 &matched,
-                &evidence,
             );
-            let linkedin_message = build_sales_linkedin_message(
-                &profile,
-                &company,
-                contact_name.as_deref(),
-                &evidence,
-            );
+            let (email_subject, email_body, linkedin_message) =
+                match generate_message_copy(&strategy, &profile, &company, contact_name.as_deref())
+                {
+                    Ok(copy) => (copy.subject, copy.body, copy.linkedin_copy),
+                    Err(_) => (
+                        build_sales_email_subject(&profile, &company),
+                        build_sales_email_body(
+                            &profile,
+                            &company,
+                            contact_name.as_deref(),
+                            &matched,
+                            &evidence,
+                        ),
+                        build_sales_linkedin_message(
+                            &profile,
+                            &company,
+                            contact_name.as_deref(),
+                            &evidence,
+                        ),
+                    ),
+                };
 
             let canonical = match self.sync_canonical_state(
                 &self.open()?,
@@ -6455,6 +7052,7 @@ fn build_prospect_profiles(
                 outreach_angle,
                 research_status: "heuristic".to_string(),
                 research_confidence,
+                tech_stack: Vec::new(),
                 created_at: acc.created_at,
                 updated_at: acc.updated_at,
             }
@@ -6634,6 +7232,7 @@ fn build_candidate_prospect_profiles(
                 matched_signals.len(),
                 usize::from(source_contact_hints.contains_key(&domain)),
             ),
+            tech_stack: Vec::new(),
             created_at: now.clone(),
             updated_at: now.clone(),
         });
@@ -7396,7 +7995,7 @@ fn classify_email(email: &str, _company_domain: &str) -> &'static str {
         "satinalma",
     ];
     if role_prefixes.contains(&local) {
-        return "role";
+        return "generic";
     }
     "personal"
 }
@@ -7435,7 +8034,7 @@ fn transliterate_turkish_ascii(value: &str) -> String {
 fn is_placeholder_name(name: &str) -> bool {
     let normalized = transliterate_turkish_ascii(
         &decode_basic_html_entities(name)
-            .replace(['\'', '’', '`'], " ")
+            .replace(['\'', '’', '`'], "")
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" "),
@@ -9796,6 +10395,87 @@ fn build_sales_linkedin_message(
     }
 }
 
+/// Stage 1: Determine message strategy from thesis + persona context.
+/// Returns pain angle, trigger reference, CTA type, tone, and language.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct MessageStrategy {
+    pain_angle: String,
+    trigger_evidence: String,
+    cta_type: String,
+    tone: String,
+    language: String,
+}
+
+fn generate_message_strategy(
+    profile: &SalesProfile,
+    _company: &str,
+    _contact_name: Option<&str>,
+    evidence: &str,
+    matched: &str,
+) -> MessageStrategy {
+    let language = if geo_is_turkey(&profile.target_geo) {
+        "tr"
+    } else {
+        "en"
+    };
+    let cta = if language == "tr" {
+        "Uygunsa size 2 sayfalik kisa bir operasyon analizi paylasabilirim."
+    } else {
+        "Happy to share a brief 2-page operational analysis if helpful."
+    };
+    MessageStrategy {
+        pain_angle: matched.to_string(),
+        trigger_evidence: evidence.to_string(),
+        cta_type: cta.to_string(),
+        tone: "professional_warm".to_string(),
+        language: language.to_string(),
+    }
+}
+
+/// Stage 2: Build outreach message copy. Currently template-based; designed for
+/// future LLM generation when evidence bundle + thesis are available.
+/// Evidence-bound: refuses to generate if no evidence is provided.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct MessageCopy {
+    subject: String,
+    body: String,
+    linkedin_copy: String,
+    claims: Vec<String>,
+    evidence_ids: Vec<String>,
+}
+
+fn generate_message_copy(
+    strategy: &MessageStrategy,
+    profile: &SalesProfile,
+    company: &str,
+    contact_name: Option<&str>,
+) -> Result<MessageCopy, String> {
+    if strategy.trigger_evidence.trim().is_empty() && strategy.pain_angle.trim().is_empty() {
+        return Err("REFUSED: No evidence or pain angle provided. Message engine requires evidence.".into());
+    }
+    let subject = build_sales_email_subject(profile, company);
+    let body = build_sales_email_body(
+        profile,
+        company,
+        contact_name,
+        &strategy.pain_angle,
+        &strategy.trigger_evidence,
+    );
+    let linkedin = build_sales_linkedin_message(
+        profile,
+        company,
+        contact_name,
+        &strategy.trigger_evidence,
+    );
+    Ok(MessageCopy {
+        subject,
+        body,
+        linkedin_copy: linkedin,
+        claims: vec![strategy.pain_angle.clone()],
+        evidence_ids: Vec::new(),
+    })
+}
+
 fn extract_contact_from_search(
     search_output: &str,
     title_policy: &str,
@@ -10212,6 +10892,8 @@ fn best_search_contact_enrichment(
         evidence,
         osint_links,
         signal,
+        tech_stack: Vec::new(),
+        job_posting_signals: Vec::new(),
     }
 }
 
@@ -10367,6 +11049,10 @@ async fn search_company_osint_enrichment(
             }
         }
     }
+
+    // Run job posting signal search (TASK-27) using the primary search engine
+    enrichment.job_posting_signals =
+        search_job_posting_signals(company, domain, search_engine).await;
 
     enrichment
 }
@@ -11447,6 +12133,514 @@ fn infer_signal_type(text: &str) -> &'static str {
         "directory_membership"
     } else {
         "site_content"
+    }
+}
+
+/// Detect job posting signals from search results for an account.
+/// Job postings indicate active change capacity and intent.
+#[cfg(test)]
+fn extract_job_posting_signals(
+    search_results: &[SearchEntry],
+    account_name: &str,
+) -> Vec<(String, String, f64)> {
+    let job_keywords = [
+        "operasyon", "saha", "field", "operations", "hiring", "kariyer",
+        "is ilani", "job", "career", "ise alim", "pozisyon", "mudur",
+        "yonetici", "engineer", "technician", "teknisyen",
+    ];
+    let name_lower = account_name.to_lowercase();
+
+    search_results
+        .iter()
+        .filter(|entry| {
+            let title_lower = entry.title.to_lowercase();
+            let url_lower = entry.url.to_lowercase();
+            let name_match = title_lower.contains(&name_lower)
+                || url_lower.contains("kariyer.net")
+                || url_lower.contains("linkedin.com/jobs");
+            let keyword_match = job_keywords.iter().any(|kw| title_lower.contains(kw));
+            name_match && keyword_match
+        })
+        .map(|entry| {
+            let confidence = if entry.url.contains("kariyer.net") {
+                0.8
+            } else if entry.url.contains("linkedin.com") {
+                0.7
+            } else {
+                0.5
+            };
+            (
+                entry.title.clone(),
+                entry.url.clone(),
+                confidence,
+            )
+        })
+        .collect()
+}
+
+/// Detect job posting intent from OSINT URLs (lightweight URL-based variant).
+fn detect_job_posting_intent_from_urls(osint_links: &[String]) -> Vec<String> {
+    let job_domains = [
+        "kariyer.net",
+        "linkedin.com/jobs",
+        "indeed.com",
+        "glassdoor.com",
+        "secretcv.com",
+        "yenibiris.com",
+    ];
+    osint_links
+        .iter()
+        .filter(|url| {
+            let lower = url.to_lowercase();
+            job_domains.iter().any(|d| lower.contains(d))
+        })
+        .map(|url| format!("Job posting: {}", url))
+        .collect()
+}
+
+/// Search job posting sites for intent signals for a given account (TASK-27).
+/// Job postings on kariyer.net, LinkedIn Jobs, etc. indicate active change
+/// capacity and serve as campaign-window intent signals.
+async fn search_job_posting_signals(
+    account_name: &str,
+    domain: &str,
+    search_engine: &WebSearchEngine,
+) -> Vec<(String, String, f64, String)> {
+    // (signal_text, source_url, confidence, signal_type)
+    let transliterated = transliterate_turkish_ascii(account_name);
+    let queries = vec![
+        format!("site:kariyer.net \"{}\"", transliterated),
+        format!("site:linkedin.com/jobs \"{}\"", transliterated),
+        format!(
+            "\"{}\" \"saha\" OR \"operasyon\" OR \"field\" iş ilanı",
+            transliterated
+        ),
+    ];
+    let timeout = Duration::from_secs(SALES_CONTACT_SEARCH_TIMEOUT_SECS);
+    let job_keywords = [
+        "operasyon",
+        "saha",
+        "field",
+        "operations",
+        "hiring",
+        "kariyer",
+        "is ilani",
+        "job",
+        "career",
+        "ise alim",
+        "pozisyon",
+        "mudur",
+        "yonetici",
+        "engineer",
+        "technician",
+        "teknisyen",
+        "bakim",
+        "maintenance",
+        "uretim",
+        "production",
+    ];
+
+    let mut signals = Vec::new();
+    for q in &queries {
+        let raw = match run_sales_search(search_engine, q, 5, timeout).await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for entry in parse_search_entries(&raw) {
+            let title_lower = entry.title.to_lowercase();
+            let url_lower = entry.url.to_lowercase();
+            let domain_lower = domain.to_lowercase();
+            let name_lower = transliterated.to_lowercase();
+
+            // Must be related to the target account
+            let name_match = title_lower.contains(&name_lower)
+                || title_lower.contains(&domain_lower)
+                || url_lower.contains("kariyer.net")
+                || url_lower.contains("linkedin.com/jobs");
+
+            let keyword_match = job_keywords.iter().any(|kw| title_lower.contains(kw));
+
+            if name_match && keyword_match {
+                let confidence = if url_lower.contains("kariyer.net") {
+                    0.8
+                } else if url_lower.contains("linkedin.com") {
+                    0.7
+                } else {
+                    0.5
+                };
+                signals.push((
+                    entry.title.clone(),
+                    entry.url.clone(),
+                    confidence,
+                    "job_posting".to_string(),
+                ));
+            }
+        }
+        if signals.len() >= 5 {
+            break;
+        }
+    }
+    signals
+}
+
+/// Detect tech stack from site HTML content and HTTP headers.
+fn detect_tech_stack(html: &str, headers: &HashMap<String, String>) -> Vec<String> {
+    let detections: &[(&str, &[&str])] = &[
+        ("SAP", &["sap.com", "sap-ui", "sapui5", "/sap/"]),
+        ("Salesforce", &["salesforce.com", "force.com", "pardot"]),
+        ("HubSpot", &["hubspot.com", "hs-scripts", "hbspt"]),
+        ("Microsoft Dynamics", &["dynamics.com", "d365"]),
+        ("Oracle", &["oracle.com", "eloqua"]),
+        ("WordPress", &["wp-content", "wp-includes", "wordpress"]),
+        ("Shopify", &["shopify.com", "cdn.shopify"]),
+        ("React", &["react-root", "reactjs", "__NEXT_DATA__"]),
+        ("Angular", &["ng-version", "angular"]),
+        ("Vue.js", &["vue-app", "vuejs"]),
+        ("Google Analytics", &["google-analytics.com", "gtag/js", "ga.js"]),
+        ("Google Tag Manager", &["googletagmanager.com", "gtm.js"]),
+        ("Hotjar", &["hotjar.com", "static.hotjar"]),
+        ("Intercom", &["intercom.io", "intercomSettings"]),
+        ("Zendesk", &["zendesk.com", "zdassets"]),
+        ("Jira", &["atlassian.net", "jira"]),
+        ("Netsis", &["netsis"]),
+        ("Logo Yazılım", &["logo.com.tr", "logo yazılım"]),
+        ("IFS", &["ifs.com", "ifsworld"]),
+    ];
+
+    let html_lower = html.to_lowercase();
+    let mut stack: Vec<String> = detections
+        .iter()
+        .filter(|(_, indicators)| indicators.iter().any(|ind| html_lower.contains(ind)))
+        .map(|(name, _)| name.to_string())
+        .collect();
+
+    if let Some(powered_by) = headers.get("x-powered-by") {
+        if !powered_by.trim().is_empty() {
+            stack.push(powered_by.trim().to_string());
+        }
+    }
+    if let Some(server) = headers.get("server") {
+        let sv = server.trim().to_lowercase();
+        if sv.contains("nginx") || sv.contains("apache") || sv.contains("iis") {
+            stack.push(server.trim().to_string());
+        }
+    }
+
+    stack.sort();
+    stack.dedup();
+    stack
+}
+
+/// 4-Layer LinkedIn company URL search (TASK-24).
+/// Progressively broader queries to find the LinkedIn company page.
+async fn find_company_linkedin_url(
+    company_name: &str,
+    domain: &str,
+    search_engine: &WebSearchEngine,
+) -> Option<String> {
+    let timeout = Duration::from_secs(SALES_CONTACT_SEARCH_TIMEOUT_SECS);
+    let transliterated = transliterate_turkish_ascii(company_name);
+
+    // Layer 1: Domain match — most precise
+    let q1 = format!("site:linkedin.com/company/ \"{}\"", domain);
+    if let Some(url) = linkedin_search_attempt(search_engine, &q1, timeout).await {
+        return Some(url);
+    }
+
+    // Layer 2: Transliterated company name (handles Turkish chars)
+    let q2 = format!("site:linkedin.com/company/ \"{}\"", transliterated);
+    if let Some(url) = linkedin_search_attempt(search_engine, &q2, timeout).await {
+        return Some(url);
+    }
+
+    // Layer 3: Company name + CEO search
+    let q3 = format!("\"{}\" linkedin CEO OR \"Genel Müdür\"", company_name);
+    if let Some(url) = linkedin_search_attempt(search_engine, &q3, timeout).await {
+        return Some(url);
+    }
+
+    // Layer 4: Turkish LinkedIn subdomain
+    let q4 = format!("site:tr.linkedin.com \"{}\"", domain);
+    linkedin_search_attempt(search_engine, &q4, timeout).await
+}
+
+async fn linkedin_search_attempt(
+    search_engine: &WebSearchEngine,
+    query: &str,
+    timeout: Duration,
+) -> Option<String> {
+    match run_sales_search(search_engine, query, 5, timeout).await {
+        Ok(res) if !res.trim().is_empty() => extract_company_linkedin_from_text(&res)
+            .and_then(|value| normalize_company_linkedin_url(&value)),
+        _ => None,
+    }
+}
+
+/// Seed default contextual factors for Turkish market timing (TASK-35).
+fn seed_contextual_factors(conn: &Connection) {
+    let factors: &[(&str, &str, &str, &str, &str)] = &[
+        ("holiday", "ramazan_bayrami", "Ramazan Bayramı — avoid outreach", "2026-03-20", "2026-03-23"),
+        ("holiday", "kurban_bayrami", "Kurban Bayramı — avoid outreach", "2026-05-27", "2026-05-30"),
+        ("holiday", "cumhuriyet_bayrami", "Cumhuriyet Bayramı — avoid outreach", "2026-10-29", "2026-10-29"),
+        ("holiday", "yilbasi", "Yılbaşı — avoid outreach", "2026-12-31", "2027-01-01"),
+        ("budget_quarter", "q1_budget", "Q1 budget planning — high activity", "2026-01-02", "2026-03-31"),
+        ("budget_quarter", "q2_budget", "Q2 budget planning — high activity", "2026-04-01", "2026-06-30"),
+        ("budget_quarter", "q3_budget", "Q3 budget planning — high activity", "2026-07-01", "2026-09-30"),
+        ("budget_quarter", "q4_budget", "Q4 budget planning — high activity", "2026-10-01", "2026-12-31"),
+        ("season", "summer_slow", "Summer slowdown — reduced response rates", "2026-07-15", "2026-08-31"),
+        ("regulation", "kvkk", "KVKK (Turkish GDPR) — ensure compliance", "2016-04-07", "2099-12-31"),
+    ];
+    for (factor_type, factor_key, factor_value, eff_from, eff_until) in factors {
+        let id = stable_sales_id("ctx_factor", &[factor_type, factor_key]);
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO contextual_factors (id, factor_type, factor_key, factor_value, effective_from, effective_until, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'system_default')",
+            params![id, factor_type, factor_key, factor_value, eff_from, eff_until],
+        );
+    }
+}
+
+/// Check if today falls within a holiday or slow period (TASK-35).
+fn is_bad_timing_today(conn: &Connection) -> bool {
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let count: i32 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM contextual_factors
+             WHERE factor_type IN ('holiday', 'season')
+             AND effective_from <= ?1 AND effective_until >= ?1",
+            params![today],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    count > 0
+}
+
+/// Determine the current budget quarter context (TASK-35).
+fn current_budget_quarter(conn: &Connection) -> Option<String> {
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    conn.query_row(
+        "SELECT factor_value FROM contextual_factors
+         WHERE factor_type = 'budget_quarter'
+         AND effective_from <= ?1 AND effective_until >= ?1
+         LIMIT 1",
+        params![today],
+        |r| r.get(0),
+    )
+    .ok()
+}
+
+/// Calibrate scoring weights from outcome data (TASK-36).
+/// Analyzes positive/negative outcomes and creates rule proposals when
+/// signal weights appear to need adjustment.
+fn calibrate_scoring_from_outcomes(conn: &Connection) -> Result<Vec<String>, String> {
+    let mut proposals = Vec::new();
+
+    // Only calibrate when we have enough data
+    let outcome_count: i32 = conn
+        .query_row("SELECT COUNT(*) FROM outcomes", [], |r| r.get(0))
+        .unwrap_or(0);
+    if outcome_count < 10 {
+        return Ok(proposals);
+    }
+
+    // Analyze which signals appear in positive vs negative outcomes
+    let mut stmt = conn
+        .prepare(
+            "SELECT s.signal_type,
+                    SUM(CASE WHEN o.outcome_type IN ('meeting_booked', 'interested', 'click') THEN 1 ELSE 0 END) as positive,
+                    SUM(CASE WHEN o.outcome_type IN ('hard_bounce', 'unsubscribe', 'wrong_person') THEN 1 ELSE 0 END) as negative,
+                    COUNT(*) as total
+             FROM outcome_attribution_snapshots oas
+             JOIN outcomes o ON o.touch_id = oas.touch_id
+             JOIN signals s ON s.account_id = oas.account_id
+             GROUP BY s.signal_type
+             HAVING total >= 3",
+        )
+        .map_err(|e| format!("Calibration query failed: {e}"))?;
+
+    let rows: Vec<(String, i32, i32, i32)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .map_err(|e| format!("Calibration query failed: {e}"))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for (signal_type, positive, negative, total) in rows {
+        let positive_rate = positive as f64 / total as f64;
+        let negative_rate = negative as f64 / total as f64;
+
+        // If this signal type has high negative correlation, propose reducing its weight
+        if negative_rate > 0.5 && total >= 5 {
+            let proposal_id = stable_sales_id(
+                "rule_proposal",
+                &[&signal_type, "weight_down", &Utc::now().format("%Y-%W").to_string()],
+            );
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO retrieval_rule_versions
+                 (id, rule_type, rule_key, old_value, new_value, proposal_source, status, version, created_at)
+                 VALUES (?1, 'signal_weight', ?2, ?3, ?4, 'auto_calibration', 'proposed', 1, ?5)",
+                params![
+                    proposal_id,
+                    signal_type,
+                    format!("current (neg_rate={negative_rate:.2})"),
+                    format!("reduce_weight (pos={positive}, neg={negative}, total={total})"),
+                    Utc::now().to_rfc3339(),
+                ],
+            );
+            proposals.push(format!("Propose reducing weight for signal '{signal_type}': neg_rate={negative_rate:.2}"));
+        }
+
+        // If this signal type has high positive correlation, propose increasing weight
+        if positive_rate > 0.6 && total >= 5 {
+            let proposal_id = stable_sales_id(
+                "rule_proposal",
+                &[&signal_type, "weight_up", &Utc::now().format("%Y-%W").to_string()],
+            );
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO retrieval_rule_versions
+                 (id, rule_type, rule_key, old_value, new_value, proposal_source, status, version, created_at)
+                 VALUES (?1, 'signal_weight', ?2, ?3, ?4, 'auto_calibration', 'proposed', 1, ?5)",
+                params![
+                    proposal_id,
+                    signal_type,
+                    format!("current (pos_rate={positive_rate:.2})"),
+                    format!("increase_weight (pos={positive}, neg={negative}, total={total})"),
+                    Utc::now().to_rfc3339(),
+                ],
+            );
+            proposals.push(format!("Propose increasing weight for signal '{signal_type}': pos_rate={positive_rate:.2}"));
+        }
+    }
+
+    Ok(proposals)
+}
+
+/// Create an A/B experiment and return its ID (TASK-37).
+fn create_experiment(
+    conn: &Connection,
+    name: &str,
+    hypothesis: &str,
+    variant_a: &str,
+    variant_b: &str,
+) -> Result<String, String> {
+    let id = stable_sales_id("experiment", &[name]);
+    conn.execute(
+        "INSERT INTO experiments (id, name, hypothesis, variant_a, variant_b, status, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6)
+         ON CONFLICT(id) DO UPDATE SET
+            hypothesis = excluded.hypothesis,
+            variant_a = excluded.variant_a,
+            variant_b = excluded.variant_b",
+        params![id, name, hypothesis, variant_a, variant_b, Utc::now().to_rfc3339()],
+    )
+    .map_err(|e| format!("Failed to create experiment: {e}"))?;
+    Ok(id)
+}
+
+/// Assign a sequence instance to an experiment variant (TASK-37).
+fn assign_experiment_variant(
+    conn: &Connection,
+    experiment_id: &str,
+    sequence_instance_id: &str,
+) -> Result<String, String> {
+    // Balanced assignment: pick whichever variant has fewer assignments
+    let count_a: i32 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM experiment_assignments
+             WHERE experiment_id = ?1 AND variant = 'a'",
+            params![experiment_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let count_b: i32 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM experiment_assignments
+             WHERE experiment_id = ?1 AND variant = 'b'",
+            params![experiment_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    let variant = if count_a <= count_b { "a" } else { "b" };
+    let id = stable_sales_id("exp_assign", &[experiment_id, sequence_instance_id]);
+    conn.execute(
+        "INSERT OR IGNORE INTO experiment_assignments (id, experiment_id, sequence_instance_id, variant)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![id, experiment_id, sequence_instance_id, variant],
+    )
+    .map_err(|e| format!("Failed to assign experiment variant: {e}"))?;
+    Ok(variant.to_string())
+}
+
+/// Get experiment results summary (TASK-37).
+fn get_experiment_results(
+    conn: &Connection,
+    experiment_id: &str,
+) -> Result<serde_json::Value, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT ea.variant,
+                    COUNT(DISTINCT ea.sequence_instance_id) as sequences,
+                    SUM(CASE WHEN o.outcome_type IN ('meeting_booked', 'interested') THEN 1 ELSE 0 END) as positive,
+                    SUM(CASE WHEN o.outcome_type IN ('hard_bounce', 'unsubscribe') THEN 1 ELSE 0 END) as negative,
+                    COUNT(o.id) as total_outcomes
+             FROM experiment_assignments ea
+             LEFT JOIN sequence_instances si ON si.id = ea.sequence_instance_id
+             LEFT JOIN touches t ON t.sequence_instance_id = si.id
+             LEFT JOIN outcomes o ON o.touch_id = t.id
+             WHERE ea.experiment_id = ?1
+             GROUP BY ea.variant",
+        )
+        .map_err(|e| format!("Experiment results query failed: {e}"))?;
+
+    let variants: Vec<serde_json::Value> = stmt
+        .query_map(params![experiment_id], |r| {
+            let variant: String = r.get(0)?;
+            let sequences: i32 = r.get(1)?;
+            let positive: i32 = r.get(2)?;
+            let negative: i32 = r.get(3)?;
+            let total: i32 = r.get(4)?;
+            Ok(serde_json::json!({
+                "variant": variant,
+                "sequences": sequences,
+                "positive_outcomes": positive,
+                "negative_outcomes": negative,
+                "total_outcomes": total,
+                "positive_rate": if total > 0 { positive as f64 / total as f64 } else { 0.0 },
+            }))
+        })
+        .map_err(|e| format!("Experiment results query failed: {e}"))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(serde_json::json!({
+        "experiment_id": experiment_id,
+        "variants": variants,
+    }))
+}
+
+/// Verify LLM-generated domain actually exists with a HEAD request (TASK-40).
+async fn verify_domain_exists(domain: &str) -> bool {
+    let url = format!("https://{domain}");
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::limited(3))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    match client.head(&url).send().await {
+        Ok(resp) => resp.status().is_success() || resp.status().is_redirection(),
+        Err(_) => {
+            // Try HTTP as fallback
+            let http_url = format!("http://{domain}");
+            client
+                .head(&http_url)
+                .send()
+                .await
+                .map(|r| r.status().is_success() || r.status().is_redirection())
+                .unwrap_or(false)
+        }
     }
 }
 
@@ -12624,6 +13818,15 @@ fn default_internal_enrich_links(base_url: &url::Url) -> Vec<String> {
         "/tr/kurumsal/hakkimizda/yonetim-kurulu",
         "/yonetim",
         "/iletisim",
+        "/bize-ulasin",
+        "/ekibimiz",
+        "/referanslarimiz",
+        "/projelerimiz",
+        "/haberler",
+        "/duyurular",
+        "/en/management",
+        "/en/team",
+        "/en/contact",
     ];
     let mut out = Vec::<String>::new();
     let mut seen = HashSet::<String>::new();
@@ -12783,9 +13986,13 @@ fn best_site_contact_enrichment(
     let mut best = SiteContactEnrichment::default();
     let mut best_identity_signal = -1;
     let mut osint_links = bundle.osint_links.clone();
+    let empty_headers = HashMap::new();
+    let mut all_tech = Vec::new();
 
     for page in bundle.pages {
         osint_links.push(page.url.clone());
+        // Tech stack detection (TASK-28)
+        all_tech.extend(detect_tech_stack(&page.html, &empty_headers));
         if let Some(url) = extract_personal_linkedin_from_text(&page.html) {
             osint_links.push(url);
         }
@@ -12823,6 +14030,9 @@ fn best_site_contact_enrichment(
         }
     }
 
+    all_tech.sort();
+    all_tech.dedup();
+    best.tech_stack = all_tech;
     best.osint_links = merge_osint_links(Vec::new(), osint_links);
     best
 }
@@ -13193,21 +14403,47 @@ fn extract_contact_from_company_site_html(
 }
 
 fn guessed_email(contact_name: Option<&str>, domain: &str) -> Option<String> {
-    let name = contact_name?;
-    if contact_name_is_placeholder(Some(name)) {
-        return None;
-    }
-    let normalized = normalize_person_name(name)?;
+    guess_personal_email_patterns(contact_name, domain)
+        .into_iter()
+        .next()
+}
+
+/// Generate multiple candidate email patterns for a contact name + domain.
+/// Each guess has confidence 0.3 (speculative). Caller should MX-verify domain.
+fn guess_personal_email_patterns(contact_name: Option<&str>, domain: &str) -> Vec<String> {
+    let name = match contact_name {
+        Some(n) if !contact_name_is_placeholder(Some(n)) => n,
+        _ => return Vec::new(),
+    };
+    let normalized = match normalize_person_name(name) {
+        Some(n) => n,
+        None => return Vec::new(),
+    };
     let parts: Vec<&str> = normalized
         .split_whitespace()
-        .filter(|p| p.chars().all(|c| c.is_ascii_alphabetic()))
+        .filter(|p| p.chars().all(|c| c.is_alphabetic()))
         .collect();
     if parts.len() < 2 || parts.len() > 3 {
-        return None;
+        return Vec::new();
     }
-    let first = parts[0].to_lowercase();
-    let last = parts[parts.len() - 1].to_lowercase();
-    Some(format!("{}.{}@{}", first, last, domain))
+    let first = transliterate_turkish_ascii(parts[0]);
+    let last = transliterate_turkish_ascii(parts[parts.len() - 1]);
+    let first_initial = first.chars().next().unwrap_or('x');
+
+    let mut patterns = Vec::with_capacity(5);
+    // Pattern 1: first.last@domain  (most common)
+    patterns.push(format!("{first}.{last}@{domain}"));
+    // Pattern 2: flast@domain
+    patterns.push(format!("{first_initial}{last}@{domain}"));
+    // Pattern 3: first@domain
+    patterns.push(format!("{first}@{domain}"));
+    // Pattern 4: f.last@domain
+    patterns.push(format!("{first_initial}.{last}@{domain}"));
+    // Pattern 5: firstlast@domain
+    patterns.push(format!("{first}{last}@{domain}"));
+
+    patterns.retain(|e| email_syntax_valid(e));
+    patterns
 }
 
 fn lead_has_person_identity(contact_name: Option<&str>, linkedin_url: Option<&String>) -> bool {
@@ -14212,6 +15448,14 @@ fn apply_site_osint_to_profile(
             profile.source_count as usize,
             profile.contact_count as usize,
         ));
+    // Merge tech stack from site enrichment (TASK-28)
+    if !enrichment.tech_stack.is_empty() {
+        let mut stack = profile.tech_stack.clone();
+        stack.extend(enrichment.tech_stack.iter().cloned());
+        stack.sort();
+        stack.dedup();
+        profile.tech_stack = stack;
+    }
 }
 
 fn apply_search_osint_to_profile(
@@ -14275,6 +15519,28 @@ fn apply_search_osint_to_profile(
             profile.source_count as usize,
             profile.contact_count as usize,
         ));
+    // Detect job posting intent from OSINT links (TASK-27)
+    let job_signals = detect_job_posting_intent_from_urls(&profile.osint_links);
+    for signal in job_signals {
+        if !profile.trigger_events.contains(&signal) {
+            profile.trigger_events.push(signal);
+        }
+    }
+    // Merge active job posting search signals (TASK-27 search)
+    for (text, url, _confidence, _sig_type) in &enrichment.job_posting_signals {
+        let signal_text = format!("Job posting: {} ({})", text, url);
+        if !profile.trigger_events.contains(&signal_text) {
+            profile.trigger_events.push(signal_text);
+        }
+    }
+    // Merge tech stack from search enrichment (TASK-28)
+    if !enrichment.tech_stack.is_empty() {
+        let mut stack = profile.tech_stack.clone();
+        stack.extend(enrichment.tech_stack.iter().cloned());
+        stack.sort();
+        stack.dedup();
+        profile.tech_stack = stack;
+    }
 }
 
 fn site_contact_enrichment_has_signal(enrichment: &SiteContactEnrichment) -> bool {
@@ -14868,7 +16134,8 @@ async fn run_sales_search_batch(
     max_results: usize,
     timeout: Duration,
 ) -> Vec<(String, Result<String, String>)> {
-    stream::iter(queries.iter().cloned().map(|query| async move {
+    let owned: Vec<String> = queries.to_vec();
+    stream::iter(owned.into_iter().map(|query| async move {
         let result = run_sales_search(search_engine, &query, max_results, timeout).await;
         (query, result)
     }))
@@ -16701,9 +17968,248 @@ pub async fn sales_outcomes_webhook(
     };
 
     match engine.ingest_outcome_event(&body.delivery_id, &body.event_type, &body.raw_text) {
-        Ok(result) => (StatusCode::OK, Json(serde_json::json!({"result": result}))),
+        Ok(result) => {
+            // After outcome ingestion, advance sequences (TASK-30)
+            let advanced = engine.advance_sequences().unwrap_or(0);
+            (StatusCode::OK, Json(serde_json::json!({"result": result, "sequences_advanced": advanced})))
+        }
         Err(e) => (
             StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        ),
+    }
+}
+
+pub async fn advance_sales_sequences(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let engine = match engine_from_state(&state) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+        }
+    };
+    match engine.advance_sequences() {
+        Ok(count) => (StatusCode::OK, Json(serde_json::json!({"advanced": count}))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
+        ),
+    }
+}
+
+// --- Experiment endpoints (TASK-37) ---
+
+pub async fn list_sales_experiments(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let engine = match engine_from_state(&state) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+        }
+    };
+    let conn = match engine.open() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+        }
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT id, name, hypothesis, variant_a, variant_b, status, created_at
+         FROM experiments ORDER BY created_at DESC LIMIT 50",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+        }
+    };
+    let experiments: Vec<serde_json::Value> = stmt
+        .query_map([], |r| {
+            Ok(serde_json::json!({
+                "id": r.get::<_, String>(0)?,
+                "name": r.get::<_, String>(1)?,
+                "hypothesis": r.get::<_, Option<String>>(2)?,
+                "variant_a": r.get::<_, Option<String>>(3)?,
+                "variant_b": r.get::<_, Option<String>>(4)?,
+                "status": r.get::<_, String>(5)?,
+                "created_at": r.get::<_, String>(6)?,
+            }))
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+    (StatusCode::OK, Json(serde_json::json!({"experiments": experiments})))
+}
+
+pub async fn create_sales_experiment(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let engine = match engine_from_state(&state) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+        }
+    };
+    let name = body["name"].as_str().unwrap_or("unnamed");
+    let hypothesis = body["hypothesis"].as_str().unwrap_or("");
+    let variant_a = body["variant_a"].as_str().unwrap_or("control");
+    let variant_b = body["variant_b"].as_str().unwrap_or("treatment");
+    let conn = match engine.open() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+        }
+    };
+    match create_experiment(&conn, name, hypothesis, variant_a, variant_b) {
+        Ok(id) => (StatusCode::OK, Json(serde_json::json!({"id": id, "status": "active"}))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
+        ),
+    }
+}
+
+pub async fn get_sales_experiment_results(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let engine = match engine_from_state(&state) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+        }
+    };
+    let conn = match engine.open() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+        }
+    };
+    match get_experiment_results(&conn, &id) {
+        Ok(results) => (StatusCode::OK, Json(results)),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
+        ),
+    }
+}
+
+// --- Context Factors endpoint (TASK-35) ---
+
+pub async fn list_sales_context_factors(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let engine = match engine_from_state(&state) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+        }
+    };
+    let conn = match engine.open() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+        }
+    };
+    let bad_timing = is_bad_timing_today(&conn);
+    let budget_quarter = current_budget_quarter(&conn);
+    let mut stmt = match conn.prepare(
+        "SELECT id, factor_type, factor_key, factor_value, effective_from, effective_until, source
+         FROM contextual_factors ORDER BY effective_from",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+        }
+    };
+    let factors: Vec<serde_json::Value> = stmt
+        .query_map([], |r| {
+            Ok(serde_json::json!({
+                "id": r.get::<_, String>(0)?,
+                "factor_type": r.get::<_, String>(1)?,
+                "factor_key": r.get::<_, String>(2)?,
+                "factor_value": r.get::<_, Option<String>>(3)?,
+                "effective_from": r.get::<_, Option<String>>(4)?,
+                "effective_until": r.get::<_, Option<String>>(5)?,
+                "source": r.get::<_, Option<String>>(6)?,
+            }))
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "factors": factors,
+            "bad_timing_today": bad_timing,
+            "current_budget_quarter": budget_quarter,
+        })),
+    )
+}
+
+// --- Score Calibration endpoint (TASK-36) ---
+
+pub async fn run_sales_calibration(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let engine = match engine_from_state(&state) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+        }
+    };
+    let conn = match engine.open() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+        }
+    };
+    match calibrate_scoring_from_outcomes(&conn) {
+        Ok(proposals) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"proposals": proposals, "count": proposals.len()})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e})),
         ),
     }
@@ -17530,6 +19036,7 @@ mod tests {
             outreach_angle: String::new(),
             research_status: "heuristic".to_string(),
             research_confidence: 0.42,
+            tech_stack: Vec::new(),
             created_at: "2026-03-25T10:00:00Z".to_string(),
             updated_at: "2026-03-25T10:00:00Z".to_string(),
         };
@@ -17561,6 +19068,7 @@ mod tests {
             outreach_angle: "Lead with dispatch coordination".to_string(),
             research_status: "heuristic".to_string(),
             research_confidence: 0.83,
+            tech_stack: Vec::new(),
             created_at: "2026-03-24T10:00:00Z".to_string(),
             updated_at: "2026-03-24T10:00:00Z".to_string(),
         };
@@ -17618,6 +19126,7 @@ mod tests {
                 outreach_angle: "Lead with dispatch coordination".to_string(),
                 research_status: "heuristic".to_string(),
                 research_confidence: 0.74,
+                tech_stack: Vec::new(),
                 created_at: "2026-03-25T10:00:00Z".to_string(),
                 updated_at: "2026-03-25T10:00:00Z".to_string(),
             }])
@@ -17692,6 +19201,7 @@ mod tests {
                 outreach_angle: "Lead with automation".to_string(),
                 research_status: "heuristic".to_string(),
                 research_confidence: 0.88,
+                tech_stack: Vec::new(),
                 created_at: "2026-03-25T10:00:00Z".to_string(),
                 updated_at: "2026-03-25T10:00:00Z".to_string(),
             }])
@@ -17779,6 +19289,7 @@ mod tests {
                 outreach_angle: "Lead with automation".to_string(),
                 research_status: "heuristic".to_string(),
                 research_confidence: 0.88,
+                tech_stack: Vec::new(),
                 created_at: "2026-03-25T10:00:00Z".to_string(),
                 updated_at: "2026-03-25T10:00:00Z".to_string(),
             }])
@@ -17867,6 +19378,7 @@ mod tests {
                 outreach_angle: "Lead with automation".to_string(),
                 research_status: "heuristic".to_string(),
                 research_confidence: 0.88,
+                tech_stack: Vec::new(),
                 created_at: "2026-03-25T10:00:00Z".to_string(),
                 updated_at: "2026-03-25T10:00:00Z".to_string(),
             }])
@@ -18206,6 +19718,7 @@ mod tests {
                 outreach_angle: "Lead with faster dispatch coordination".to_string(),
                 research_status: "heuristic".to_string(),
                 research_confidence: 0.81,
+                tech_stack: Vec::new(),
                 created_at: "2026-03-26T09:00:00Z".to_string(),
                 updated_at: "2026-03-26T09:00:00Z".to_string(),
             }])
@@ -19548,6 +21061,8 @@ mod tests {
                 "https://www.linkedin.com/company/yapi-merkezi/".to_string(),
                 "https://yapimerkezi.com.tr/yonetim".to_string(),
             ],
+            tech_stack: Vec::new(),
+            job_posting_signals: Vec::new(),
             signal: site_contact_candidate_signal(
                 Some(&"Başar Arıoğlu".to_string()),
                 Some(&"Chairman".to_string()),
@@ -19757,5 +21272,800 @@ Bergiz Holding altyapi ve insaat projeleri yurutur.
             utc_day.succ_opt().expect("next day"),
             "utc"
         ));
+    }
+
+    // =======================================================================
+    // SPEC VERIFICATION TESTS — Phase 0 Checklist
+    // =======================================================================
+
+    #[test]
+    fn spec_p0_consumer_domain_rejected() {
+        assert!(!is_valid_company_domain("gmail.com"));
+        assert!(!is_valid_company_domain("yahoo.com"));
+        assert!(!is_valid_company_domain("hotmail.com"));
+        assert!(!is_valid_company_domain("outlook.com"));
+        assert!(!is_valid_company_domain("protonmail.com"));
+    }
+
+    #[test]
+    fn spec_p0_valid_company_domain_accepted() {
+        assert!(is_valid_company_domain("machinity.com"));
+        assert!(is_valid_company_domain("acme.com.tr"));
+        assert!(is_valid_company_domain("example-corp.com"));
+    }
+
+    #[test]
+    fn spec_p0_gov_edu_mil_domains_rejected() {
+        assert!(!is_valid_company_domain("ankara.gov.tr"));
+        assert!(!is_valid_company_domain("odtu.edu.tr"));
+        assert!(!is_valid_company_domain("tsk.mil.tr"));
+    }
+
+    #[test]
+    fn spec_p0_turkish_placeholder_detected() {
+        assert!(is_placeholder_name("Başkan'ın Mesajı"));
+        assert!(is_placeholder_name("baskanin mesaji"));
+        assert!(is_placeholder_name("Genel Müdürün Mesajı"));
+        assert!(is_placeholder_name("Hakkımızda"));
+        assert!(is_placeholder_name("Vizyonumuz"));
+        assert!(is_placeholder_name("İletişim"));
+        assert!(is_placeholder_name("Kariyer"));
+        assert!(is_placeholder_name("Yönetim Kurulu"));
+    }
+
+    #[test]
+    fn spec_p0_real_names_not_placeholder() {
+        assert!(!is_placeholder_name("Ali Vural"));
+        assert!(!is_placeholder_name("Mehmet Kaya"));
+        assert!(!is_placeholder_name("Ayşe Demir"));
+    }
+
+    #[test]
+    fn spec_p0_phone_normalization_e164() {
+        assert_eq!(
+            normalize_phone("0530 851 89 61"),
+            Some("+905308518961".to_string())
+        );
+        assert_eq!(
+            normalize_phone("+90 530 851 89 61"),
+            Some("+905308518961".to_string())
+        );
+        assert_eq!(
+            normalize_phone("5308518961"),
+            Some("+905308518961".to_string())
+        );
+        assert_eq!(normalize_phone("123"), None); // too short
+    }
+
+    #[test]
+    fn spec_p0_email_classification() {
+        assert_eq!(classify_email("info@acme.com", "acme.com"), "generic");
+        assert_eq!(classify_email("ali.vural@acme.com", "acme.com"), "personal");
+        assert_eq!(classify_email("user@gmail.com", "acme.com"), "consumer");
+        assert_eq!(classify_email("not-an-email", "acme.com"), "invalid");
+        // sales@ and hr@ are generic role mailboxes
+        assert_eq!(classify_email("sales@acme.com", "acme.com"), "generic");
+        assert_eq!(classify_email("hr@acme.com", "acme.com"), "generic");
+    }
+
+    #[test]
+    fn spec_p0_target_geo_empty_default() {
+        let profile = SalesProfile::default();
+        assert!(
+            profile.target_geo.is_empty(),
+            "target_geo should default to empty to force user to set it"
+        );
+    }
+
+    #[test]
+    fn spec_p0_candidate_gateway_rejects_consumer() {
+        let mut candidate = DomainCandidate {
+            domain: "gmail.com".to_string(),
+            ..Default::default()
+        };
+        assert!(!normalize_candidate_gateway(&mut candidate));
+    }
+
+    #[test]
+    fn spec_p0_candidate_gateway_accepts_valid() {
+        let mut candidate = DomainCandidate {
+            domain: "machinity.com".to_string(),
+            score: 10,
+            ..Default::default()
+        };
+        assert!(normalize_candidate_gateway(&mut candidate));
+    }
+
+    #[test]
+    fn spec_p0_candidate_gateway_normalizes_phone() {
+        let mut candidate = DomainCandidate {
+            domain: "example.com.tr".to_string(),
+            phone: Some("0532 123 45 67".to_string()),
+            ..Default::default()
+        };
+        assert!(normalize_candidate_gateway(&mut candidate));
+        assert_eq!(candidate.phone.as_deref(), Some("+905321234567"));
+    }
+
+    // =======================================================================
+    // SPEC VERIFICATION TESTS — Phase 1 Checklist
+    // =======================================================================
+
+    #[test]
+    fn spec_p1_five_axis_score_struct() {
+        let score = FiveAxisScore {
+            fit_score: 0.8,
+            intent_score: 0.6,
+            reachability_score: 0.7,
+            deliverability_risk: 0.1,
+            compliance_risk: 0.05,
+        };
+        assert!(score.fit_score > 0.0 && score.fit_score <= 1.0);
+        assert!(score.deliverability_risk >= 0.0 && score.deliverability_risk <= 1.0);
+    }
+
+    #[test]
+    fn spec_p1_send_gate_block_on_high_deliverability_risk() {
+        let score = FiveAxisScore {
+            fit_score: 0.9,
+            intent_score: 0.8,
+            reachability_score: 0.9,
+            deliverability_risk: 0.8,
+            compliance_risk: 0.0,
+        };
+        assert!(matches!(send_gate(&score), SendGateDecision::Block { .. }));
+    }
+
+    #[test]
+    fn spec_p1_send_gate_block_on_high_compliance_risk() {
+        let score = FiveAxisScore {
+            fit_score: 0.9,
+            intent_score: 0.8,
+            reachability_score: 0.9,
+            deliverability_risk: 0.1,
+            compliance_risk: 0.6,
+        };
+        assert!(matches!(send_gate(&score), SendGateDecision::Block { .. }));
+    }
+
+    #[test]
+    fn spec_p1_send_gate_research_on_low_reachability() {
+        let score = FiveAxisScore {
+            fit_score: 0.8,
+            intent_score: 0.5,
+            reachability_score: 0.1,
+            deliverability_risk: 0.1,
+            compliance_risk: 0.1,
+        };
+        assert!(matches!(
+            send_gate(&score),
+            SendGateDecision::Research { .. }
+        ));
+    }
+
+    #[test]
+    fn spec_p1_send_gate_nurture_on_low_intent() {
+        let score = FiveAxisScore {
+            fit_score: 0.8,
+            intent_score: 0.1,
+            reachability_score: 0.5,
+            deliverability_risk: 0.1,
+            compliance_risk: 0.1,
+        };
+        assert!(matches!(
+            send_gate(&score),
+            SendGateDecision::Nurture { .. }
+        ));
+    }
+
+    #[test]
+    fn spec_p1_send_gate_activate_on_good_account() {
+        let score = FiveAxisScore {
+            fit_score: 0.8,
+            intent_score: 0.6,
+            reachability_score: 0.7,
+            deliverability_risk: 0.1,
+            compliance_risk: 0.1,
+        };
+        assert!(matches!(send_gate(&score), SendGateDecision::Activate));
+    }
+
+    #[test]
+    fn spec_p1_tier_assignment() {
+        let high = FiveAxisScore {
+            fit_score: 0.9,
+            intent_score: 0.7,
+            reachability_score: 0.8,
+            deliverability_risk: 0.1,
+            compliance_risk: 0.1,
+        };
+        assert_eq!(assign_tier(&high), "a_tier");
+
+        let mid = FiveAxisScore {
+            fit_score: 0.6,
+            intent_score: 0.3,
+            reachability_score: 0.5,
+            deliverability_risk: 0.2,
+            compliance_risk: 0.1,
+        };
+        assert_eq!(assign_tier(&mid), "standard");
+
+        let low = FiveAxisScore {
+            fit_score: 0.3,
+            intent_score: 0.1,
+            reachability_score: 0.2,
+            deliverability_risk: 0.5,
+            compliance_risk: 0.4,
+        };
+        assert_eq!(assign_tier(&low), "basic");
+    }
+
+    #[test]
+    fn spec_p1_signal_horizon_classification() {
+        let (horizon, expires) = classify_signal_horizon("tender", "ihale");
+        assert_eq!(horizon, "immediate");
+        assert!(expires.is_some());
+
+        let (horizon, _) = classify_signal_horizon("directory_membership", "member");
+        assert_eq!(horizon, "structural");
+
+        let (horizon, _) = classify_signal_horizon("job_posting", "acil pozisyon");
+        assert_eq!(horizon, "immediate");
+
+        let (horizon, _) = classify_signal_horizon("job_posting", "saha muduru");
+        assert_eq!(horizon, "campaign_window");
+    }
+
+    #[test]
+    fn spec_p1_source_confidence_hierarchy() {
+        assert!(source_confidence("directory_listing") > source_confidence("site_html"));
+        assert!(source_confidence("site_html") > source_confidence("web_search"));
+        assert!(source_confidence("web_search") > source_confidence("llm_enrichment"));
+        assert!(source_confidence("llm_enrichment") > source_confidence("llm_generation"));
+    }
+
+    #[test]
+    fn spec_p1_reply_classification() {
+        assert_eq!(classify_reply_content("toplanti yapalim"), "meeting_booked");
+        assert_eq!(classify_reply_content("ilginc gorunuyor"), "interested");
+        assert_eq!(classify_reply_content("simdi degil"), "not_now");
+        assert_eq!(classify_reply_content("yanlis kisi"), "wrong_person");
+        assert_eq!(
+            classify_reply_content("beni listeden cikar"),
+            "unsubscribe"
+        );
+    }
+
+    // =======================================================================
+    // NEW FEATURE TESTS
+    // =======================================================================
+
+    #[test]
+    fn spec_email_pattern_guesser_produces_multiple_patterns() {
+        let patterns = guess_personal_email_patterns(Some("Ali Vural"), "acme.com.tr");
+        assert!(patterns.len() >= 3, "Should produce at least 3 patterns");
+        assert!(patterns.contains(&"ali.vural@acme.com.tr".to_string()));
+        assert!(patterns.contains(&"avural@acme.com.tr".to_string()));
+        assert!(patterns.contains(&"ali@acme.com.tr".to_string()));
+    }
+
+    #[test]
+    fn spec_email_pattern_guesser_handles_turkish_chars() {
+        let patterns = guess_personal_email_patterns(Some("Şükrü Öztürk"), "firma.com.tr");
+        assert!(!patterns.is_empty());
+        // Turkish chars should be transliterated
+        assert!(patterns[0].contains("sukru") || patterns[0].contains("ozturk"));
+    }
+
+    #[test]
+    fn spec_email_pattern_guesser_rejects_placeholder() {
+        let patterns = guess_personal_email_patterns(Some("Leadership Team"), "acme.com");
+        assert!(patterns.is_empty());
+    }
+
+    #[test]
+    fn spec_tech_stack_detection_finds_sap() {
+        let html = r#"<html><body><script src="https://sap.com/sap-ui.js"></script></body></html>"#;
+        let headers = HashMap::new();
+        let stack = detect_tech_stack(html, &headers);
+        assert!(stack.contains(&"SAP".to_string()));
+    }
+
+    #[test]
+    fn spec_tech_stack_detection_finds_hubspot() {
+        let html = r#"<html><body><script src="//js.hs-scripts.com/1234.js"></script></body></html>"#;
+        let headers = HashMap::new();
+        let stack = detect_tech_stack(html, &headers);
+        assert!(stack.contains(&"HubSpot".to_string()));
+    }
+
+    #[test]
+    fn spec_tech_stack_detection_empty_on_clean_html() {
+        let html = "<html><body><p>Hello world</p></body></html>";
+        let headers = HashMap::new();
+        let stack = detect_tech_stack(html, &headers);
+        assert!(stack.is_empty());
+    }
+
+    #[test]
+    fn spec_tech_stack_detection_uses_headers() {
+        let html = "<html><body></body></html>";
+        let mut headers = HashMap::new();
+        headers.insert("x-powered-by".to_string(), "Express".to_string());
+        let stack = detect_tech_stack(html, &headers);
+        assert!(stack.contains(&"Express".to_string()));
+    }
+
+    #[test]
+    fn spec_job_posting_signal_extraction() {
+        let results = vec![
+            SearchEntry {
+                title: "Acme Corp - Saha Operasyon Yoneticisi".to_string(),
+                url: "https://kariyer.net/is-ilani/acme".to_string(),
+                snippet: String::new(),
+            },
+            SearchEntry {
+                title: "Random unrelated post".to_string(),
+                url: "https://example.com".to_string(),
+                snippet: String::new(),
+            },
+        ];
+        let signals = extract_job_posting_signals(&results, "Acme Corp");
+        assert_eq!(signals.len(), 1);
+        assert!(signals[0].0.contains("Saha"));
+        assert!(signals[0].2 > 0.5); // confidence
+    }
+
+    #[test]
+    fn spec_message_strategy_turkish_for_tr_geo() {
+        let profile = SalesProfile {
+            target_geo: "TR".to_string(),
+            product_name: "TestProd".to_string(),
+            ..SalesProfile::default()
+        };
+        let strategy = generate_message_strategy(&profile, "Acme", Some("Ali"), "signal", "ops");
+        assert_eq!(strategy.language, "tr");
+    }
+
+    #[test]
+    fn spec_message_copy_refuses_without_evidence() {
+        let strategy = MessageStrategy {
+            pain_angle: String::new(),
+            trigger_evidence: String::new(),
+            ..Default::default()
+        };
+        let profile = SalesProfile::default();
+        let result = generate_message_copy(&strategy, &profile, "Acme", Some("Ali"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("REFUSED"));
+    }
+
+    #[test]
+    fn spec_message_copy_succeeds_with_evidence() {
+        let strategy = MessageStrategy {
+            pain_angle: "field ops coordination".to_string(),
+            trigger_evidence: "directory membership signal".to_string(),
+            language: "en".to_string(),
+            cta_type: "soft".to_string(),
+            tone: "warm".to_string(),
+        };
+        let profile = SalesProfile {
+            product_name: "TestProd".to_string(),
+            sender_name: "Sender".to_string(),
+            ..SalesProfile::default()
+        };
+        let result = generate_message_copy(&strategy, &profile, "Acme", Some("Ali"));
+        assert!(result.is_ok());
+        let copy = result.unwrap();
+        assert!(!copy.subject.is_empty());
+        assert!(!copy.body.is_empty());
+    }
+
+    #[test]
+    fn spec_seniority_from_title_detects_clevel() {
+        assert_eq!(seniority_from_title(Some("CEO")), "c_level");
+        assert_eq!(seniority_from_title(Some("Chief Operating Officer")), "c_level");
+        assert_eq!(seniority_from_title(Some("Genel Müdür")), "c_level");
+        assert_eq!(seniority_from_title(Some("Founder & CEO")), "c_level");
+    }
+
+    #[test]
+    fn spec_seniority_from_title_detects_levels() {
+        assert_eq!(seniority_from_title(Some("VP Engineering")), "vp");
+        assert_eq!(seniority_from_title(Some("Director of Ops")), "director");
+        assert_eq!(seniority_from_title(Some("Operations Manager")), "manager");
+        assert_eq!(seniority_from_title(Some("Intern")), "unknown");
+    }
+
+    #[test]
+    fn spec_transliterate_turkish_ascii() {
+        assert_eq!(transliterate_turkish_ascii("Şükrü Öztürk"), "sukru ozturk");
+        assert_eq!(transliterate_turkish_ascii("İstanbul"), "istanbul");
+        assert_eq!(transliterate_turkish_ascii("Çağrı"), "cagri");
+    }
+
+    #[test]
+    fn spec_email_syntax_valid() {
+        assert!(email_syntax_valid("ali@example.com"));
+        assert!(email_syntax_valid("a.b@c.d"));
+        assert!(!email_syntax_valid("notanemail"));
+        assert!(!email_syntax_valid("@domain.com"));
+        assert!(!email_syntax_valid("user@"));
+        assert!(!email_syntax_valid("user@.com"));
+    }
+
+    #[test]
+    fn spec_sequence_advancement_completes_on_positive_outcome() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = SalesEngine::new(temp.path());
+        engine.init().unwrap();
+        let conn = engine.open().unwrap();
+        let now = Utc::now().to_rfc3339();
+        engine.ensure_default_sequence_template(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO accounts (id, canonical_name, created_at, updated_at) VALUES ('acc1', 'Test Co', ?1, ?1)",
+            params![now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO contacts (id, account_id, full_name, created_at) VALUES ('c1', 'acc1', 'Ali', ?1)",
+            params![now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO sequence_instances (id, template_id, account_id, contact_id, current_step, status, started_at, updated_at)
+             VALUES ('seq1', 'default_outreach_sequence', 'acc1', 'c1', 1, 'active', ?1, ?1)",
+            params![now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO touches (id, sequence_instance_id, step, channel, message_payload, created_at)
+             VALUES ('t1', 'seq1', 1, 'email', '{}', ?1)",
+            params![now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO outcomes (id, touch_id, outcome_type, classified_at) VALUES ('o1', 't1', 'meeting_booked', ?1)",
+            params![now],
+        ).unwrap();
+
+        let advanced = engine.advance_sequences().unwrap();
+        assert!(advanced >= 1);
+
+        let status: String = conn.query_row(
+            "SELECT status FROM sequence_instances WHERE id = 'seq1'",
+            [],
+            |r: &rusqlite::Row| r.get(0),
+        ).unwrap();
+        assert_eq!(status, "completed");
+    }
+
+    #[test]
+    fn spec_sequence_advancement_cancels_on_bounce() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = SalesEngine::new(temp.path());
+        engine.init().unwrap();
+        let conn = engine.open().unwrap();
+        let now = Utc::now().to_rfc3339();
+        engine.ensure_default_sequence_template(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO accounts (id, canonical_name, created_at, updated_at) VALUES ('acc2', 'Bounce Co', ?1, ?1)",
+            params![now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO contacts (id, account_id, full_name, created_at) VALUES ('c2', 'acc2', 'Test', ?1)",
+            params![now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO sequence_instances (id, template_id, account_id, contact_id, current_step, status, started_at, updated_at)
+             VALUES ('seq2', 'default_outreach_sequence', 'acc2', 'c2', 1, 'active', ?1, ?1)",
+            params![now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO touches (id, sequence_instance_id, step, channel, message_payload, created_at)
+             VALUES ('t2', 'seq2', 1, 'email', '{}', ?1)",
+            params![now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO outcomes (id, touch_id, outcome_type, classified_at) VALUES ('o2', 't2', 'hard_bounce', ?1)",
+            params![now],
+        ).unwrap();
+
+        engine.advance_sequences().unwrap();
+        let status: String = conn.query_row(
+            "SELECT status FROM sequence_instances WHERE id = 'seq2'",
+            [],
+            |r: &rusqlite::Row| r.get(0),
+        ).unwrap();
+        assert_eq!(status, "cancelled");
+    }
+
+    #[test]
+    fn spec_mailbox_pool_selects_lowest_sends() {
+        let mut cfg = SenderConfig {
+            mailboxes: vec![
+                MailboxConfig {
+                    email: "a@send.example.com".into(),
+                    daily_cap: 10,
+                    warm_state: "warm".into(),
+                    sends_today: 8,
+                    counter_date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+                    ..Default::default()
+                },
+                MailboxConfig {
+                    email: "b@send.example.com".into(),
+                    daily_cap: 10,
+                    warm_state: "warm".into(),
+                    sends_today: 3,
+                    counter_date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+                    ..Default::default()
+                },
+            ],
+        };
+        let picked = cfg.select_mailbox().unwrap();
+        assert_eq!(picked.email, "b@send.example.com");
+    }
+
+    #[test]
+    fn spec_mailbox_pool_skips_cold() {
+        let mut cfg = SenderConfig {
+            mailboxes: vec![
+                MailboxConfig {
+                    email: "cold@send.example.com".into(),
+                    daily_cap: 10,
+                    warm_state: "cold".into(),
+                    sends_today: 0,
+                    counter_date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+                    ..Default::default()
+                },
+                MailboxConfig {
+                    email: "warm@send.example.com".into(),
+                    daily_cap: 10,
+                    warm_state: "warm".into(),
+                    sends_today: 5,
+                    counter_date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+                    ..Default::default()
+                },
+            ],
+        };
+        let picked = cfg.select_mailbox().unwrap();
+        assert_eq!(picked.email, "warm@send.example.com");
+    }
+
+    #[test]
+    fn spec_mailbox_pool_exhausted_returns_none() {
+        let mut cfg = SenderConfig {
+            mailboxes: vec![MailboxConfig {
+                email: "full@send.example.com".into(),
+                daily_cap: 5,
+                warm_state: "warm".into(),
+                sends_today: 5,
+                counter_date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+                ..Default::default()
+            }],
+        };
+        assert!(cfg.select_mailbox().is_none());
+    }
+
+    #[test]
+    fn spec_mailbox_warming_cap_limited() {
+        let mb = MailboxConfig {
+            daily_cap: 50,
+            warm_state: "warming".into(),
+            ..Default::default()
+        };
+        assert_eq!(mb.effective_cap(), 15); // warming caps at 15
+    }
+
+    #[test]
+    fn spec_sender_remaining_capacity() {
+        let cfg = SenderConfig {
+            mailboxes: vec![
+                MailboxConfig {
+                    daily_cap: 10,
+                    warm_state: "warm".into(),
+                    sends_today: 3,
+                    ..Default::default()
+                },
+                MailboxConfig {
+                    daily_cap: 10,
+                    warm_state: "warm".into(),
+                    sends_today: 7,
+                    ..Default::default()
+                },
+                MailboxConfig {
+                    daily_cap: 10,
+                    warm_state: "cold".into(),
+                    sends_today: 0,
+                    ..Default::default()
+                },
+            ],
+        };
+        assert_eq!(cfg.remaining_capacity(), 10); // 7 + 3 from warm mailboxes
+    }
+
+    #[test]
+    fn spec_mailbox_pool_parses_legacy_string_entries() {
+        let pool = mailbox_pool_from_json(r#"["legacy@send.example.com", "SECOND@send.example.com "]"#);
+        assert_eq!(pool.len(), 2);
+        assert_eq!(pool[0].email, "legacy@send.example.com");
+        assert_eq!(pool[1].email, "second@send.example.com");
+        assert_eq!(pool[0].warm_state, "warming");
+        assert_eq!(pool[0].daily_cap, 20);
+    }
+
+    #[test]
+    fn spec_record_mailbox_send_persists_daily_counter() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SalesEngine::new(dir.path());
+        engine.init().unwrap();
+        let sender_cfg = SenderConfig {
+            mailboxes: vec![MailboxConfig {
+                email: "warm@send.example.com".into(),
+                daily_cap: 10,
+                warm_state: "warm".into(),
+                counter_date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+                ..Default::default()
+            }],
+        };
+        engine.save_sender_config(&sender_cfg).unwrap();
+
+        engine.record_mailbox_send("warm@send.example.com").unwrap();
+        let reloaded = engine.load_sender_config();
+
+        assert_eq!(reloaded.mailboxes.len(), 1);
+        assert_eq!(reloaded.mailboxes[0].sends_today, 1);
+        assert_eq!(reloaded.mailboxes[0].email, "warm@send.example.com");
+    }
+
+    #[test]
+    fn spec_context_factors_seeded_on_init() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sales.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS contextual_factors (
+                id TEXT PRIMARY KEY,
+                factor_type TEXT NOT NULL,
+                factor_key TEXT NOT NULL,
+                factor_value TEXT,
+                effective_from TEXT,
+                effective_until TEXT,
+                source TEXT
+            );",
+        )
+        .unwrap();
+        seed_contextual_factors(&conn);
+        let count: i32 = conn
+            .query_row("SELECT COUNT(*) FROM contextual_factors", [], |r| r.get(0))
+            .unwrap();
+        assert!(count >= 10, "Expected at least 10 contextual factors, got {count}");
+        // Check specific factors exist
+        let ramazan: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM contextual_factors WHERE factor_key = 'ramazan_bayrami'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ramazan, 1);
+        let kvkk: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM contextual_factors WHERE factor_key = 'kvkk'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kvkk, 1);
+        // Idempotent — re-seeding should not duplicate
+        seed_contextual_factors(&conn);
+        let count2: i32 = conn
+            .query_row("SELECT COUNT(*) FROM contextual_factors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, count2);
+    }
+
+    #[test]
+    fn spec_experiment_create_and_balanced_assignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sales.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS experiments (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, hypothesis TEXT,
+                variant_a TEXT, variant_b TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS experiment_assignments (
+                id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL,
+                sequence_instance_id TEXT, variant TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+
+        let exp_id = create_experiment(&conn, "subject_line_test", "Shorter subjects get more opens", "short", "long").unwrap();
+        assert!(!exp_id.is_empty());
+
+        // Assign multiple sequences — should balance a/b
+        let v1 = assign_experiment_variant(&conn, &exp_id, "seq_001").unwrap();
+        let v2 = assign_experiment_variant(&conn, &exp_id, "seq_002").unwrap();
+        assert_eq!(v1, "a");
+        assert_eq!(v2, "b");
+        let v3 = assign_experiment_variant(&conn, &exp_id, "seq_003").unwrap();
+        assert_eq!(v3, "a");
+    }
+
+    #[test]
+    fn spec_calibration_creates_proposals_from_outcomes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sales.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS outcomes (
+                id TEXT PRIMARY KEY, touch_id TEXT NOT NULL,
+                outcome_type TEXT NOT NULL,
+                classified_at TEXT NOT NULL DEFAULT (datetime('now')),
+                classifier_confidence REAL DEFAULT 1.0
+            );
+            CREATE TABLE IF NOT EXISTS outcome_attribution_snapshots (
+                id TEXT PRIMARY KEY, touch_id TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                snapshot_at TEXT NOT NULL DEFAULT (datetime('now')),
+                score_at_touch_json TEXT, active_signal_ids TEXT,
+                unused_signal_ids TEXT, thesis_id TEXT,
+                sequence_variant TEXT, message_variant TEXT,
+                channel TEXT, mailbox_id TEXT, contextual_factors_json TEXT
+            );
+            CREATE TABLE IF NOT EXISTS signals (
+                id TEXT PRIMARY KEY, account_id TEXT NOT NULL,
+                signal_type TEXT NOT NULL, text TEXT NOT NULL,
+                source TEXT, observed_at TEXT, confidence REAL DEFAULT 0.5,
+                effect_horizon TEXT, expires_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS retrieval_rule_versions (
+                id TEXT PRIMARY KEY, rule_type TEXT NOT NULL,
+                rule_key TEXT NOT NULL, old_value TEXT,
+                new_value TEXT NOT NULL, proposal_source TEXT,
+                backtest_result_json TEXT, holdout_result_json TEXT,
+                status TEXT NOT NULL DEFAULT 'proposed',
+                approved_by TEXT, activated_at TEXT,
+                version INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .unwrap();
+
+        // Not enough data → no proposals
+        let proposals = calibrate_scoring_from_outcomes(&conn).unwrap();
+        assert!(proposals.is_empty());
+
+        // Insert enough outcomes with signals
+        for i in 0..12 {
+            let touch_id = format!("touch_{i}");
+            let account_id = format!("acc_{i}");
+            conn.execute(
+                "INSERT INTO outcome_attribution_snapshots (id, touch_id, account_id, snapshot_at) VALUES (?1, ?2, ?3, datetime('now'))",
+                params![format!("snap_{i}"), touch_id, account_id],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO outcomes (id, touch_id, outcome_type) VALUES (?1, ?2, ?3)",
+                params![format!("out_{i}"), touch_id, if i < 8 { "hard_bounce" } else { "meeting_booked" }],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO signals (id, account_id, signal_type, text) VALUES (?1, ?2, 'directory_membership', ?3)",
+                params![format!("sig_{i}"), account_id, format!("Signal {i}")],
+            ).unwrap();
+        }
+
+        let proposals = calibrate_scoring_from_outcomes(&conn).unwrap();
+        assert!(!proposals.is_empty(), "Should have created calibration proposals");
+    }
+
+    #[test]
+    fn spec_verify_domain_exists_basic() {
+        // This is an async function — just verify it compiles and the signature is correct
+        // Actual HTTP verification would require network access
+        let _fn_exists: fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> =
+            |domain| Box::pin(verify_domain_exists(domain));
     }
 }

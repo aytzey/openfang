@@ -463,6 +463,32 @@ function salesPage() {
       return String(Math.round(value * 100)) + '%';
     },
 
+    prospectActionSuggestion(p) {
+      if (!p) return '';
+      var status = p.profile_status || '';
+      var hasEmail = !!(p.primary_email);
+      var hasLinkedin = !!(p.primary_linkedin_url);
+      if (status === 'contact_ready' && hasEmail) return 'Send email now';
+      if (status === 'contact_ready' && hasLinkedin) return 'LinkedIn outreach';
+      if (status === 'email_only') return 'Search LinkedIn';
+      if (status === 'contact_identified') return 'Verify contact';
+      if (status === 'company_only') return 'Research needed';
+      return '';
+    },
+
+    prospectActionClass(p) {
+      if (!p) return 'badge-muted';
+      var status = p.profile_status || '';
+      if (status === 'contact_ready') return 'badge-success';
+      if (status === 'email_only' || status === 'contact_identified') return 'badge-warn';
+      return 'badge-muted';
+    },
+
+    prospectTechStack(p) {
+      if (!p || !Array.isArray(p.tech_stack) || p.tech_stack.length === 0) return '';
+      return p.tech_stack.join(', ');
+    },
+
     approvalSelected(id) {
       return !!(this.approvalSelections && this.approvalSelections[id]);
     },
@@ -813,13 +839,21 @@ function salesPage() {
 
     prospectNextAction(prospect) {
       if (!prospect) return '-';
+      var score = typeof prospect.fit_score === 'number' ? prospect.fit_score : 50;
+      var isHigh = score >= 75;
       if (prospect.profile_status === 'contact_ready') {
-        if (prospect.primary_email && prospect.primary_linkedin_url) return 'Email ile basla, LinkedIn follow-up';
-        if (prospect.primary_email) return 'Email taslagini onaya gonder';
+        if (prospect.primary_email && prospect.primary_linkedin_url) {
+          return isHigh ? 'Hemen email gonder + LinkedIn follow-up planla' : 'Email ile basla, LinkedIn follow-up';
+        }
+        if (prospect.primary_email) {
+          return isHigh ? 'Hemen email taslagini onaya gonder' : 'Email taslagini onaya gonder';
+        }
         if (prospect.primary_linkedin_url) return 'LinkedIn operator-assist gorevi ac';
+        return 'Email pattern tahmini dene veya LinkedIn ara';
       }
+      if (prospect.profile_status === 'email_only') return 'LinkedIn profilini ara, kisisel email bul';
       if (prospect.profile_status === 'contact_identified') return "Kanal dogrulama yap ve lead'e yuksel";
-      return 'Buying committee ve temas kanali cikar';
+      return 'Arastirma gerekli: buying committee ve temas kanali cikar';
     },
 
     prospectOsintLinks(prospect) {

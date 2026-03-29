@@ -379,7 +379,7 @@
             </div>
             <div class="table-wrap" x-show="prospects.length > 0">
               <table>
-                <thead><tr><th>Sirket</th><th>Durum</th><th>Birincil temas</th><th>Kanal</th><th>Fit</th><th>ICP sinyali</th></tr></thead>
+                <thead><tr><th>Sirket</th><th>Durum</th><th>Birincil temas</th><th>Kanal</th><th>Fit</th><th>ICP sinyali</th><th>Aksiyon</th></tr></thead>
                 <tbody>
                   <template x-for="p in prospects" :key="p.id">
                     <tr>
@@ -387,6 +387,7 @@
                           <span class="font-bold" x-text="p.company"></span>
                           <div class="text-xs text-dim" x-text="p.company_domain"></div>
                           <div class="text-xs text-dim sales-line-clamp" x-text="p.summary"></div>
+                          <div class="text-xs text-dim" x-show="prospectTechStack(p)" x-text="'Tech: ' + prospectTechStack(p)"></div>
                           <button class="btn btn-ghost btn-sm" style="margin-top:8px" @click="selectProspect(p)">Profili ac</button>
                         </td>
                       <td><span class="badge" :class="prospectStatusClass(p.profile_status)" x-text="p.profile_status"></span></td>
@@ -397,6 +398,7 @@
                       <td class="text-xs" x-text="prospectChannels(p)"></td>
                       <td x-text="p.fit_score"></td>
                       <td class="text-xs"><div class="sales-line-clamp" x-text="prospectSignalsPreview(p).join(' | ') || '-'"></div></td>
+                      <td><span class="badge" :class="prospectActionClass(p)" x-text="prospectActionSuggestion(p)" x-show="prospectActionSuggestion(p)"></span></td>
                     </tr>
                   </template>
                 </tbody>

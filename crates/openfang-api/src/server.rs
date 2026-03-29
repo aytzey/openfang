@@ -497,6 +497,27 @@ pub async fn build_router_with_options(
             axum::routing::post(sales::sales_outcomes_webhook),
         )
         .route(
+            "/api/sales/sequences/advance",
+            axum::routing::post(sales::advance_sales_sequences),
+        )
+        .route(
+            "/api/sales/experiments",
+            axum::routing::get(sales::list_sales_experiments)
+                .post(sales::create_sales_experiment),
+        )
+        .route(
+            "/api/sales/experiments/{id}/results",
+            axum::routing::get(sales::get_sales_experiment_results),
+        )
+        .route(
+            "/api/sales/context-factors",
+            axum::routing::get(sales::list_sales_context_factors),
+        )
+        .route(
+            "/api/sales/calibration/run",
+            axum::routing::post(sales::run_sales_calibration),
+        )
+        .route(
             "/api/sales/runs",
             axum::routing::get(sales::list_sales_runs),
         )
