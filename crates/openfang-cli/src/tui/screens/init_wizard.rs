@@ -29,6 +29,14 @@ struct ProviderInfo {
 
 const PROVIDERS: &[ProviderInfo] = &[
     ProviderInfo {
+        name: "openai-codex",
+        display: "OpenAI Codex",
+        env_var: "OPENAI_CODEX_ACCESS_TOKEN",
+        default_model: "gpt-5.3-codex",
+        needs_key: false,
+        hint: "~/.codex/auth.json",
+    },
+    ProviderInfo {
         name: "groq",
         display: "Groq",
         env_var: "GROQ_API_KEY",
@@ -285,18 +293,13 @@ impl State {
 
     fn build_provider_order(&mut self) {
         self.provider_order.clear();
-        let gemini_via_google = std::env::var("GOOGLE_API_KEY").is_ok();
-        for (i, p) in PROVIDERS.iter().enumerate() {
-            let detected =
-                std::env::var(p.env_var).is_ok() || (p.name == "gemini" && gemini_via_google);
-            if detected {
+        for (i, _) in PROVIDERS.iter().enumerate() {
+            if self.is_provider_detected(i) {
                 self.provider_order.push(i);
             }
         }
-        for (i, p) in PROVIDERS.iter().enumerate() {
-            let detected =
-                std::env::var(p.env_var).is_ok() || (p.name == "gemini" && gemini_via_google);
-            if !detected {
+        for (i, _) in PROVIDERS.iter().enumerate() {
+            if !self.is_provider_detected(i) {
                 self.provider_order.push(i);
             }
         }
@@ -336,6 +339,7 @@ impl State {
         let p = &PROVIDERS[prov_idx];
         std::env::var(p.env_var).is_ok()
             || (p.name == "gemini" && std::env::var("GOOGLE_API_KEY").is_ok())
+            || (p.name == "openai-codex" && crate::has_codex_cli_auth())
     }
 
     /// Populate model_entries from the catalog for the selected provider.
@@ -1595,7 +1599,13 @@ fn draw_provider(f: &mut Frame, area: Rect, state: &mut State) {
             };
             let name_span = Span::raw(format!("{:<14}", p.display));
             let hint_text = if detected {
-                format!("{} detected", p.env_var)
+                if p.name == "openai-codex" {
+                    "~/.codex/auth.json detected".to_string()
+                } else {
+                    format!("{} detected", p.env_var)
+                }
+            } else if p.name == "openai-codex" {
+                "requires ~/.codex/auth.json".to_string()
             } else if !p.needs_key {
                 "local, no key needed".to_string()
             } else if !p.hint.is_empty() {

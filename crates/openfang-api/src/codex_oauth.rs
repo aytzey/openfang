@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
-use tracing::warn;
+use tracing::{info, warn};
 
 const DEFAULT_AUTH_URL: &str = "https://auth.openai.com/oauth/authorize";
 const DEFAULT_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -844,7 +844,7 @@ fn extract_expiry(v: &serde_json::Value) -> Option<DateTime<Utc>> {
     expires_in.map(|secs| Utc::now() + ChronoDuration::seconds(secs))
 }
 
-pub(crate) fn import_codex_cli_auth(home_dir: &Path) -> Result<StoredCodexAuth, String> {
+fn codex_cli_auth_candidates(home_dir: &Path) -> Vec<PathBuf> {
     let mut candidates = vec![home_dir.join(".codex").join("auth.json")];
     if let Ok(home) = std::env::var("HOME") {
         let cli_path = PathBuf::from(home).join(".codex").join("auth.json");
@@ -852,13 +852,40 @@ pub(crate) fn import_codex_cli_auth(home_dir: &Path) -> Result<StoredCodexAuth, 
             candidates.push(cli_path);
         }
     }
-    let path = candidates
+    candidates
+}
+
+fn find_codex_cli_auth_path(home_dir: &Path) -> Option<PathBuf> {
+    codex_cli_auth_candidates(home_dir)
         .into_iter()
         .find(|candidate| candidate.exists())
-        .ok_or_else(|| {
-            "Codex auth file not found in home_dir/.codex/auth.json or $HOME/.codex/auth.json"
-                .to_string()
-        })?;
+}
+
+pub fn has_codex_cli_auth(home_dir: &Path) -> bool {
+    find_codex_cli_auth_path(home_dir).is_some()
+}
+
+pub fn load_preferred_codex_auth(home_dir: &Path) -> Result<Option<StoredCodexAuth>, String> {
+    if logout_marker_exists(home_dir) {
+        return Ok(None);
+    }
+
+    if let Some(auth) = load_stored_auth(home_dir)? {
+        return Ok(Some(auth));
+    }
+
+    if has_codex_cli_auth(home_dir) {
+        return import_codex_cli_auth(home_dir).map(Some);
+    }
+
+    Ok(None)
+}
+
+pub fn import_codex_cli_auth(home_dir: &Path) -> Result<StoredCodexAuth, String> {
+    let path = find_codex_cli_auth_path(home_dir).ok_or_else(|| {
+        "Codex auth file not found in home_dir/.codex/auth.json or $HOME/.codex/auth.json"
+            .to_string()
+    })?;
 
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
@@ -928,6 +955,41 @@ pub(crate) fn import_codex_cli_auth(home_dir: &Path) -> Result<StoredCodexAuth, 
     };
 
     Ok(auth)
+}
+
+pub(crate) async fn initialize_codex_auth(state: &AppState) {
+    let home = &state.kernel.config.home_dir;
+    let fallback_client_id =
+        std::env::var("OPENAI_OAUTH_CLIENT_ID").unwrap_or_else(|_| DEFAULT_CLIENT_ID.to_string());
+
+    let mut auth = match load_preferred_codex_auth(home) {
+        Ok(Some(auth)) => auth,
+        Ok(None) => {
+            clear_codex_auth_from_runtime(state);
+            return;
+        }
+        Err(e) => {
+            warn!("Failed to load Codex OAuth auth during startup: {e}");
+            clear_codex_auth_from_runtime(state);
+            return;
+        }
+    };
+
+    if let Err(e) = ensure_access_token_for_auth(&mut auth, &fallback_client_id).await {
+        warn!("Failed to prepare Codex OAuth auth during startup: {e}");
+        clear_codex_auth_from_runtime(state);
+        return;
+    }
+
+    auth.chatgpt_account_id = auth_account_id(&auth);
+    if auth.client_id.is_none() {
+        auth.client_id = Some(fallback_client_id);
+    }
+    if let Err(e) = save_stored_auth(home, &auth) {
+        warn!("Failed to persist Codex OAuth auth during startup: {e}");
+    }
+    apply_codex_auth_to_runtime(state, &auth);
+    info!("Codex OAuth auth loaded from {}", auth.source);
 }
 
 pub async fn codex_oauth_start(

@@ -745,6 +745,7 @@ fn init_tracing_file() {
 fn main() {
     // Load ~/.openfang/.env into process environment (system env takes priority).
     dotenv::load_dotenv();
+    prime_codex_oauth_env();
 
     let cli = Cli::parse();
 
@@ -1018,6 +1019,46 @@ pub(crate) fn daemon_json(
 // Commands
 // ---------------------------------------------------------------------------
 
+pub(crate) fn has_codex_cli_auth() -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    openfang_api::codex_oauth::has_codex_cli_auth(&home.join(".openfang"))
+}
+
+fn prime_codex_oauth_env() {
+    let token_already_set = std::env::var("OPENAI_CODEX_ACCESS_TOKEN")
+        .ok()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    if token_already_set {
+        return;
+    }
+
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+    let openfang_home = home.join(".openfang");
+    let Ok(Some(auth)) = openfang_api::codex_oauth::load_preferred_codex_auth(&openfang_home)
+    else {
+        return;
+    };
+
+    if auth.access_token.trim().is_empty() {
+        return;
+    }
+
+    std::env::set_var("OPENAI_CODEX_ACCESS_TOKEN", auth.access_token.trim());
+    if let Some(account_id) = auth
+        .chatgpt_account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        std::env::set_var("OPENAI_CODEX_ACCOUNT_ID", account_id);
+    }
+}
+
 fn cmd_init(quick: bool) {
     let home = match dirs::home_dir() {
         Some(h) => h,
@@ -1187,6 +1228,11 @@ fn launch_desktop_app(_openfang_dir: &std::path::Path) {
 
 /// Auto-detect the best available provider.
 fn detect_best_provider() -> (&'static str, &'static str, &'static str) {
+    if has_codex_cli_auth() {
+        ui::success("Detected OpenAI Codex OAuth (~/.codex/auth.json)");
+        return ("openai-codex", "OPENAI_CODEX_ACCESS_TOKEN", "gpt-5.3-codex");
+    }
+
     let providers = provider_list();
 
     for (p, env_var, m, display) in &providers {
@@ -1208,6 +1254,12 @@ fn detect_best_provider() -> (&'static str, &'static str, &'static str) {
 /// Static list of supported providers: (id, env_var, default_model, display_name).
 fn provider_list() -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
     vec![
+        (
+            "openai-codex",
+            "OPENAI_CODEX_ACCESS_TOKEN",
+            "gpt-5.3-codex",
+            "OpenAI Codex OAuth",
+        ),
         ("groq", "GROQ_API_KEY", "llama-3.3-70b-versatile", "Groq"),
         ("gemini", "GEMINI_API_KEY", "gemini-2.5-flash", "Gemini"),
         ("deepseek", "DEEPSEEK_API_KEY", "deepseek-chat", "DeepSeek"),
@@ -1900,19 +1952,22 @@ fn cmd_doctor(json: bool, repair: bool) {
             }
             let answer = prompt_input("    Create default config? [Y/n] ");
             if answer.is_empty() || answer.starts_with('y') || answer.starts_with('Y') {
-                let default_config = r#"# OpenFang Agent OS configuration
+                let (provider, api_key_env, model) = detect_best_provider();
+                let default_config = format!(
+                    r#"# OpenFang Agent OS configuration
 # See https://github.com/RightNow-AI/openfang for documentation
 
 api_listen = "127.0.0.1:4200"
 
 [default_model]
-provider = "groq"
-model = "llama-3.3-70b-versatile"
-api_key_env = "GROQ_API_KEY"
+provider = "{provider}"
+model = "{model}"
+api_key_env = "{api_key_env}"
 
 [memory]
 decay_rate = 0.05
-"#;
+"#
+                );
                 let _ = std::fs::create_dir_all(&openfang_dir);
                 if std::fs::write(&config_path, default_config).is_ok() {
                     restrict_file_permissions(&config_path);
@@ -2096,6 +2151,18 @@ decay_rate = 0.05
     if !json {
         println!("\n  LLM Providers:");
     }
+    let mut any_key_set = false;
+    if has_codex_cli_auth() {
+        any_key_set = true;
+        if !json {
+            ui::provider_status("OpenAI Codex OAuth", "~/.codex/auth.json", true);
+        }
+        checks.push(serde_json::json!({
+            "check": "provider_codex_cli_auth",
+            "status": "ok",
+            "provider": "openai-codex"
+        }));
+    }
     let provider_keys = [
         ("GROQ_API_KEY", "Groq", "groq"),
         ("OPENROUTER_API_KEY", "OpenRouter", "openrouter"),
@@ -2108,8 +2175,6 @@ decay_rate = 0.05
         ("MISTRAL_API_KEY", "Mistral", "mistral"),
         ("FIREWORKS_API_KEY", "Fireworks", "fireworks"),
     ];
-
-    let mut any_key_set = false;
     for (env_var, name, provider_id) in &provider_keys {
         let set = std::env::var(env_var).is_ok();
         if set {
@@ -3695,6 +3760,7 @@ fn cmd_channel_toggle(channel: &str, enable: bool) {
 /// Map a provider name to its conventional environment variable name.
 fn provider_to_env_var(provider: &str) -> String {
     match provider.to_lowercase().as_str() {
+        "openai-codex" => "OPENAI_CODEX_ACCESS_TOKEN".to_string(),
         "groq" => "GROQ_API_KEY".to_string(),
         "anthropic" => "ANTHROPIC_API_KEY".to_string(),
         "openai" => "OPENAI_API_KEY".to_string(),

@@ -30,6 +30,9 @@ const PROVIDER_ENV_VARS: &[(&str, &str)] = &[
 ];
 
 fn detect_provider() -> Option<(&'static str, &'static str)> {
+    if crate::has_codex_cli_auth() {
+        return Some(("OpenAI Codex OAuth", "~/.codex/auth.json"));
+    }
     for &(var, name) in PROVIDER_ENV_VARS {
         if std::env::var(var).is_ok() {
             return Some((name, var));

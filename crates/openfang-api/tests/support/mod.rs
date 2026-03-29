@@ -32,6 +32,7 @@ pub struct TestServerBuilder {
     model: TestModelConfig,
     api_key: Option<String>,
     rate_limiter: Option<Arc<KeyedRateLimiter>>,
+    codex_cli_auth_json: Option<serde_json::Value>,
 }
 
 impl Default for TestServerBuilder {
@@ -40,6 +41,7 @@ impl Default for TestServerBuilder {
             model: OLLAMA_TEST_MODEL,
             api_key: None,
             rate_limiter: None,
+            codex_cli_auth_json: None,
         }
     }
 }
@@ -60,8 +62,23 @@ impl TestServerBuilder {
         self
     }
 
+    pub fn with_codex_cli_auth_json(mut self, auth_json: serde_json::Value) -> Self {
+        self.codex_cli_auth_json = Some(auth_json);
+        self
+    }
+
     pub async fn start(self) -> TestServer {
         let tmp = tempfile::tempdir().expect("Failed to create temp dir");
+
+        if let Some(auth_json) = self.codex_cli_auth_json {
+            let codex_dir = tmp.path().join(".codex");
+            std::fs::create_dir_all(&codex_dir).expect("create temp .codex dir");
+            std::fs::write(
+                codex_dir.join("auth.json"),
+                serde_json::to_string_pretty(&auth_json).expect("serialize temp auth"),
+            )
+            .expect("write temp auth.json");
+        }
 
         let mut config = KernelConfig {
             home_dir: tmp.path().to_path_buf(),

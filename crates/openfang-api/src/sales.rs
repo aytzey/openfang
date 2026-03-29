@@ -61,6 +61,17 @@ const MAX_MIB_DIRECTORY_CANDIDATES: usize = 10;
 const MAX_IMDER_DIRECTORY_CANDIDATES: usize = 8;
 const MAX_ISDER_DIRECTORY_CANDIDATES: usize = 8;
 const MAX_THBB_DIRECTORY_CANDIDATES: usize = 8;
+const MAX_EDER_DIRECTORY_CANDIDATES: usize = 8;
+const MAX_LOJIDER_DIRECTORY_CANDIDATES: usize = 10;
+const MAX_TFYD_DIRECTORY_CANDIDATES: usize = 10;
+const MAX_OSS_DIRECTORY_CANDIDATES: usize = 10;
+const MAX_IDA_DIRECTORY_CANDIDATES: usize = 10;
+const MAX_TESID_DIRECTORY_CANDIDATES: usize = 12;
+const MAX_TUDIS_DIRECTORY_CANDIDATES: usize = 10;
+const MAX_EMSAD_DIRECTORY_CANDIDATES: usize = 10;
+const MAX_TGSD_DIRECTORY_CANDIDATES: usize = 12;
+const MAX_ARED_DIRECTORY_CANDIDATES: usize = 10;
+const MAX_TODEB_DIRECTORY_CANDIDATES: usize = 10;
 const MAX_IMDER_DETAIL_FETCHES: usize = 12;
 const MAX_ISDER_DETAIL_FETCHES: usize = 12;
 const MIB_DIRECTORY_PAGE_COUNT: usize = 9;
@@ -385,6 +396,8 @@ struct JobStageStatus {
     started_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     completed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkpoint: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -397,6 +410,17 @@ struct JobProgressResponse {
     stages: Vec<JobStageStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct LeadGenerationCheckpoint {
+    total_candidates: usize,
+    processed_candidates: usize,
+    profiled_accounts: usize,
+    inserted: u32,
+    approvals_queued: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_domain: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -524,8 +548,8 @@ fn normalize_mailbox_config(mut mailbox: MailboxConfig) -> Option<MailboxConfig>
 }
 
 fn mailbox_pool_from_json(pool_json: &str) -> Vec<MailboxConfig> {
-    let value: serde_json::Value = serde_json::from_str(pool_json)
-        .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
+    let value: serde_json::Value =
+        serde_json::from_str(pool_json).unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
     let serde_json::Value::Array(items) = value else {
         return Vec::new();
     };
@@ -1533,6 +1557,31 @@ impl SalesEngine {
         Ok(())
     }
 
+    fn update_job_stage_checkpoint<T: Serialize>(
+        &self,
+        job_id: &str,
+        stage: PipelineStage,
+        checkpoint: &T,
+    ) -> Result<(), String> {
+        let conn = self.open()?;
+        let checkpoint_data = serde_json::to_string(checkpoint)
+            .map_err(|e| format!("Failed to serialize job checkpoint: {e}"))?;
+        conn.execute(
+            "UPDATE job_stages
+             SET checkpoint_data = ?3,
+                 updated_at = ?4
+             WHERE job_run_id = ?1 AND stage_name = ?2",
+            params![
+                job_id,
+                stage.as_str(),
+                checkpoint_data,
+                Utc::now().to_rfc3339()
+            ],
+        )
+        .map_err(|e| format!("Failed to update job checkpoint: {e}"))?;
+        Ok(())
+    }
+
     fn complete_job_stage<T: Serialize>(
         &self,
         job_id: &str,
@@ -1556,7 +1605,12 @@ impl SalesEngine {
         Ok(())
     }
 
-    fn fail_job_stage(&self, job_id: &str, stage: PipelineStage, error_msg: &str) -> Result<(), String> {
+    fn fail_job_stage(
+        &self,
+        job_id: &str,
+        stage: PipelineStage,
+        error_msg: &str,
+    ) -> Result<(), String> {
         let conn = self.open()?;
         let now = Utc::now().to_rfc3339();
         conn.execute(
@@ -1608,7 +1662,7 @@ impl SalesEngine {
 
         let mut stmt = conn
             .prepare(
-                "SELECT stage_name, status, started_at, completed_at
+                "SELECT stage_name, status, started_at, completed_at, checkpoint_data
                  FROM job_stages
                  WHERE job_run_id = ?1
                  ORDER BY CASE stage_name
@@ -1624,11 +1678,15 @@ impl SalesEngine {
             .map_err(|e| format!("Prepare job stages query failed: {e}"))?;
         let stages = stmt
             .query_map(params![job_id], |row| {
+                let checkpoint = row
+                    .get::<_, Option<String>>(4)?
+                    .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok());
                 Ok(JobStageStatus {
                     name: row.get::<_, String>(0)?,
                     status: row.get::<_, String>(1)?,
                     started_at: row.get::<_, Option<String>>(2)?,
                     completed_at: row.get::<_, Option<String>>(3)?,
+                    checkpoint,
                 })
             })
             .map_err(|e| format!("Job stages query failed: {e}"))?
@@ -1654,6 +1712,29 @@ impl SalesEngine {
             stages,
             error_message,
         }))
+    }
+
+    fn latest_running_job_progress(
+        &self,
+        job_type: &str,
+    ) -> Result<Option<JobProgressResponse>, String> {
+        let conn = self.open()?;
+        let job_id = conn
+            .query_row(
+                "SELECT id
+                 FROM job_runs
+                 WHERE job_type = ?1 AND status = 'running'
+                 ORDER BY started_at DESC
+                 LIMIT 1",
+                params![job_type],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| format!("Active job lookup failed: {e}"))?;
+        let Some(job_id) = job_id else {
+            return Ok(None);
+        };
+        self.get_job_progress(&job_id)
     }
 
     fn latest_completed_checkpoint(
@@ -1705,7 +1786,11 @@ impl SalesEngine {
         channel: &str,
         recipient: &str,
     ) -> Result<bool, String> {
-        let recipient_json_path = if channel == "email" { "$.to" } else { "$.profile_url" };
+        let recipient_json_path = if channel == "email" {
+            "$.to"
+        } else {
+            "$.profile_url"
+        };
         let sql = format!(
             "SELECT COUNT(*)
              FROM approvals
@@ -1713,9 +1798,11 @@ impl SalesEngine {
                AND status = 'pending'
                AND json_extract(payload_json, '{recipient_json_path}') = ?2"
         );
-        conn.query_row(sql.as_str(), params![channel, recipient], |row| row.get::<_, i64>(0))
-            .map(|count| count > 0)
-            .map_err(|e| format!("Pending approval lookup failed: {e}"))
+        conn.query_row(sql.as_str(), params![channel, recipient], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map(|count| count > 0)
+        .map_err(|e| format!("Pending approval lookup failed: {e}"))
     }
 
     fn is_suppressed(&self, conn: &Connection, contact_value: &str) -> Result<bool, String> {
@@ -1803,19 +1890,21 @@ impl SalesEngine {
             .map_err(|e| format!("Prepare source_health query failed: {e}"))?;
         let rows = stmt
             .query_map([], |row| {
-            Ok(SourceHealthRow {
-                id: row.get::<_, String>(0)?,
-                source_type: row.get::<_, String>(1)?,
-                precision: row.get::<_, Option<f64>>(2)?,
-                freshness: row.get::<_, Option<String>>(3)?,
-                parser_health: row.get::<_, f64>(4).unwrap_or(0.0),
-                legal_mode: row.get::<_, String>(5).unwrap_or_else(|_| "public".to_string()),
-                historical_reply_yield: row.get::<_, Option<f64>>(6)?,
-                last_checked_at: row.get::<_, Option<String>>(7)?,
-                auto_skip: row.get::<_, i64>(8).unwrap_or(0) == 1,
+                Ok(SourceHealthRow {
+                    id: row.get::<_, String>(0)?,
+                    source_type: row.get::<_, String>(1)?,
+                    precision: row.get::<_, Option<f64>>(2)?,
+                    freshness: row.get::<_, Option<String>>(3)?,
+                    parser_health: row.get::<_, f64>(4).unwrap_or(0.0),
+                    legal_mode: row
+                        .get::<_, String>(5)
+                        .unwrap_or_else(|_| "public".to_string()),
+                    historical_reply_yield: row.get::<_, Option<f64>>(6)?,
+                    last_checked_at: row.get::<_, Option<String>>(7)?,
+                    auto_skip: row.get::<_, i64>(8).unwrap_or(0) == 1,
+                })
             })
-        })
-        .map_err(|e| format!("Source health query failed: {e}"))?;
+            .map_err(|e| format!("Source health query failed: {e}"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("Source health row decode failed: {e}"))
     }
@@ -1855,7 +1944,9 @@ impl SalesEngine {
             )
             .map_err(|e| format!("Failed to prepare activation selection query: {e}"))?;
         let activation_rows = activation_stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
             .map_err(|e| format!("Failed to query activation queue: {e}"))?;
         for row in activation_rows {
             let (account_id, _priority) =
@@ -2116,8 +2207,10 @@ impl SalesEngine {
         proposal_source: &str,
         backtest_result: &serde_json::Value,
     ) -> Result<String, String> {
-        let proposal_id =
-            stable_sales_id("rule_proposal", &[rule_type, rule_key, new_value, proposal_source]);
+        let proposal_id = stable_sales_id(
+            "rule_proposal",
+            &[rule_type, rule_key, new_value, proposal_source],
+        );
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO retrieval_rule_versions
@@ -2183,13 +2276,20 @@ impl SalesEngine {
         let unused_set = unused_signal_ids.iter().cloned().collect::<HashSet<_>>();
         let missed_signals = all_signals
             .iter()
-            .filter(|(signal_id, _)| !active_set.contains(signal_id) && !unused_set.contains(signal_id))
+            .filter(|(signal_id, _)| {
+                !active_set.contains(signal_id) && !unused_set.contains(signal_id)
+            })
             .map(|(signal_id, _)| signal_id.clone())
             .collect::<Vec<_>>();
 
         let positive_outcome = matches!(
             outcome_type,
-            "open" | "click" | "forwarded" | "referral" | "interested" | "meeting_booked"
+            "open"
+                | "click"
+                | "forwarded"
+                | "referral"
+                | "interested"
+                | "meeting_booked"
                 | "closed_won"
         );
         let negative_outcome = matches!(
@@ -2239,14 +2339,14 @@ impl SalesEngine {
         )
         .map_err(|e| format!("Failed to persist missed signal review: {e}"))?;
 
-        let (proposal_direction, driver_signal_id) = if let Some(signal_id) = validated_signals.first()
-        {
-            ("increase", Some(signal_id.clone()))
-        } else if let Some(signal_id) = false_positive_signals.first() {
-            ("decrease", Some(signal_id.clone()))
-        } else {
-            ("" , None)
-        };
+        let (proposal_direction, driver_signal_id) =
+            if let Some(signal_id) = validated_signals.first() {
+                ("increase", Some(signal_id.clone()))
+            } else if let Some(signal_id) = false_positive_signals.first() {
+                ("decrease", Some(signal_id.clone()))
+            } else {
+                ("", None)
+            };
         if let Some(signal_id) = driver_signal_id {
             if let Some(signal_type) = all_signal_types.get(&signal_id) {
                 let proposal_payload = serde_json::json!({
@@ -2320,7 +2420,10 @@ impl SalesEngine {
             .map_err(|e| format!("Failed to upsert sender_policies: {e}"))?;
         }
 
-        for profile in self.list_stored_prospect_profiles(10_000, None).unwrap_or_default() {
+        for profile in self
+            .list_stored_prospect_profiles(10_000, None)
+            .unwrap_or_default()
+        {
             self.migrate_prospect_profile(&conn, &profile, sales_profile.as_ref())?;
         }
         for lead in self.list_leads(10_000, None).unwrap_or_default() {
@@ -2438,7 +2541,11 @@ impl SalesEngine {
             .map_err(|e| format!("Failed to migrate signals: {e}"))?;
         }
 
-        for link in profile.osint_links.iter().take(MAX_OSINT_LINKS_PER_PROSPECT) {
+        for link in profile
+            .osint_links
+            .iter()
+            .take(MAX_OSINT_LINKS_PER_PROSPECT)
+        {
             let artifact_id = stable_sales_id("artifact", &[&account_id, link]);
             conn.execute(
                 "INSERT OR IGNORE INTO artifacts
@@ -2483,7 +2590,12 @@ impl SalesEngine {
             buyer_roles: Vec::new(),
             pain_points: Vec::new(),
             trigger_events: Vec::new(),
-            recommended_channel: if lead.email.is_some() { "email" } else { "linkedin" }.to_string(),
+            recommended_channel: if lead.email.is_some() {
+                "email"
+            } else {
+                "linkedin"
+            }
+            .to_string(),
             outreach_angle: String::new(),
             research_status: "migration".to_string(),
             research_confidence: 0.7,
@@ -2524,7 +2636,9 @@ impl SalesEngine {
         phone: Option<&str>,
         linkedin: Option<&str>,
     ) -> Result<(), String> {
-        if let Some(email) = email.and_then(|value| normalize_email_candidate(Some(value.to_string()))) {
+        if let Some(email) =
+            email.and_then(|value| normalize_email_candidate(Some(value.to_string())))
+        {
             let method_id = stable_sales_id("cm", &[contact_id, "email", &email]);
             conn.execute(
                 "INSERT OR IGNORE INTO contact_methods
@@ -2866,12 +2980,8 @@ impl SalesEngine {
                 }
             )
         };
-        let recommended_channel = recommended_activation_channel(
-            conn,
-            account_id,
-            contact_id,
-        )
-        .unwrap_or_else(|| "research".to_string());
+        let recommended_channel = recommended_activation_channel(conn, account_id, contact_id)
+            .unwrap_or_else(|| "research".to_string());
         let thesis_confidence = thesis_confidence(score);
         let thesis_status = match gate {
             SendGateDecision::Activate => "ready",
@@ -2997,7 +3107,10 @@ impl SalesEngine {
         let cleaned_title = contact_title.and_then(clean_profile_contact_field);
         let contact_id = stable_sales_id(
             "contact",
-            &[domain, &canonical_contact_key(domain, cleaned_name.as_deref(), email, linkedin_url)],
+            &[
+                domain,
+                &canonical_contact_key(domain, cleaned_name.as_deref(), email, linkedin_url),
+            ],
         );
         conn.execute(
             "INSERT INTO contacts
@@ -3048,9 +3161,15 @@ impl SalesEngine {
         self.migrate_contact_methods(conn, &contact_id, email, phone, linkedin_url)?;
 
         for (channel_type, value) in [
-            ("email", email.and_then(|value| normalize_email_candidate(Some(value.to_string())))),
+            (
+                "email",
+                email.and_then(|value| normalize_email_candidate(Some(value.to_string()))),
+            ),
             ("phone", phone.and_then(normalize_phone)),
-            ("linkedin", linkedin_url.and_then(normalize_outreach_linkedin_url)),
+            (
+                "linkedin",
+                linkedin_url.and_then(normalize_outreach_linkedin_url),
+            ),
         ] {
             if let Some(value) = value {
                 let suppressed = self.is_suppressed(conn, &value)?;
@@ -3150,16 +3269,12 @@ impl SalesEngine {
                 evidence_ids.push(id);
             }
         }
-        if let Some(email) = email.and_then(|value| normalize_email_candidate(Some(value.to_string()))) {
-            if let Some(id) = self.upsert_evidence(
-                conn,
-                &artifact_id,
-                "email",
-                &email,
-                "site_html",
-                0.9,
-                &now,
-            )? {
+        if let Some(email) =
+            email.and_then(|value| normalize_email_candidate(Some(value.to_string())))
+        {
+            if let Some(id) =
+                self.upsert_evidence(conn, &artifact_id, "email", &email, "site_html", 0.9, &now)?
+            {
                 evidence_ids.push(id);
             }
         }
@@ -3189,7 +3304,9 @@ impl SalesEngine {
                 evidence_ids.push(id);
             }
         }
-        if let Some(company_linkedin) = company_linkedin_url.and_then(normalize_company_linkedin_url) {
+        if let Some(company_linkedin) =
+            company_linkedin_url.and_then(normalize_company_linkedin_url)
+        {
             let company_artifact = self.upsert_artifact(
                 conn,
                 "web_search",
@@ -3296,10 +3413,7 @@ impl SalesEngine {
             SendGateDecision::Block { .. } => {}
         }
 
-        Ok(CanonicalAccountSync {
-            score,
-            gate,
-        })
+        Ok(CanonicalAccountSync { score, gate })
     }
 
     fn ensure_touch_for_approval(
@@ -3313,12 +3427,15 @@ impl SalesEngine {
         let account_id = stable_sales_id("acct", &[&lead.company_domain]);
         let contact_id = stable_sales_id(
             "contact",
-            &[&lead.company_domain, &canonical_contact_key(
+            &[
                 &lead.company_domain,
-                clean_profile_contact_name(&lead.contact_name).as_deref(),
-                lead.email.as_deref(),
-                lead.linkedin_url.as_deref(),
-            )],
+                &canonical_contact_key(
+                    &lead.company_domain,
+                    clean_profile_contact_name(&lead.contact_name).as_deref(),
+                    lead.email.as_deref(),
+                    lead.linkedin_url.as_deref(),
+                ),
+            ],
         );
         let thesis_id = conn
             .query_row(
@@ -3331,7 +3448,11 @@ impl SalesEngine {
         let template_id = self.ensure_default_sequence_template(conn)?;
         let sequence_instance_id = stable_sales_id(
             "sequence_instance",
-            &[&account_id, &contact_id, thesis_id.as_deref().unwrap_or("none")],
+            &[
+                &account_id,
+                &contact_id,
+                thesis_id.as_deref().unwrap_or("none"),
+            ],
         );
         let now = Utc::now().to_rfc3339();
         let initial_step = if channel == "email" {
@@ -3477,12 +3598,28 @@ impl SalesEngine {
             )
             .map_err(|e| format!("Failed to prepare sequence advancement query: {e}"))?;
 
-        type SeqRow = (String, String, String, String, Option<String>, i32, String, String, Option<String>);
+        type SeqRow = (
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            i32,
+            String,
+            String,
+            Option<String>,
+        );
         let sequences: Vec<SeqRow> = stmt
             .query_map([], |row| {
                 Ok((
-                    row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
-                    row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?,
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
                     row.get(8)?,
                 ))
             })
@@ -3490,8 +3627,17 @@ impl SalesEngine {
             .filter_map(|r| r.ok())
             .collect();
 
-        for (seq_id, _template_id, account_id, contact_id, thesis_id,
-             current_step, _status, steps_json, last_sent_at) in sequences
+        for (
+            seq_id,
+            _template_id,
+            account_id,
+            contact_id,
+            thesis_id,
+            current_step,
+            _status,
+            steps_json,
+            last_sent_at,
+        ) in sequences
         {
             let steps: Vec<serde_json::Value> =
                 serde_json::from_str(&steps_json).unwrap_or_default();
@@ -3561,11 +3707,11 @@ impl SalesEngine {
                 .unwrap_or(3);
 
             let ready_to_advance = match &last_sent_at {
-                Some(sent) => {
-                    chrono::DateTime::parse_from_rfc3339(sent)
-                        .map(|dt| now.signed_duration_since(dt.with_timezone(&Utc)).num_days() >= delay_days)
-                        .unwrap_or(false)
-                }
+                Some(sent) => chrono::DateTime::parse_from_rfc3339(sent)
+                    .map(|dt| {
+                        now.signed_duration_since(dt.with_timezone(&Utc)).num_days() >= delay_days
+                    })
+                    .unwrap_or(false),
                 None => true, // No touch sent yet, first step is ready
             };
 
@@ -3621,10 +3767,7 @@ impl SalesEngine {
 
     /// Get sequence progress for an account.
     #[allow(dead_code)]
-    fn get_sequence_progress(
-        &self,
-        account_id: &str,
-    ) -> Result<Vec<serde_json::Value>, String> {
+    fn get_sequence_progress(&self, account_id: &str) -> Result<Vec<serde_json::Value>, String> {
         let conn = self.open()?;
         let mut stmt = conn
             .prepare(
@@ -4161,10 +4304,7 @@ impl SalesEngine {
         .map_err(|e| format!("Account lookup by derived id failed: {e}"))
     }
 
-    fn fallback_dossier_from_prospect(
-        &self,
-        profile: &SalesProspectProfile,
-    ) -> serde_json::Value {
+    fn fallback_dossier_from_prospect(&self, profile: &SalesProspectProfile) -> serde_json::Value {
         let email_classification = profile
             .primary_email
             .as_deref()
@@ -4224,24 +4364,30 @@ impl SalesEngine {
                 }
             }
             SendGateDecision::Research { .. } => "Research needed".to_string(),
-            SendGateDecision::Nurture { .. } => "Hold in nurture until a stronger timing signal appears".to_string(),
+            SendGateDecision::Nurture { .. } => {
+                "Hold in nurture until a stronger timing signal appears".to_string()
+            }
             SendGateDecision::Block { .. } => "Blocked until risk is reduced".to_string(),
         };
         let methods = [
-            profile.primary_email.as_ref().map(|email| serde_json::json!({
-                "channel_type": "email",
-                "value": email,
-                "classification": email_classification,
-                "confidence": profile.research_confidence,
-                "suppressed": false,
-            })),
-            profile.primary_linkedin_url.as_ref().map(|url| serde_json::json!({
-                "channel_type": "linkedin",
-                "value": url,
-                "classification": "personal",
-                "confidence": profile.research_confidence,
-                "suppressed": false,
-            })),
+            profile.primary_email.as_ref().map(|email| {
+                serde_json::json!({
+                    "channel_type": "email",
+                    "value": email,
+                    "classification": email_classification,
+                    "confidence": profile.research_confidence,
+                    "suppressed": false,
+                })
+            }),
+            profile.primary_linkedin_url.as_ref().map(|url| {
+                serde_json::json!({
+                    "channel_type": "linkedin",
+                    "value": url,
+                    "classification": "personal",
+                    "confidence": profile.research_confidence,
+                    "suppressed": false,
+                })
+            }),
         ]
         .into_iter()
         .flatten()
@@ -4464,7 +4610,16 @@ impl SalesEngine {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("Failed to decode dossier contacts: {e}"))?;
         let mut contacts = Vec::new();
-        for (contact_id, full_name, title, seniority, name_confidence, title_confidence, is_decision_maker) in contact_rows {
+        for (
+            contact_id,
+            full_name,
+            title,
+            seniority,
+            name_confidence,
+            title_confidence,
+            is_decision_maker,
+        ) in contact_rows
+        {
             let mut method_stmt = conn
                 .prepare(
                     "SELECT channel_type, value, COALESCE(classification, ''), confidence, verified_at, COALESCE(suppressed, 0)
@@ -4541,7 +4696,9 @@ impl SalesEngine {
                     .filter(|value| !value.is_empty())
                     .unwrap_or("outreach")
             ),
-            SendGateDecision::Research { missing } => format!("Research needed: {}", missing.join("; ")),
+            SendGateDecision::Research { missing } => {
+                format!("Research needed: {}", missing.join("; "))
+            }
             SendGateDecision::Nurture { reason } => reason.clone(),
             SendGateDecision::Block { reason } => reason.clone(),
         };
@@ -4765,7 +4922,8 @@ impl SalesEngine {
                     (host, port, user, pass, email, false)
                 }
             } else {
-                let (host, port, user, pass, email) = self.resolve_global_email_config(state).await?;
+                let (host, port, user, pass, email) =
+                    self.resolve_global_email_config(state).await?;
                 (host, port, user, pass, email, false)
             };
 
@@ -4970,16 +5128,11 @@ impl SalesEngine {
             .map_err(|e| format!("Failed to load approval/lead for outcome: {e}"))?
             .ok_or_else(|| "Approval/lead not found for delivery".to_string())?;
 
-        self.ensure_touch_for_approval(
-            &conn,
-            &approval.3,
-            &approval.0,
-            &approval.1,
-            &approval.2,
-        )?;
+        self.ensure_touch_for_approval(&conn, &approval.3, &approval.0, &approval.1, &approval.2)?;
 
         let outcome = classify_outcome(raw_text, event_type, &approval.0);
-        let outcome_id = stable_sales_id("outcome", &[delivery_id, event_type, &outcome.outcome_type]);
+        let outcome_id =
+            stable_sales_id("outcome", &[delivery_id, event_type, &outcome.outcome_type]);
         conn.execute(
             "INSERT INTO outcomes (id, touch_id, outcome_type, raw_text, classified_at, classifier_confidence)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -5023,7 +5176,9 @@ impl SalesEngine {
             .unwrap_or_else(|| serde_json::json!({}));
         let active_signal_ids = {
             let mut stmt = conn
-                .prepare("SELECT id FROM signals WHERE account_id = ?1 ORDER BY confidence DESC LIMIT 8")
+                .prepare(
+                    "SELECT id FROM signals WHERE account_id = ?1 ORDER BY confidence DESC LIMIT 8",
+                )
                 .map_err(|e| format!("Failed to prepare signal snapshot query: {e}"))?;
             let rows = stmt
                 .query_map(params![account_id.clone()], |row| row.get::<_, String>(0))
@@ -5090,7 +5245,12 @@ impl SalesEngine {
                 self.suppress_contact(&conn, &delivery.2, "unsubscribe", true, Some(&outcome_id))?;
             }
             "wrong_person" => {
-                self.enqueue_research(&conn, &account_id, "Wrong person outcome; find alternate contact", 95)?;
+                self.enqueue_research(
+                    &conn,
+                    &account_id,
+                    "Wrong person outcome; find alternate contact",
+                    95,
+                )?;
             }
             "meeting_booked" => {
                 let _ = conn.execute(
@@ -5667,7 +5827,9 @@ impl SalesEngine {
             self.set_job_stage_running(job_id, PipelineStage::Validation)?;
         }
         let mut llm_validated_domains = HashSet::<String>::new();
-        let validation_count = candidate_list.len().min(LLM_RELEVANCE_VALIDATION_BATCH_SIZE);
+        let validation_count = candidate_list
+            .len()
+            .min(LLM_RELEVANCE_VALIDATION_BATCH_SIZE);
         let should_run_llm_validation = validation_count > 3
             && !(is_field_ops && profile.target_geo.trim().eq_ignore_ascii_case("TR"));
         if should_run_llm_validation {
@@ -5810,8 +5972,22 @@ impl SalesEngine {
             .then_with(|| a.domain.cmp(&b.domain))
         });
         current_stage = PipelineStage::LeadGeneration;
+        let total_candidates = candidate_list.len().min(max_candidates);
+        let profiled_accounts = seeded_prospect_profiles.len();
         if let Some(job_id) = job_id {
             self.set_job_stage_running(job_id, PipelineStage::LeadGeneration)?;
+            self.update_job_stage_checkpoint(
+                job_id,
+                PipelineStage::LeadGeneration,
+                &LeadGenerationCheckpoint {
+                    total_candidates,
+                    processed_candidates: 0,
+                    profiled_accounts,
+                    inserted: 0,
+                    approvals_queued: 0,
+                    current_domain: None,
+                },
+            )?;
         }
 
         let mut discovered = 0u32;
@@ -5857,8 +6033,36 @@ impl SalesEngine {
         let mut activation_candidates = HashMap::<String, ActivationLeadCandidate>::new();
 
         for candidate in candidate_list.iter().take(max_candidates) {
+            if let Some(job_id) = job_id {
+                self.update_job_stage_checkpoint(
+                    job_id,
+                    PipelineStage::LeadGeneration,
+                    &LeadGenerationCheckpoint {
+                        total_candidates,
+                        processed_candidates: discovered as usize,
+                        profiled_accounts,
+                        inserted,
+                        approvals_queued,
+                        current_domain: Some(candidate.domain.clone()),
+                    },
+                )?;
+            }
             discovered += 1;
             if candidate.score < min_candidate_score {
+                if let Some(job_id) = job_id {
+                    self.update_job_stage_checkpoint(
+                        job_id,
+                        PipelineStage::LeadGeneration,
+                        &LeadGenerationCheckpoint {
+                            total_candidates,
+                            processed_candidates: discovered as usize,
+                            profiled_accounts,
+                            inserted,
+                            approvals_queued,
+                            current_domain: Some(candidate.domain.clone()),
+                        },
+                    )?;
+                }
                 continue;
             }
 
@@ -6325,8 +6529,7 @@ impl SalesEngine {
 
             // For validated companies: fill missing fields with reasonable defaults.
             if (is_llm_validated || is_verified_by_memory)
-                && (contact_name.is_none()
-                    || contact_name_is_placeholder(contact_name.as_deref()))
+                && (contact_name.is_none() || contact_name_is_placeholder(contact_name.as_deref()))
             {
                 contact_title = default_contact_title(profile.target_title_policy.as_str());
             }
@@ -6488,6 +6691,21 @@ impl SalesEngine {
                 }
                 Err(e) => warn!(domain = %domain, error = %e, "Lead insert failed"),
             }
+
+            if let Some(job_id) = job_id {
+                self.update_job_stage_checkpoint(
+                    job_id,
+                    PipelineStage::LeadGeneration,
+                    &LeadGenerationCheckpoint {
+                        total_candidates,
+                        processed_candidates: discovered as usize,
+                        profiled_accounts,
+                        inserted,
+                        approvals_queued,
+                        current_domain: Some(domain.clone()),
+                    },
+                )?;
+            }
         }
 
         if !activation_candidates.is_empty() {
@@ -6496,8 +6714,11 @@ impl SalesEngine {
                 .iter()
                 .map(|(account_id, candidate)| (account_id.clone(), candidate.priority))
                 .collect::<HashMap<_, _>>();
-            let selected_accounts =
-                self.select_accounts_for_activation(&conn, &candidate_priorities, profile.daily_target)?;
+            let selected_accounts = self.select_accounts_for_activation(
+                &conn,
+                &candidate_priorities,
+                profile.daily_target,
+            )?;
             let selected_set = selected_accounts.into_iter().collect::<HashSet<_>>();
             for candidate in activation_candidates.into_values() {
                 let lead_status = if selected_set.contains(&candidate.account_id) {
@@ -6517,6 +6738,20 @@ impl SalesEngine {
                 if let Err(e) = self.update_lead_status(&candidate.lead.id, lead_status) {
                     warn!(lead_id = %candidate.lead.id, error = %e, "Failed to update activation lead status");
                 }
+            }
+            if let Some(job_id) = job_id {
+                self.update_job_stage_checkpoint(
+                    job_id,
+                    PipelineStage::LeadGeneration,
+                    &LeadGenerationCheckpoint {
+                        total_candidates,
+                        processed_candidates: discovered as usize,
+                        profiled_accounts,
+                        inserted,
+                        approvals_queued,
+                        current_domain: None,
+                    },
+                )?;
             }
         }
 
@@ -6566,6 +6801,9 @@ impl SalesEngine {
                 PipelineStage::LeadGeneration,
                 &serde_json::json!({
                     "run_id": run_id,
+                    "total_candidates": total_candidates,
+                    "processed_candidates": discovered,
+                    "profiled_accounts": profiled_accounts,
                     "discovered": discovered,
                     "inserted": inserted,
                     "approvals_queued": approvals_queued
@@ -8668,8 +8906,105 @@ async fn fetch_free_discovery_candidates(
             Vec::new()
         }
     };
+    let fetch_eder = async {
+        if profile_targets_digital_commerce(profile) {
+            fetch_eder_member_candidates(&client, profile, run_sequence).await
+        } else {
+            Vec::new()
+        }
+    };
+    let fetch_lojider = async {
+        if profile_targets_logistics(profile) {
+            fetch_lojider_member_candidates(&client, profile, run_sequence).await
+        } else {
+            Vec::new()
+        }
+    };
+    let fetch_tfyd = async {
+        if profile_targets_events_exhibitions(profile) {
+            fetch_tfyd_member_candidates(&client, profile, run_sequence).await
+        } else {
+            Vec::new()
+        }
+    };
+    let fetch_oss = async {
+        if profile_targets_automotive(profile) {
+            fetch_oss_member_candidates(&client, profile, run_sequence).await
+        } else {
+            Vec::new()
+        }
+    };
+    let fetch_ida = async {
+        if profile_targets_pr_communications(profile) {
+            fetch_ida_member_candidates(&client, profile, run_sequence).await
+        } else {
+            Vec::new()
+        }
+    };
+    let fetch_tesid = async {
+        if profile_targets_electronics(profile) {
+            fetch_tesid_member_candidates(&client, profile, run_sequence).await
+        } else {
+            Vec::new()
+        }
+    };
+    let fetch_tudis = async {
+        if profile_targets_leather(profile) {
+            fetch_tudis_member_candidates(&client, profile, run_sequence).await
+        } else {
+            Vec::new()
+        }
+    };
+    let fetch_emsad = async {
+        if profile_targets_electromechanical(profile) {
+            fetch_emsad_member_candidates(&client, profile, run_sequence).await
+        } else {
+            Vec::new()
+        }
+    };
+    let fetch_tgsd = async {
+        if profile_targets_textile_apparel(profile) {
+            fetch_tgsd_member_candidates(&client, profile, run_sequence).await
+        } else {
+            Vec::new()
+        }
+    };
+    let fetch_ared = async {
+        if profile_targets_advertising_signage(profile) {
+            fetch_ared_member_candidates(&client, profile, run_sequence).await
+        } else {
+            Vec::new()
+        }
+    };
+    let fetch_todeb = async {
+        if profile_targets_fintech_payments(profile) {
+            fetch_todeb_member_candidates(&client, profile, run_sequence).await
+        } else {
+            Vec::new()
+        }
+    };
 
-    let (tmb, eud, asmud, platformder, mib, imder, isder, thbb) = tokio::join!(
+    let (
+        tmb,
+        eud,
+        asmud,
+        platformder,
+        mib,
+        imder,
+        isder,
+        thbb,
+        eder,
+        lojider,
+        tfyd,
+        oss,
+        ida,
+        tesid,
+        tudis,
+        emsad,
+        tgsd,
+        ared,
+        todeb,
+    ) = tokio::join!(
         fetch_tmb,
         fetch_eud,
         fetch_asmud,
@@ -8677,10 +9012,41 @@ async fn fetch_free_discovery_candidates(
         fetch_mib,
         fetch_imder,
         fetch_isder,
-        fetch_thbb
+        fetch_thbb,
+        fetch_eder,
+        fetch_lojider,
+        fetch_tfyd,
+        fetch_oss,
+        fetch_ida,
+        fetch_tesid,
+        fetch_tudis,
+        fetch_emsad,
+        fetch_tgsd,
+        fetch_ared,
+        fetch_todeb
     );
     interleave_free_discovery_sources(
-        vec![tmb, eud, asmud, platformder, mib, imder, isder, thbb],
+        vec![
+            tmb,
+            eud,
+            asmud,
+            platformder,
+            mib,
+            imder,
+            isder,
+            thbb,
+            eder,
+            lojider,
+            tfyd,
+            oss,
+            ida,
+            tesid,
+            tudis,
+            emsad,
+            tgsd,
+            ared,
+            todeb,
+        ],
         MAX_FREE_DIRECTORY_CANDIDATES,
     )
 }
@@ -10086,6 +10452,1464 @@ fn parse_thbb_yazismali_candidates(
     out
 }
 
+async fn fetch_eder_member_candidates(
+    client: &reqwest::Client,
+    profile: &SalesProfile,
+    run_sequence: usize,
+) -> Vec<FreeDiscoveryCandidate> {
+    let Some(html) = fetch_html_page(
+        client,
+        "https://eder.org.tr/uyelerimiz/",
+        FREE_DIRECTORY_FETCH_TIMEOUT_MS,
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+
+    parse_eder_member_candidates(&html, profile, run_sequence, MAX_EDER_DIRECTORY_CANDIDATES)
+}
+
+fn parse_eder_member_candidates(
+    html: &str,
+    profile: &SalesProfile,
+    run_sequence: usize,
+    max_candidates: usize,
+) -> Vec<FreeDiscoveryCandidate> {
+    let item_re = regex_lite::Regex::new(
+        r#"(?is)<div class="ui-e-ico-box" onclick="window\.open\(&#039;([^&]+?)&#039;,\s*&#039;_blank&#039;\)">(.*?)<div class="ui-e-description">\s*<p>(.*?)</p>"#,
+    )
+    .unwrap();
+
+    let mut out = Vec::<FreeDiscoveryCandidate>::new();
+    let mut seen = HashSet::<String>::new();
+
+    for cap in item_re.captures_iter(html) {
+        let raw_url = cap
+            .get(1)
+            .map(|m| decode_basic_html_entities(m.as_str()))
+            .unwrap_or_default();
+        let Some(domain) = extract_domain(&raw_url) else {
+            continue;
+        };
+        if domain == "eder.org.tr"
+            || is_blocked_company_domain(&domain)
+            || !seen.insert(domain.clone())
+        {
+            continue;
+        }
+
+        let description = cap
+            .get(3)
+            .map(|m| strip_html_tags(&decode_basic_html_entities(m.as_str())))
+            .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| domain.clone());
+        let mut company = description.clone();
+        for suffix in [
+            " E-Ticaret Yazılımları",
+            " E-Ticaret Yazilimlari",
+            " Tahsilat Yazılımları",
+            " Tahsilat Yazilimlari",
+            " Yazılımları",
+            " Yazilimlari",
+        ] {
+            if company.ends_with(suffix) {
+                company = company.trim_end_matches(suffix).trim().to_string();
+                break;
+            }
+        }
+        if company.is_empty() {
+            company = domain.clone();
+        }
+
+        let mut matched_keywords = vec![
+            profile.target_industry.clone(),
+            "digital commerce".to_string(),
+            "e-commerce infrastructure".to_string(),
+            "commerce software".to_string(),
+        ];
+        let description_lower = description.to_lowercase();
+        if description_lower.contains("e-ticaret") || description_lower.contains("eticaret") {
+            matched_keywords.push("e-commerce".to_string());
+        }
+        if description_lower.contains("tahsilat") {
+            matched_keywords.push("payments".to_string());
+            matched_keywords.push("collections".to_string());
+        }
+        if description_lower.contains("altyap") {
+            matched_keywords.push("platform infrastructure".to_string());
+        }
+
+        out.push(FreeDiscoveryCandidate {
+            candidate: DomainCandidate {
+                domain: domain.clone(),
+                score: MIN_DOMAIN_RELEVANCE_SCORE + 12,
+                evidence: vec![format!(
+                    "EDER uyelerimiz page lists {} with official website {}",
+                    truncate_text_for_reason(&company, 120),
+                    domain
+                )],
+                matched_keywords: dedupe_strings(matched_keywords),
+                source_links: vec!["https://eder.org.tr/uyelerimiz/".to_string()],
+                phone: None,
+            },
+            contact_hint: SourceContactHint {
+                source: Some("EDER members page".to_string()),
+                ..SourceContactHint::default()
+            },
+        });
+    }
+
+    if !out.is_empty() {
+        let offset = run_sequence % out.len();
+        out.rotate_left(offset);
+    }
+    out.truncate(max_candidates);
+    out
+}
+
+async fn fetch_lojider_member_candidates(
+    client: &reqwest::Client,
+    profile: &SalesProfile,
+    run_sequence: usize,
+) -> Vec<FreeDiscoveryCandidate> {
+    let Some(html) = fetch_html_page(
+        client,
+        "https://www.lojider.org.tr/Member-List",
+        FREE_DIRECTORY_FETCH_TIMEOUT_MS,
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+
+    parse_lojider_member_candidates(
+        &html,
+        profile,
+        run_sequence,
+        MAX_LOJIDER_DIRECTORY_CANDIDATES,
+    )
+}
+
+fn parse_lojider_member_candidates(
+    html: &str,
+    profile: &SalesProfile,
+    run_sequence: usize,
+    max_candidates: usize,
+) -> Vec<FreeDiscoveryCandidate> {
+    let company_re = regex_lite::Regex::new(r#"(?is)<b class="d-block">(.*?)</b>"#).unwrap();
+    let phone_re = regex_lite::Regex::new(r#"(?is)href="tel:[^"]+">\s*([^<]+?)\s*</a>"#).unwrap();
+    let website_re =
+        regex_lite::Regex::new(r#"(?is)<i[^>]*fa-paper-plane[^>]*></i>\s*<a[^>]*href="([^"]+)""#)
+            .unwrap();
+    let contact_re =
+        regex_lite::Regex::new(r#"(?is)<i[^>]*fa-user[^>]*></i>\s*([^<]+?)\s*</div>"#).unwrap();
+
+    let mut out = Vec::<FreeDiscoveryCandidate>::new();
+    let mut seen = HashSet::<String>::new();
+
+    for segment in html.split(r#"<div class="row mb-4 member-row">"#).skip(1) {
+        let block_html = format!(r#"<div class="row mb-4 member-row">{segment}"#);
+        let Some(domain) = website_re
+            .captures(&block_html)
+            .and_then(|value| value.get(1).map(|m| decode_basic_html_entities(m.as_str())))
+            .as_deref()
+            .and_then(extract_domain)
+        else {
+            continue;
+        };
+        if domain == "lojider.org.tr"
+            || is_blocked_company_domain(&domain)
+            || !seen.insert(domain.clone())
+        {
+            continue;
+        }
+
+        let company = company_re
+            .captures(&block_html)
+            .and_then(|value| value.get(1).map(|m| strip_html_tags(m.as_str())))
+            .map(|value| decode_basic_html_entities(&value))
+            .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| domain.clone());
+        let phone = phone_re
+            .captures(&block_html)
+            .and_then(|value| value.get(1).map(|m| decode_basic_html_entities(m.as_str())))
+            .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|value| !value.is_empty());
+        let raw_contact = contact_re
+            .captures(&block_html)
+            .and_then(|value| value.get(1).map(|m| decode_basic_html_entities(m.as_str())))
+            .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|value| !value.is_empty());
+        let contact_name = raw_contact
+            .as_deref()
+            .and_then(normalize_turkish_source_person_name)
+            .or_else(|| raw_contact.as_deref().and_then(normalize_person_name));
+        let email =
+            normalize_directory_email_for_domain(extract_email_from_text(&block_html), &domain);
+
+        let mut matched_keywords = vec![
+            profile.target_industry.clone(),
+            "logistics".to_string(),
+            "freight".to_string(),
+            "transport association".to_string(),
+        ];
+        let source_text = format!(
+            "{company} {}",
+            strip_html_tags(&decode_basic_html_entities(&block_html))
+        );
+        let source_lower = source_text.to_lowercase();
+        if source_lower.contains("gümrük") || source_lower.contains("gumruk") {
+            matched_keywords.push("customs".to_string());
+        }
+        if source_lower.contains("antrepo") || source_lower.contains("depo") {
+            matched_keywords.push("warehousing".to_string());
+        }
+        if source_lower.contains("nakliye") || source_lower.contains("taş") {
+            matched_keywords.push("transport".to_string());
+        }
+
+        let evidence = match (phone.as_deref(), email.as_deref()) {
+            (Some(phone), Some(email)) => format!(
+                "LojiDer member list shows {} with official website {}, public phone {} and contact {}",
+                truncate_text_for_reason(&company, 120),
+                domain,
+                phone,
+                email
+            ),
+            (Some(phone), None) => format!(
+                "LojiDer member list shows {} with official website {} and public phone {}",
+                truncate_text_for_reason(&company, 120),
+                domain,
+                phone
+            ),
+            (None, Some(email)) => format!(
+                "LojiDer member list shows {} with official website {} and contact {}",
+                truncate_text_for_reason(&company, 120),
+                domain,
+                email
+            ),
+            (None, None) => format!(
+                "LojiDer member list shows {} with official website {}",
+                truncate_text_for_reason(&company, 120),
+                domain
+            ),
+        };
+
+        out.push(FreeDiscoveryCandidate {
+            candidate: DomainCandidate {
+                domain: domain.clone(),
+                score: MIN_DOMAIN_RELEVANCE_SCORE + 13,
+                evidence: vec![evidence],
+                matched_keywords: dedupe_strings(matched_keywords),
+                source_links: vec!["https://www.lojider.org.tr/Member-List".to_string()],
+                phone: phone.as_deref().and_then(normalize_phone),
+            },
+            contact_hint: SourceContactHint {
+                contact_name,
+                email,
+                source: Some("LojiDer members page".to_string()),
+                ..SourceContactHint::default()
+            },
+        });
+    }
+
+    if !out.is_empty() {
+        let offset = run_sequence % out.len();
+        out.rotate_left(offset);
+    }
+    out.truncate(max_candidates);
+    out
+}
+
+async fn fetch_tfyd_member_candidates(
+    client: &reqwest::Client,
+    profile: &SalesProfile,
+    run_sequence: usize,
+) -> Vec<FreeDiscoveryCandidate> {
+    let Some(html) = fetch_html_page(
+        client,
+        "https://www.tfyd.org.tr/uyelerimiz",
+        FREE_DIRECTORY_FETCH_TIMEOUT_MS,
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+
+    parse_tfyd_member_candidates(&html, profile, run_sequence, MAX_TFYD_DIRECTORY_CANDIDATES)
+}
+
+fn parse_tfyd_member_candidates(
+    html: &str,
+    profile: &SalesProfile,
+    run_sequence: usize,
+    max_candidates: usize,
+) -> Vec<FreeDiscoveryCandidate> {
+    let row_re = regex_lite::Regex::new(r#"(?is)<tr[^>]*>(.*?)</tr>"#).unwrap();
+    let cell_re = regex_lite::Regex::new(r#"(?is)<td[^>]*>(.*?)</td>"#).unwrap();
+
+    let mut out = Vec::<FreeDiscoveryCandidate>::new();
+    let mut seen = HashSet::<String>::new();
+
+    for row_cap in row_re.captures_iter(html) {
+        let row_html = row_cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        let cells = cell_re
+            .captures_iter(row_html)
+            .filter_map(|cell| cell.get(1).map(|m| m.as_str()))
+            .map(|value| {
+                strip_html_tags(&decode_basic_html_entities(value))
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>();
+        if cells.len() < 4 {
+            continue;
+        }
+
+        let company = cells[1].trim().to_string();
+        let Some(domain) = extract_domain(&cells[2]) else {
+            continue;
+        };
+        if company.is_empty()
+            || domain == "tfyd.org.tr"
+            || is_blocked_company_domain(&domain)
+            || !seen.insert(domain.clone())
+        {
+            continue;
+        }
+
+        let phone = normalize_phone(&cells[3]);
+        let source_text = format!("{company} {}", cells.join(" "));
+        let source_lower = source_text.to_lowercase();
+        let mut matched_keywords = vec![
+            profile.target_industry.clone(),
+            "events & exhibitions".to_string(),
+            "fair organization".to_string(),
+            "event services".to_string(),
+        ];
+        if source_lower.contains("fuar") {
+            matched_keywords.push("fair".to_string());
+        }
+        if source_lower.contains("organizasyon") {
+            matched_keywords.push("event organization".to_string());
+        }
+        if source_lower.contains("kongre") {
+            matched_keywords.push("congress".to_string());
+        }
+
+        let evidence = if let Some(phone) = phone.as_deref() {
+            format!(
+                "TFYD uyelerimiz page lists {} with official website {} and public phone {}",
+                truncate_text_for_reason(&company, 120),
+                domain,
+                phone
+            )
+        } else {
+            format!(
+                "TFYD uyelerimiz page lists {} with official website {}",
+                truncate_text_for_reason(&company, 120),
+                domain
+            )
+        };
+
+        out.push(FreeDiscoveryCandidate {
+            candidate: DomainCandidate {
+                domain: domain.clone(),
+                score: MIN_DOMAIN_RELEVANCE_SCORE + 12,
+                evidence: vec![evidence],
+                matched_keywords: dedupe_strings(matched_keywords),
+                source_links: vec!["https://www.tfyd.org.tr/uyelerimiz".to_string()],
+                phone,
+            },
+            contact_hint: SourceContactHint {
+                source: Some("TFYD members page".to_string()),
+                ..SourceContactHint::default()
+            },
+        });
+    }
+
+    if !out.is_empty() {
+        let offset = run_sequence % out.len();
+        out.rotate_left(offset);
+    }
+    out.truncate(max_candidates);
+    out
+}
+
+async fn fetch_oss_member_candidates(
+    client: &reqwest::Client,
+    profile: &SalesProfile,
+    run_sequence: usize,
+) -> Vec<FreeDiscoveryCandidate> {
+    let Some(html) = fetch_html_page(
+        client,
+        "https://www.oss.org.tr/en/members/",
+        FREE_DIRECTORY_FETCH_TIMEOUT_MS,
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+
+    parse_oss_member_candidates(&html, profile, run_sequence, MAX_OSS_DIRECTORY_CANDIDATES)
+}
+
+fn parse_oss_member_candidates(
+    html: &str,
+    profile: &SalesProfile,
+    run_sequence: usize,
+    max_candidates: usize,
+) -> Vec<FreeDiscoveryCandidate> {
+    let company_re =
+        regex_lite::Regex::new(r#"(?is)<h5 class="card-title">\s*(.*?)</h5>"#).unwrap();
+    let phone_re =
+        regex_lite::Regex::new(r#"(?is)bi bi-telephone-fill"></i>\s*([^<]+?)\s*</li>"#).unwrap();
+    let website_re = regex_lite::Regex::new(r#"(?is)window\.open\('([^']+)'\)"#).unwrap();
+
+    let mut out = Vec::<FreeDiscoveryCandidate>::new();
+    let mut seen = HashSet::<String>::new();
+
+    for segment in html.split(r#"<div class="card membercard">"#).skip(1) {
+        let block_html = format!(r#"<div class="card membercard">{segment}"#);
+        let Some(domain) = website_re
+            .captures(&block_html)
+            .and_then(|value| value.get(1).map(|m| decode_basic_html_entities(m.as_str())))
+            .as_deref()
+            .and_then(extract_domain)
+        else {
+            continue;
+        };
+        if domain == "oss.org.tr"
+            || is_blocked_company_domain(&domain)
+            || !seen.insert(domain.clone())
+        {
+            continue;
+        }
+
+        let company = company_re
+            .captures(&block_html)
+            .and_then(|value| value.get(1).map(|m| strip_html_tags(m.as_str())))
+            .map(|value| decode_basic_html_entities(&value))
+            .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| domain.clone());
+        let phone = phone_re
+            .captures(&block_html)
+            .and_then(|value| value.get(1).map(|m| decode_basic_html_entities(m.as_str())))
+            .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|value| !value.is_empty());
+
+        let source_text = format!(
+            "{company} {}",
+            strip_html_tags(&decode_basic_html_entities(&block_html))
+        );
+        let source_lower = source_text.to_lowercase();
+        let mut matched_keywords = vec![
+            profile.target_industry.clone(),
+            "automotive aftermarket".to_string(),
+            "spare parts".to_string(),
+            "aftermarket association".to_string(),
+        ];
+        if source_lower.contains("otomotiv") || source_lower.contains("automotive") {
+            matched_keywords.push("automotive".to_string());
+        }
+        if source_lower.contains("yedek par") || source_lower.contains("spare part") {
+            matched_keywords.push("spare parts".to_string());
+        }
+        if source_lower.contains("filtre") {
+            matched_keywords.push("filters".to_string());
+        }
+        if source_lower.contains("suspansiyon") || source_lower.contains("süspansiyon") {
+            matched_keywords.push("suspension".to_string());
+        }
+
+        let evidence = if let Some(phone) = phone.as_deref() {
+            format!(
+                "OSS members page lists {} with official website {} and public phone {}",
+                truncate_text_for_reason(&company, 120),
+                domain,
+                phone
+            )
+        } else {
+            format!(
+                "OSS members page lists {} with official website {}",
+                truncate_text_for_reason(&company, 120),
+                domain
+            )
+        };
+
+        out.push(FreeDiscoveryCandidate {
+            candidate: DomainCandidate {
+                domain: domain.clone(),
+                score: MIN_DOMAIN_RELEVANCE_SCORE + 12,
+                evidence: vec![evidence],
+                matched_keywords: dedupe_strings(matched_keywords),
+                source_links: vec!["https://www.oss.org.tr/en/members/".to_string()],
+                phone: phone.as_deref().and_then(normalize_phone),
+            },
+            contact_hint: SourceContactHint {
+                source: Some("OSS members page".to_string()),
+                ..SourceContactHint::default()
+            },
+        });
+    }
+
+    if !out.is_empty() {
+        let offset = run_sequence % out.len();
+        out.rotate_left(offset);
+    }
+    out.truncate(max_candidates);
+    out
+}
+
+async fn fetch_ida_member_candidates(
+    client: &reqwest::Client,
+    profile: &SalesProfile,
+    run_sequence: usize,
+) -> Vec<FreeDiscoveryCandidate> {
+    let Some(html) = fetch_html_page(
+        client,
+        "https://www.ida.org.tr/ornek-sayfa/uyelerimiz/",
+        FREE_DIRECTORY_FETCH_TIMEOUT_MS,
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+
+    parse_ida_member_candidates(&html, profile, run_sequence, MAX_IDA_DIRECTORY_CANDIDATES)
+}
+
+fn parse_ida_member_candidates(
+    html: &str,
+    profile: &SalesProfile,
+    run_sequence: usize,
+    max_candidates: usize,
+) -> Vec<FreeDiscoveryCandidate> {
+    let table_re =
+        regex_lite::Regex::new(r#"(?is)<table border="0" cellspacing="0" cellpadding="3">\s*<tbody>(.*?)</tbody>\s*</table>"#)
+            .unwrap();
+    let company_re =
+        regex_lite::Regex::new(r#"(?is)<td colspan="2"><strong>(.*?)</strong></td>"#).unwrap();
+    let web_re =
+        regex_lite::Regex::new(r#"(?is)<td><strong>Web:</strong></td>\s*<td><a href="([^"]+)""#)
+            .unwrap();
+    let contact_re = regex_lite::Regex::new(
+        r#"(?is)<td[^>]*><strong>(?:Yönetici Ortak|Kurucu Ortak|Managing Partner|Genel Müdür|Genel Mudur|Temsilci|Kurucu):</strong></td>\s*<td>(.*?)</td>"#,
+    )
+    .unwrap();
+    let phone_re =
+        regex_lite::Regex::new(r#"(?is)<td><strong>Telefon:</strong></td>\s*<td>(.*?)</td>"#)
+            .unwrap();
+
+    let mut out = Vec::<FreeDiscoveryCandidate>::new();
+    let mut seen = HashSet::<String>::new();
+
+    for table_cap in table_re.captures_iter(html) {
+        let Some(block_html) = table_cap.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        let Some(domain) = web_re
+            .captures(block_html)
+            .and_then(|value| value.get(1).map(|m| decode_basic_html_entities(m.as_str())))
+            .as_deref()
+            .and_then(extract_domain)
+        else {
+            continue;
+        };
+        if domain == "ida.org.tr"
+            || is_blocked_company_domain(&domain)
+            || !seen.insert(domain.clone())
+        {
+            continue;
+        }
+
+        let Some(company) = company_re
+            .captures(block_html)
+            .and_then(|value| value.get(1).map(|m| strip_html_tags(m.as_str())))
+            .map(|value| decode_basic_html_entities(&value))
+            .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let contact_name = contact_re
+            .captures(block_html)
+            .and_then(|value| value.get(1).map(|m| strip_html_tags(m.as_str())))
+            .map(|value| decode_basic_html_entities(&value))
+            .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
+            .and_then(|value| {
+                normalize_turkish_source_person_name(&value)
+                    .or_else(|| normalize_person_name(&value))
+            });
+        let phone = phone_re
+            .captures(block_html)
+            .and_then(|value| value.get(1).map(|m| decode_basic_html_entities(m.as_str())))
+            .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|value| !value.is_empty());
+
+        let source_text = format!(
+            "{company} {}",
+            strip_html_tags(&decode_basic_html_entities(block_html))
+        );
+        let source_lower = source_text.to_lowercase();
+        let mut matched_keywords = vec![
+            profile.target_industry.clone(),
+            "public relations".to_string(),
+            "communications agency".to_string(),
+            "brand communication".to_string(),
+        ];
+        if source_lower.contains("iletişim") || source_lower.contains("iletisim") {
+            matched_keywords.push("communication consultancy".to_string());
+        }
+        if source_lower.contains("medya") {
+            matched_keywords.push("media relations".to_string());
+        }
+
+        let evidence = if let Some(phone) = phone.as_deref() {
+            format!(
+                "IDA members page lists {} with official website {} and public phone {}",
+                truncate_text_for_reason(&company, 120),
+                domain,
+                phone
+            )
+        } else {
+            format!(
+                "IDA members page lists {} with official website {}",
+                truncate_text_for_reason(&company, 120),
+                domain
+            )
+        };
+
+        out.push(FreeDiscoveryCandidate {
+            candidate: DomainCandidate {
+                domain: domain.clone(),
+                score: MIN_DOMAIN_RELEVANCE_SCORE + 13,
+                evidence: vec![evidence],
+                matched_keywords: dedupe_strings(matched_keywords),
+                source_links: vec!["https://www.ida.org.tr/ornek-sayfa/uyelerimiz/".to_string()],
+                phone: phone.as_deref().and_then(normalize_phone),
+            },
+            contact_hint: SourceContactHint {
+                contact_name,
+                source: Some("IDA members page".to_string()),
+                ..SourceContactHint::default()
+            },
+        });
+    }
+
+    if !out.is_empty() {
+        let offset = run_sequence % out.len();
+        out.rotate_left(offset);
+    }
+    out.truncate(max_candidates);
+    out
+}
+
+async fn fetch_tesid_member_candidates(
+    client: &reqwest::Client,
+    profile: &SalesProfile,
+    run_sequence: usize,
+) -> Vec<FreeDiscoveryCandidate> {
+    let Some(html) = fetch_html_page(
+        client,
+        "https://tesid.org.tr/uyelerimiz",
+        FREE_DIRECTORY_FETCH_TIMEOUT_MS,
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+
+    parse_tesid_member_candidates(&html, profile, run_sequence, MAX_TESID_DIRECTORY_CANDIDATES)
+}
+
+fn parse_tesid_member_candidates(
+    html: &str,
+    profile: &SalesProfile,
+    run_sequence: usize,
+    max_candidates: usize,
+) -> Vec<FreeDiscoveryCandidate> {
+    let start = html.find(r#"<div class="boxuye_detay">"#).unwrap_or(0);
+    let end = html
+        .find("TESİD ÜYELERİ ALT SEKTÖR DAĞILIMI")
+        .unwrap_or(html.len());
+    let slice = &html[start..end];
+    let anchor_re = regex_lite::Regex::new(r#"(?is)<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#).unwrap();
+
+    let mut out = Vec::<FreeDiscoveryCandidate>::new();
+    let mut seen = HashSet::<String>::new();
+
+    for cap in anchor_re.captures_iter(slice) {
+        let Some(raw_href) = cap.get(1).map(|m| decode_basic_html_entities(m.as_str())) else {
+            continue;
+        };
+        let Some(domain) = extract_domain(&raw_href) else {
+            continue;
+        };
+        if domain == "tesid.org.tr"
+            || is_blocked_company_domain(&domain)
+            || !seen.insert(domain.clone())
+        {
+            continue;
+        }
+
+        let company = cap
+            .get(2)
+            .map(|m| strip_html_tags(m.as_str()))
+            .map(|value| decode_basic_html_entities(&value))
+            .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
+            .unwrap_or_default();
+        if company.len() < 8 || company.to_lowercase().contains("tesid üyeleri alt sektör") {
+            continue;
+        }
+
+        let company_lower = company.to_lowercase();
+        let mut matched_keywords = vec![
+            profile.target_industry.clone(),
+            "electronics".to_string(),
+            "electronic manufacturing".to_string(),
+            "hardware".to_string(),
+        ];
+        if company_lower.contains("yazılım") || company_lower.contains("yazilim") {
+            matched_keywords.push("software".to_string());
+        }
+        if company_lower.contains("savunma") {
+            matched_keywords.push("defense electronics".to_string());
+        }
+        if company_lower.contains("otomasyon") {
+            matched_keywords.push("industrial automation".to_string());
+        }
+        if company_lower.contains("telekom") || company_lower.contains("haberleşme") {
+            matched_keywords.push("telecom".to_string());
+        }
+
+        out.push(FreeDiscoveryCandidate {
+            candidate: DomainCandidate {
+                domain: domain.clone(),
+                score: MIN_DOMAIN_RELEVANCE_SCORE + 12,
+                evidence: vec![format!(
+                    "TESID members page lists {} with official website {}",
+                    truncate_text_for_reason(&company, 120),
+                    domain
+                )],
+                matched_keywords: dedupe_strings(matched_keywords),
+                source_links: vec!["https://tesid.org.tr/uyelerimiz".to_string()],
+                phone: None,
+            },
+            contact_hint: SourceContactHint {
+                source: Some("TESID members page".to_string()),
+                ..SourceContactHint::default()
+            },
+        });
+    }
+
+    if !out.is_empty() {
+        let offset = run_sequence % out.len();
+        out.rotate_left(offset);
+    }
+    out.truncate(max_candidates);
+    out
+}
+
+async fn fetch_tudis_member_candidates(
+    client: &reqwest::Client,
+    profile: &SalesProfile,
+    run_sequence: usize,
+) -> Vec<FreeDiscoveryCandidate> {
+    let Some(html) = fetch_html_page(
+        client,
+        "https://www.tudis.org.tr/uyelerimiz",
+        FREE_DIRECTORY_FETCH_TIMEOUT_MS,
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+
+    parse_tudis_member_candidates(&html, profile, run_sequence, MAX_TUDIS_DIRECTORY_CANDIDATES)
+}
+
+fn parse_tudis_member_candidates(
+    html: &str,
+    profile: &SalesProfile,
+    run_sequence: usize,
+    max_candidates: usize,
+) -> Vec<FreeDiscoveryCandidate> {
+    let row_re = regex_lite::Regex::new(r#"(?is)<tr[^>]*>(.*?)</tr>"#).unwrap();
+    let cell_re = regex_lite::Regex::new(r#"(?is)<td[^>]*>(.*?)</td>"#).unwrap();
+
+    let mut out = Vec::<FreeDiscoveryCandidate>::new();
+    let mut seen = HashSet::<String>::new();
+
+    for row_cap in row_re.captures_iter(html) {
+        let row_html = row_cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        let raw_cells = cell_re
+            .captures_iter(row_html)
+            .filter_map(|cell| cell.get(1).map(|m| m.as_str().to_string()))
+            .collect::<Vec<_>>();
+        if raw_cells.len() < 3 {
+            continue;
+        }
+        let cells = raw_cells
+            .iter()
+            .map(|value| {
+                strip_html_tags(&decode_basic_html_entities(value))
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>();
+
+        let company = cells[0].trim().to_string();
+        let Some(domain) = extract_domain(&raw_cells[2]).or_else(|| extract_domain(&cells[2]))
+        else {
+            continue;
+        };
+        if company.is_empty()
+            || company.contains("ÜYE FİRMA ADI")
+            || domain == "tudis.org.tr"
+            || is_blocked_company_domain(&domain)
+            || !seen.insert(domain.clone())
+        {
+            continue;
+        }
+
+        let email =
+            normalize_directory_email_for_domain(extract_email_from_text(&raw_cells[1]), &domain);
+        let mut matched_keywords = vec![
+            profile.target_industry.clone(),
+            "leather".to_string(),
+            "tannery".to_string(),
+            "leather manufacturing".to_string(),
+        ];
+        let company_lower = company.to_lowercase();
+        if company_lower.contains("konf") {
+            matched_keywords.push("leather apparel".to_string());
+        }
+        if company_lower.contains("deri") {
+            matched_keywords.push("leather goods".to_string());
+        }
+
+        let evidence = if let Some(email) = email.as_deref() {
+            format!(
+                "TUDIS members page lists {} with official website {} and contact {}",
+                truncate_text_for_reason(&company, 120),
+                domain,
+                email
+            )
+        } else {
+            format!(
+                "TUDIS members page lists {} with official website {}",
+                truncate_text_for_reason(&company, 120),
+                domain
+            )
+        };
+
+        out.push(FreeDiscoveryCandidate {
+            candidate: DomainCandidate {
+                domain: domain.clone(),
+                score: MIN_DOMAIN_RELEVANCE_SCORE + 12,
+                evidence: vec![evidence],
+                matched_keywords: dedupe_strings(matched_keywords),
+                source_links: vec!["https://www.tudis.org.tr/uyelerimiz".to_string()],
+                phone: None,
+            },
+            contact_hint: SourceContactHint {
+                email,
+                source: Some("TUDIS members page".to_string()),
+                ..SourceContactHint::default()
+            },
+        });
+    }
+
+    if !out.is_empty() {
+        let offset = run_sequence % out.len();
+        out.rotate_left(offset);
+    }
+    out.truncate(max_candidates);
+    out
+}
+
+async fn fetch_emsad_member_candidates(
+    client: &reqwest::Client,
+    profile: &SalesProfile,
+    run_sequence: usize,
+) -> Vec<FreeDiscoveryCandidate> {
+    let Some(html) = fetch_html_page(
+        client,
+        "https://www.emsad.org.tr/TR,753/uyelerimiz.html",
+        FREE_DIRECTORY_FETCH_TIMEOUT_MS,
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+
+    parse_emsad_member_candidates(&html, profile, run_sequence, MAX_EMSAD_DIRECTORY_CANDIDATES)
+}
+
+fn parse_emsad_member_candidates(
+    html: &str,
+    profile: &SalesProfile,
+    run_sequence: usize,
+    max_candidates: usize,
+) -> Vec<FreeDiscoveryCandidate> {
+    let table_re = regex_lite::Regex::new(
+        r#"(?is)<table width="100%" border="0" cellspacing="1" cellpadding="2">(.*?)</table>"#,
+    )
+    .unwrap();
+    let company_re =
+        regex_lite::Regex::new(r#"(?is)<td[^>]*align="left"[^>]*><b>(.*?)</b><br"#).unwrap();
+    let contact_re =
+        regex_lite::Regex::new(r#"(?is)<b>\s*Temsilci Adı:\s*</b>\s*(.*?)<br"#).unwrap();
+    let phone_re = regex_lite::Regex::new(r#"(?is)<b>\s*Tel:\s*</b>\s*(.*?)<br"#).unwrap();
+    let email_re = regex_lite::Regex::new(r#"(?is)<b>\s*e-posta:\s*</b>\s*(.*?)<br"#).unwrap();
+    let web_re = regex_lite::Regex::new(r#"(?is)<b>\s*web:</b>\s*<a[^>]*href="([^"]+)""#).unwrap();
+
+    let mut out = Vec::<FreeDiscoveryCandidate>::new();
+    let mut seen = HashSet::<String>::new();
+
+    for table_cap in table_re.captures_iter(html) {
+        let Some(block_html) = table_cap.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        let Some(domain) = web_re
+            .captures(block_html)
+            .and_then(|value| value.get(1).map(|m| decode_basic_html_entities(m.as_str())))
+            .as_deref()
+            .and_then(extract_domain)
+        else {
+            continue;
+        };
+        if domain == "emsad.org.tr"
+            || is_blocked_company_domain(&domain)
+            || !seen.insert(domain.clone())
+        {
+            continue;
+        }
+
+        let Some(company) = company_re
+            .captures(block_html)
+            .and_then(|value| value.get(1).map(|m| strip_html_tags(m.as_str())))
+            .map(|value| decode_basic_html_entities(&value))
+            .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let contact_name = contact_re
+            .captures(block_html)
+            .and_then(|value| value.get(1).map(|m| strip_html_tags(m.as_str())))
+            .map(|value| decode_basic_html_entities(&value))
+            .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
+            .and_then(|value| {
+                normalize_turkish_source_person_name(&value)
+                    .or_else(|| normalize_person_name(&value))
+            });
+        let phone = phone_re
+            .captures(block_html)
+            .and_then(|value| value.get(1).map(|m| decode_basic_html_entities(m.as_str())))
+            .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|value| !value.is_empty());
+        let email = email_re
+            .captures(block_html)
+            .and_then(|value| value.get(1).map(|m| decode_basic_html_entities(m.as_str())))
+            .and_then(|value| {
+                normalize_directory_email_for_domain(extract_email_from_text(&value), &domain)
+            });
+
+        let source_text = format!(
+            "{company} {}",
+            strip_html_tags(&decode_basic_html_entities(block_html))
+        );
+        let source_lower = source_text.to_lowercase();
+        let mut matched_keywords = vec![
+            profile.target_industry.clone(),
+            "electromechanical".to_string(),
+            "electrical equipment".to_string(),
+            "power equipment".to_string(),
+        ];
+        if source_lower.contains("transform") {
+            matched_keywords.push("transformer".to_string());
+        }
+        if source_lower.contains("enerji") || source_lower.contains("energy") {
+            matched_keywords.push("energy equipment".to_string());
+        }
+        if source_lower.contains("otomasyon") {
+            matched_keywords.push("industrial automation".to_string());
+        }
+
+        let evidence = match (phone.as_deref(), email.as_deref()) {
+            (Some(phone), Some(email)) => format!(
+                "EMSAD members page lists {} with official website {}, public phone {} and contact {}",
+                truncate_text_for_reason(&company, 120),
+                domain,
+                phone,
+                email
+            ),
+            (Some(phone), None) => format!(
+                "EMSAD members page lists {} with official website {} and public phone {}",
+                truncate_text_for_reason(&company, 120),
+                domain,
+                phone
+            ),
+            (None, Some(email)) => format!(
+                "EMSAD members page lists {} with official website {} and contact {}",
+                truncate_text_for_reason(&company, 120),
+                domain,
+                email
+            ),
+            (None, None) => format!(
+                "EMSAD members page lists {} with official website {}",
+                truncate_text_for_reason(&company, 120),
+                domain
+            ),
+        };
+
+        out.push(FreeDiscoveryCandidate {
+            candidate: DomainCandidate {
+                domain: domain.clone(),
+                score: MIN_DOMAIN_RELEVANCE_SCORE + 13,
+                evidence: vec![evidence],
+                matched_keywords: dedupe_strings(matched_keywords),
+                source_links: vec!["https://www.emsad.org.tr/TR,753/uyelerimiz.html".to_string()],
+                phone: phone.as_deref().and_then(normalize_phone),
+            },
+            contact_hint: SourceContactHint {
+                contact_name,
+                email,
+                source: Some("EMSAD members page".to_string()),
+                ..SourceContactHint::default()
+            },
+        });
+    }
+
+    if !out.is_empty() {
+        let offset = run_sequence % out.len();
+        out.rotate_left(offset);
+    }
+    out.truncate(max_candidates);
+    out
+}
+
+async fn fetch_tgsd_member_candidates(
+    client: &reqwest::Client,
+    profile: &SalesProfile,
+    run_sequence: usize,
+) -> Vec<FreeDiscoveryCandidate> {
+    let Some(html) = fetch_html_page(
+        client,
+        "https://tgsd.org.tr/uyelerimiz/",
+        FREE_DIRECTORY_FETCH_TIMEOUT_MS,
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+
+    parse_tgsd_member_candidates(&html, profile, run_sequence, MAX_TGSD_DIRECTORY_CANDIDATES)
+}
+
+fn parse_tgsd_member_candidates(
+    html: &str,
+    profile: &SalesProfile,
+    run_sequence: usize,
+    max_candidates: usize,
+) -> Vec<FreeDiscoveryCandidate> {
+    let row_re = regex_lite::Regex::new(r#"(?is)<tr[^>]*>(.*?)</tr>"#).unwrap();
+    let cell_re = regex_lite::Regex::new(r#"(?is)<td[^>]*>(.*?)</td>"#).unwrap();
+    let href_re = regex_lite::Regex::new(r#"(?is)<a href="([^"]+)""#).unwrap();
+
+    let mut out = Vec::<FreeDiscoveryCandidate>::new();
+    let mut seen = HashSet::<String>::new();
+
+    for row_cap in row_re.captures_iter(html) {
+        let row_html = row_cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        let raw_cells = cell_re
+            .captures_iter(row_html)
+            .filter_map(|cell| cell.get(1).map(|m| m.as_str().to_string()))
+            .collect::<Vec<_>>();
+        if raw_cells.len() < 4 {
+            continue;
+        }
+        let cells = raw_cells
+            .iter()
+            .map(|value| {
+                strip_html_tags(&decode_basic_html_entities(value))
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>();
+
+        if cells[1].eq_ignore_ascii_case("Adı Soyadı") || cells[2].eq_ignore_ascii_case("Firma") {
+            continue;
+        }
+
+        let Some(domain) = href_re
+            .captures(&raw_cells[3])
+            .and_then(|value| value.get(1).map(|m| decode_basic_html_entities(m.as_str())))
+            .as_deref()
+            .and_then(extract_domain)
+        else {
+            continue;
+        };
+        let company = cells[2].trim().to_string();
+        if company.is_empty()
+            || domain == "tgsd.org.tr"
+            || is_blocked_company_domain(&domain)
+            || !seen.insert(domain.clone())
+        {
+            continue;
+        }
+
+        let contact_name = normalize_turkish_source_person_name(&cells[1])
+            .or_else(|| normalize_person_name(&cells[1]));
+        let company_lower = company.to_lowercase();
+        let mut matched_keywords = vec![
+            profile.target_industry.clone(),
+            "textile".to_string(),
+            "apparel".to_string(),
+            "ready-to-wear".to_string(),
+        ];
+        if company_lower.contains("tekstil") {
+            matched_keywords.push("textile manufacturing".to_string());
+        }
+        if company_lower.contains("giyim") {
+            matched_keywords.push("garment".to_string());
+        }
+        if company_lower.contains("denim") {
+            matched_keywords.push("denim".to_string());
+        }
+
+        out.push(FreeDiscoveryCandidate {
+            candidate: DomainCandidate {
+                domain: domain.clone(),
+                score: MIN_DOMAIN_RELEVANCE_SCORE + 12,
+                evidence: vec![format!(
+                    "TGSD members page lists {} with official website {}",
+                    truncate_text_for_reason(&company, 120),
+                    domain
+                )],
+                matched_keywords: dedupe_strings(matched_keywords),
+                source_links: vec!["https://tgsd.org.tr/uyelerimiz/".to_string()],
+                phone: None,
+            },
+            contact_hint: SourceContactHint {
+                contact_name,
+                source: Some("TGSD members page".to_string()),
+                ..SourceContactHint::default()
+            },
+        });
+    }
+
+    if !out.is_empty() {
+        let offset = run_sequence % out.len();
+        out.rotate_left(offset);
+    }
+    out.truncate(max_candidates);
+    out
+}
+
+async fn fetch_ared_member_candidates(
+    client: &reqwest::Client,
+    profile: &SalesProfile,
+    run_sequence: usize,
+) -> Vec<FreeDiscoveryCandidate> {
+    let Some(html) = fetch_html_page(
+        client,
+        "https://www.ared.org.tr/uyelerimiz",
+        FREE_DIRECTORY_FETCH_TIMEOUT_MS,
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+
+    parse_ared_member_candidates(&html, profile, run_sequence, MAX_ARED_DIRECTORY_CANDIDATES)
+}
+
+fn parse_ared_member_candidates(
+    html: &str,
+    profile: &SalesProfile,
+    run_sequence: usize,
+    max_candidates: usize,
+) -> Vec<FreeDiscoveryCandidate> {
+    let company_re =
+        regex_lite::Regex::new(r#"(?is)<h3 class="entry-title">\s*(.*?)\s*</h3>"#).unwrap();
+    let contact_re =
+        regex_lite::Regex::new(r#"(?is)fa-user[^>]*></i>\s*([^<]+?)\s*</span>"#).unwrap();
+    let phone_re =
+        regex_lite::Regex::new(r#"(?is)fa-phone-square[^>]*></i>\s*([^<]+?)\s*</span>"#).unwrap();
+    let email_re = regex_lite::Regex::new(r#"(?is)href="mailto:([^"]*)""#).unwrap();
+    let website_re =
+        regex_lite::Regex::new(r#"(?is)mailto:[^"]*"[^>]*>.*?</a>\s*-\s*<a[^>]*href="([^"]+)""#)
+            .unwrap();
+
+    let mut out = Vec::<FreeDiscoveryCandidate>::new();
+    let mut seen = HashSet::<String>::new();
+
+    for segment in html.split(r#"<div class="col-lg-12 load-post">"#).skip(1) {
+        let block_html = format!(r#"<div class="col-lg-12 load-post">{segment}"#);
+        let Some(domain) = website_re
+            .captures(&block_html)
+            .and_then(|value| value.get(1).map(|m| decode_basic_html_entities(m.as_str())))
+            .as_deref()
+            .and_then(extract_domain)
+        else {
+            continue;
+        };
+        if domain == "ared.org.tr"
+            || is_blocked_company_domain(&domain)
+            || !seen.insert(domain.clone())
+        {
+            continue;
+        }
+
+        let Some(company_raw) = company_re
+            .captures(&block_html)
+            .and_then(|value| value.get(1).map(|m| decode_basic_html_entities(m.as_str())))
+        else {
+            continue;
+        };
+        let company = company_raw
+            .split(" - ")
+            .next()
+            .unwrap_or(company_raw.as_str())
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if company.is_empty() {
+            continue;
+        }
+
+        let contact_name = contact_re
+            .captures(&block_html)
+            .and_then(|value| value.get(1).map(|m| decode_basic_html_entities(m.as_str())))
+            .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
+            .and_then(|value| {
+                normalize_turkish_source_person_name(&value)
+                    .or_else(|| normalize_person_name(&value))
+            });
+        let phone = phone_re
+            .captures(&block_html)
+            .and_then(|value| value.get(1).map(|m| decode_basic_html_entities(m.as_str())))
+            .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|value| !value.is_empty());
+        let email = email_re
+            .captures(&block_html)
+            .and_then(|value| value.get(1).map(|m| decode_basic_html_entities(m.as_str())))
+            .and_then(|value| {
+                normalize_directory_email_for_domain(extract_email_from_text(&value), &domain)
+            });
+
+        let source_text = format!(
+            "{company} {}",
+            strip_html_tags(&decode_basic_html_entities(&block_html))
+        );
+        let source_lower = source_text.to_lowercase();
+        let mut matched_keywords = vec![
+            profile.target_industry.clone(),
+            "signage".to_string(),
+            "outdoor advertising".to_string(),
+            "industrial printing".to_string(),
+        ];
+        if source_lower.contains("dijital") {
+            matched_keywords.push("digital signage".to_string());
+        }
+        if source_lower.contains("baskı") || source_lower.contains("baski") {
+            matched_keywords.push("printing services".to_string());
+        }
+        if source_lower.contains("şehir mobilyaları") || source_lower.contains("sehir mobilyalari")
+        {
+            matched_keywords.push("urban furniture".to_string());
+        }
+
+        let evidence = match (phone.as_deref(), email.as_deref()) {
+            (Some(phone), Some(email)) => format!(
+                "ARED members page lists {} with official website {}, public phone {} and contact {}",
+                truncate_text_for_reason(&company, 120),
+                domain,
+                phone,
+                email
+            ),
+            (Some(phone), None) => format!(
+                "ARED members page lists {} with official website {} and public phone {}",
+                truncate_text_for_reason(&company, 120),
+                domain,
+                phone
+            ),
+            (None, Some(email)) => format!(
+                "ARED members page lists {} with official website {} and contact {}",
+                truncate_text_for_reason(&company, 120),
+                domain,
+                email
+            ),
+            (None, None) => format!(
+                "ARED members page lists {} with official website {}",
+                truncate_text_for_reason(&company, 120),
+                domain
+            ),
+        };
+
+        out.push(FreeDiscoveryCandidate {
+            candidate: DomainCandidate {
+                domain: domain.clone(),
+                score: MIN_DOMAIN_RELEVANCE_SCORE + 13,
+                evidence: vec![evidence],
+                matched_keywords: dedupe_strings(matched_keywords),
+                source_links: vec!["https://www.ared.org.tr/uyelerimiz".to_string()],
+                phone: phone.as_deref().and_then(normalize_phone),
+            },
+            contact_hint: SourceContactHint {
+                contact_name,
+                email,
+                source: Some("ARED members page".to_string()),
+                ..SourceContactHint::default()
+            },
+        });
+    }
+
+    if !out.is_empty() {
+        let offset = run_sequence % out.len();
+        out.rotate_left(offset);
+    }
+    out.truncate(max_candidates);
+    out
+}
+
+async fn fetch_todeb_member_candidates(
+    client: &reqwest::Client,
+    profile: &SalesProfile,
+    run_sequence: usize,
+) -> Vec<FreeDiscoveryCandidate> {
+    let Some(html) = fetch_html_page(
+        client,
+        "https://todeb.org.tr/sayfa/birlik-uyeleri/39/",
+        FREE_DIRECTORY_FETCH_TIMEOUT_MS,
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+
+    parse_todeb_member_candidates(&html, profile, run_sequence, MAX_TODEB_DIRECTORY_CANDIDATES)
+}
+
+fn parse_todeb_member_candidates(
+    html: &str,
+    profile: &SalesProfile,
+    run_sequence: usize,
+    max_candidates: usize,
+) -> Vec<FreeDiscoveryCandidate> {
+    let company_re = regex_lite::Regex::new(r#"(?is)<h2>(.*?)</h2>"#).unwrap();
+    let phone_re =
+        regex_lite::Regex::new(r#"(?is)<strong>Telefon:\s*<br\s*/?></strong>\s*([^<]+)"#).unwrap();
+    let web_re =
+        regex_lite::Regex::new(r#"(?is)<strong>Web:\s*<br\s*/?></strong>\s*<a href="([^"]+)""#)
+            .unwrap();
+
+    let mut out = Vec::<FreeDiscoveryCandidate>::new();
+    let mut seen = HashSet::<String>::new();
+
+    for segment in html
+        .split(r#"<div class="flexCerceve logoBorder">"#)
+        .skip(1)
+    {
+        let block_html = format!(r#"<div class="flexCerceve logoBorder">{segment}"#);
+        let Some(domain) = web_re
+            .captures(&block_html)
+            .and_then(|value| value.get(1).map(|m| decode_basic_html_entities(m.as_str())))
+            .as_deref()
+            .and_then(extract_domain)
+        else {
+            continue;
+        };
+        if domain == "todeb.org.tr"
+            || is_blocked_company_domain(&domain)
+            || !seen.insert(domain.clone())
+        {
+            continue;
+        }
+
+        let Some(company) = company_re
+            .captures(&block_html)
+            .and_then(|value| value.get(1).map(|m| strip_html_tags(m.as_str())))
+            .map(|value| decode_basic_html_entities(&value))
+            .map(|value| repair_common_mojibake_utf8(&value))
+            .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let phone = phone_re
+            .captures(&block_html)
+            .and_then(|value| value.get(1).map(|m| decode_basic_html_entities(m.as_str())))
+            .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|value| !value.is_empty());
+
+        let source_text = format!(
+            "{company} {}",
+            strip_html_tags(&decode_basic_html_entities(&block_html))
+        );
+        let source_lower = source_text.to_lowercase();
+        let mut matched_keywords = vec![
+            profile.target_industry.clone(),
+            "payments".to_string(),
+            "electronic money".to_string(),
+            "fintech".to_string(),
+        ];
+        if source_lower.contains("elektronik para") {
+            matched_keywords.push("e-money".to_string());
+        }
+        if source_lower.contains("ödeme") || source_lower.contains("odeme") {
+            matched_keywords.push("payment services".to_string());
+        }
+
+        let evidence = if let Some(phone) = phone.as_deref() {
+            format!(
+                "TODEB members page lists {} with official website {} and public phone {}",
+                truncate_text_for_reason(&company, 120),
+                domain,
+                phone
+            )
+        } else {
+            format!(
+                "TODEB members page lists {} with official website {}",
+                truncate_text_for_reason(&company, 120),
+                domain
+            )
+        };
+
+        out.push(FreeDiscoveryCandidate {
+            candidate: DomainCandidate {
+                domain: domain.clone(),
+                score: MIN_DOMAIN_RELEVANCE_SCORE + 13,
+                evidence: vec![evidence],
+                matched_keywords: dedupe_strings(matched_keywords),
+                source_links: vec!["https://todeb.org.tr/sayfa/birlik-uyeleri/39/".to_string()],
+                phone: phone.as_deref().and_then(normalize_phone),
+            },
+            contact_hint: SourceContactHint {
+                source: Some("TODEB members page".to_string()),
+                ..SourceContactHint::default()
+            },
+        });
+    }
+
+    if !out.is_empty() {
+        let offset = run_sequence % out.len();
+        out.rotate_left(offset);
+    }
+    out.truncate(max_candidates);
+    out
+}
+
 fn interleave_free_discovery_sources(
     sources: Vec<Vec<FreeDiscoveryCandidate>>,
     max_candidates: usize,
@@ -10135,6 +11959,17 @@ fn source_health_key(source: &str) -> &'static str {
         "IMDER member detail" => "directory_imder",
         "ISDER member detail" => "directory_isder",
         "THBB yazismali uyeler" => "directory_thbb",
+        "EDER members page" => "directory_eder",
+        "LojiDer members page" => "directory_lojider",
+        "TFYD members page" => "directory_tfyd",
+        "OSS members page" => "directory_oss",
+        "IDA members page" => "directory_ida",
+        "TESID members page" => "directory_tesid",
+        "TUDIS members page" => "directory_tudis",
+        "EMSAD members page" => "directory_emsad",
+        "TGSD members page" => "directory_tgsd",
+        "ARED members page" => "directory_ared",
+        "TODEB members page" => "directory_todeb",
         _ => "directory_unknown",
     }
 }
@@ -10160,6 +11995,39 @@ fn expected_source_counts_for_profile(profile: &SalesProfile) -> HashMap<String,
     if profile_targets_energy(profile) {
         out.insert("directory_eud".to_string(), 0);
     }
+    if profile_targets_digital_commerce(profile) {
+        out.insert("directory_eder".to_string(), 0);
+    }
+    if profile_targets_logistics(profile) {
+        out.insert("directory_lojider".to_string(), 0);
+    }
+    if profile_targets_events_exhibitions(profile) {
+        out.insert("directory_tfyd".to_string(), 0);
+    }
+    if profile_targets_automotive(profile) {
+        out.insert("directory_oss".to_string(), 0);
+    }
+    if profile_targets_pr_communications(profile) {
+        out.insert("directory_ida".to_string(), 0);
+    }
+    if profile_targets_electronics(profile) {
+        out.insert("directory_tesid".to_string(), 0);
+    }
+    if profile_targets_leather(profile) {
+        out.insert("directory_tudis".to_string(), 0);
+    }
+    if profile_targets_electromechanical(profile) {
+        out.insert("directory_emsad".to_string(), 0);
+    }
+    if profile_targets_textile_apparel(profile) {
+        out.insert("directory_tgsd".to_string(), 0);
+    }
+    if profile_targets_advertising_signage(profile) {
+        out.insert("directory_ared".to_string(), 0);
+    }
+    if profile_targets_fintech_payments(profile) {
+        out.insert("directory_todeb".to_string(), 0);
+    }
     out
 }
 
@@ -10172,6 +12040,344 @@ fn profile_targets_energy(profile: &SalesProfile) -> bool {
         || seed.contains("power")
         || seed.contains("utility")
         || seed.contains("renewable")
+}
+
+fn seed_contains_any(seed: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| seed.contains(needle))
+}
+
+fn profile_targets_digital_commerce(profile: &SalesProfile) -> bool {
+    let seed = profile_keyword_seed_text(profile);
+    seed_contains_any(
+        &seed,
+        &[
+            "e-commerce",
+            "ecommerce",
+            "e ticaret",
+            "eticaret",
+            "marketplace",
+            "pazaryeri",
+            "online store",
+            "web shop",
+            "shopping cart",
+            "checkout",
+            "merchant",
+            "order management",
+            "digital commerce",
+        ],
+    )
+}
+
+fn profile_targets_fintech_payments(profile: &SalesProfile) -> bool {
+    let seed = profile_keyword_seed_text(profile);
+    seed_contains_any(
+        &seed,
+        &[
+            "payment",
+            "payments",
+            "ödeme",
+            "odeme",
+            "electronic money",
+            "e-money",
+            "wallet",
+            "digital wallet",
+            "fintech",
+            "sanal pos",
+            "pos",
+            "acquiring",
+            "issuer",
+            "money transfer",
+            "remittance",
+            "open banking",
+        ],
+    )
+}
+
+fn profile_targets_logistics(profile: &SalesProfile) -> bool {
+    let seed = profile_keyword_seed_text(profile);
+    seed_contains_any(
+        &seed,
+        &[
+            "logistics",
+            "lojistik",
+            "freight",
+            "forwarding",
+            "warehouse",
+            "warehousing",
+            "depo",
+            "antrepo",
+            "shipping",
+            "cargo",
+            "nakliye",
+            "gumruk",
+            "gümrük",
+            "supply chain",
+        ],
+    )
+}
+
+fn profile_targets_electronics(profile: &SalesProfile) -> bool {
+    let seed = profile_keyword_seed_text(profile);
+    seed_contains_any(
+        &seed,
+        &[
+            "electronics",
+            "elektronik",
+            "telecom",
+            "telekom",
+            "embedded",
+            "pcb",
+            "hardware",
+            "iot",
+            "haberleşme",
+            "savunma elektroni",
+            "electronic manufacturing",
+        ],
+    )
+}
+
+fn profile_targets_electromechanical(profile: &SalesProfile) -> bool {
+    let seed = profile_keyword_seed_text(profile);
+    seed_contains_any(
+        &seed,
+        &[
+            "electromechanical",
+            "elektromekanik",
+            "transformer",
+            "switchgear",
+            "substation",
+            "medium voltage",
+            "high voltage",
+            "power distribution",
+            "energy equipment",
+            "electrical equipment",
+            "kablo",
+            "cable",
+            "pano",
+            "industrial automation",
+            "busbar",
+        ],
+    )
+}
+
+fn profile_targets_automotive(profile: &SalesProfile) -> bool {
+    let seed = profile_keyword_seed_text(profile);
+    seed_contains_any(
+        &seed,
+        &[
+            "automotive",
+            "otomotiv",
+            "aftermarket",
+            "auto parts",
+            "spare parts",
+            "yedek parca",
+            "yedek parça",
+            "oem",
+            "tier 1",
+            "tier1",
+        ],
+    )
+}
+
+fn profile_targets_textile_apparel(profile: &SalesProfile) -> bool {
+    let seed = profile_keyword_seed_text(profile);
+    seed_contains_any(
+        &seed,
+        &[
+            "textile",
+            "tekstil",
+            "apparel",
+            "garment",
+            "ready-to-wear",
+            "ready wear",
+            "hazır giyim",
+            "hazir giyim",
+            "konfeksiyon",
+            "giyim",
+            "fashion",
+            "denim",
+            "woven",
+            "knitwear",
+            "örme",
+            "orme",
+        ],
+    )
+}
+
+fn profile_targets_leather(profile: &SalesProfile) -> bool {
+    let seed = profile_keyword_seed_text(profile);
+    seed_contains_any(
+        &seed,
+        &[
+            "leather",
+            "deri",
+            "tannery",
+            "tabakhane",
+            "hide",
+            "nubuk",
+            "suede",
+            "saraciye",
+        ],
+    )
+}
+
+fn profile_targets_pr_communications(profile: &SalesProfile) -> bool {
+    let seed = profile_keyword_seed_text(profile);
+    seed_contains_any(
+        &seed,
+        &[
+            "public relations",
+            "pr agency",
+            "communication agency",
+            "communications",
+            "communication",
+            "kurumsal iletişim",
+            "kurumsal iletisim",
+            "iletişim danışmanlığı",
+            "iletisim danismanligi",
+            "halkla ilişkiler",
+            "halkla iliskiler",
+            "media relations",
+            "brand communication",
+            "reputation management",
+        ],
+    )
+}
+
+fn profile_targets_advertising_signage(profile: &SalesProfile) -> bool {
+    let seed = profile_keyword_seed_text(profile);
+    seed_contains_any(
+        &seed,
+        &[
+            "signage",
+            "digital signage",
+            "outdoor advertising",
+            "open-air advertising",
+            "açıkhava",
+            "acikhava",
+            "endüstriyel reklam",
+            "endustriyel reklam",
+            "display",
+            "point of sale",
+            "baskı",
+            "baski",
+            "serigrafi",
+            "wide format",
+            "reklam",
+        ],
+    )
+}
+
+fn profile_targets_events_exhibitions(profile: &SalesProfile) -> bool {
+    let seed = profile_keyword_seed_text(profile);
+    seed_contains_any(
+        &seed,
+        &[
+            "events & exhibitions",
+            "event",
+            "events",
+            "exhibition",
+            "expo",
+            "fair organization",
+            "organizer",
+            "organizasyon",
+            "etkinlik",
+            "kongre",
+            "fuar",
+            "fuarcilik",
+            "fuarcılık",
+        ],
+    )
+}
+
+fn llm_candidate_relevance_prompt_context(profile: &SalesProfile) -> String {
+    if profile_targets_field_ops(profile) {
+        "We sell to companies with field/on-site operations (construction, maintenance, facility management, technical service, dispatch, infrastructure, equipment, etc.).\n\
+         For each company, assess:\n\
+         - Is it a real company in our target industry with meaningful field or operational teams?\n\
+         - Would they plausibly benefit from our product?"
+            .to_string()
+    } else if profile_targets_fintech_payments(profile) {
+        "We sell to payments, fintech, wallets, money-movement, and electronic-money companies.\n\
+         For each company, assess:\n\
+         - Is it a real payment, wallet, electronic-money, or fintech operator/vendor in the target geography?\n\
+         - Would they plausibly benefit from our product?"
+            .to_string()
+    } else if profile_targets_digital_commerce(profile) {
+        "We sell to companies operating in digital commerce, marketplace, online retail, or e-commerce infrastructure.\n\
+         For each company, assess:\n\
+         - Is it a real company in e-commerce, online retail, payment/checkout, or commerce software infrastructure?\n\
+         - Would they plausibly benefit from our product?"
+            .to_string()
+    } else if profile_targets_logistics(profile) {
+        "We sell to logistics, freight, warehousing, customs, cargo, and supply-chain companies.\n\
+         For each company, assess:\n\
+         - Is it a real logistics or supply-chain operator/vendor in the target geography?\n\
+         - Would they plausibly benefit from our product?"
+            .to_string()
+    } else if profile_targets_electronics(profile) {
+        "We sell to electronics, telecom, embedded systems, and hardware companies.\n\
+         For each company, assess:\n\
+         - Is it a real electronics or telecom company in the target geography?\n\
+         - Would they plausibly benefit from our product?"
+            .to_string()
+    } else if profile_targets_electromechanical(profile) {
+        "We sell to electromechanical, transformer, switchgear, cable, and power-distribution equipment companies.\n\
+         For each company, assess:\n\
+         - Is it a real electrical equipment or electromechanical company in the target geography?\n\
+         - Would they plausibly benefit from our product?"
+            .to_string()
+    } else if profile_targets_automotive(profile) {
+        "We sell to automotive, aftermarket, spare-parts, and vehicle supply-chain companies.\n\
+         For each company, assess:\n\
+         - Is it a real automotive or automotive-aftermarket company in the target geography?\n\
+         - Would they plausibly benefit from our product?"
+            .to_string()
+    } else if profile_targets_textile_apparel(profile) {
+        "We sell to textile, apparel, garment, denim, and ready-to-wear companies.\n\
+         For each company, assess:\n\
+         - Is it a real textile, apparel, or fashion manufacturing company in the target geography?\n\
+         - Would they plausibly benefit from our product?"
+            .to_string()
+    } else if profile_targets_leather(profile) {
+        "We sell to leather, tannery, hide-processing, and leather-goods companies.\n\
+         For each company, assess:\n\
+         - Is it a real leather or tannery company in the target geography?\n\
+         - Would they plausibly benefit from our product?"
+            .to_string()
+    } else if profile_targets_pr_communications(profile) {
+        "We sell to PR, communication, media-relations, and brand-communication agencies.\n\
+         For each company, assess:\n\
+         - Is it a real communication or PR agency in the target geography?\n\
+         - Would they plausibly benefit from our product?"
+            .to_string()
+    } else if profile_targets_advertising_signage(profile) {
+        "We sell to signage, display, industrial-printing, and outdoor-advertising companies.\n\
+         For each company, assess:\n\
+         - Is it a real signage, display, industrial-printing, or outdoor-advertising company in the target geography?\n\
+         - Would they plausibly benefit from our product?"
+            .to_string()
+    } else if profile_targets_events_exhibitions(profile) {
+        "We sell to exhibition, fair, congress, organizer, and event-services companies.\n\
+         For each company, assess:\n\
+         - Is it a real event, exhibition, fair, or congress operator/vendor in the target geography?\n\
+         - Would they plausibly benefit from our product?"
+            .to_string()
+    } else if profile_targets_energy(profile) {
+        "We sell to energy, utility, electricity generation, and related infrastructure companies.\n\
+         For each company, assess:\n\
+         - Is it a real energy or utility company in the target geography?\n\
+         - Would they plausibly benefit from our product?"
+            .to_string()
+    } else {
+        format!(
+            "We sell to B2B companies in {} within {}.\n\
+             For each company, assess:\n\
+             - Is it a real company in or adjacent to the target industry?\n\
+             - Would they plausibly benefit from our product?",
+            profile.target_industry, profile.target_geo
+        )
+    }
 }
 
 fn candidate_quality_floor(profile: &SalesProfile) -> i32 {
@@ -10451,7 +12657,9 @@ fn generate_message_copy(
     contact_name: Option<&str>,
 ) -> Result<MessageCopy, String> {
     if strategy.trigger_evidence.trim().is_empty() && strategy.pain_angle.trim().is_empty() {
-        return Err("REFUSED: No evidence or pain angle provided. Message engine requires evidence.".into());
+        return Err(
+            "REFUSED: No evidence or pain angle provided. Message engine requires evidence.".into(),
+        );
     }
     let subject = build_sales_email_subject(profile, company);
     let body = build_sales_email_body(
@@ -10461,12 +12669,8 @@ fn generate_message_copy(
         &strategy.pain_angle,
         &strategy.trigger_evidence,
     );
-    let linkedin = build_sales_linkedin_message(
-        profile,
-        company,
-        contact_name,
-        &strategy.trigger_evidence,
-    );
+    let linkedin =
+        build_sales_linkedin_message(profile, company, contact_name, &strategy.trigger_evidence);
     Ok(MessageCopy {
         subject,
         body,
@@ -12035,24 +14239,14 @@ fn classify_reply_content(text: &str) -> &'static str {
     let lower = text.to_lowercase();
     if lower.contains("toplanti") || lower.contains("meeting") || lower.contains("goruselim") {
         "meeting_booked"
-    } else if lower.contains("ilginc")
-        || lower.contains("interested")
-        || lower.contains("merak")
-    {
+    } else if lower.contains("ilginc") || lower.contains("interested") || lower.contains("merak") {
         "interested"
-    } else if lower.contains("simdi degil")
-        || lower.contains("not now")
-        || lower.contains("sonra")
+    } else if lower.contains("simdi degil") || lower.contains("not now") || lower.contains("sonra")
     {
         "not_now"
-    } else if lower.contains("yanlis")
-        || lower.contains("wrong")
-        || lower.contains("hatali")
-    {
+    } else if lower.contains("yanlis") || lower.contains("wrong") || lower.contains("hatali") {
         "wrong_person"
-    } else if lower.contains("cikar")
-        || lower.contains("unsubscribe")
-        || lower.contains("gonderme")
+    } else if lower.contains("cikar") || lower.contains("unsubscribe") || lower.contains("gonderme")
     {
         "unsubscribe"
     } else {
@@ -12144,9 +14338,22 @@ fn extract_job_posting_signals(
     account_name: &str,
 ) -> Vec<(String, String, f64)> {
     let job_keywords = [
-        "operasyon", "saha", "field", "operations", "hiring", "kariyer",
-        "is ilani", "job", "career", "ise alim", "pozisyon", "mudur",
-        "yonetici", "engineer", "technician", "teknisyen",
+        "operasyon",
+        "saha",
+        "field",
+        "operations",
+        "hiring",
+        "kariyer",
+        "is ilani",
+        "job",
+        "career",
+        "ise alim",
+        "pozisyon",
+        "mudur",
+        "yonetici",
+        "engineer",
+        "technician",
+        "teknisyen",
     ];
     let name_lower = account_name.to_lowercase();
 
@@ -12169,11 +14376,7 @@ fn extract_job_posting_signals(
             } else {
                 0.5
             };
-            (
-                entry.title.clone(),
-                entry.url.clone(),
-                confidence,
-            )
+            (entry.title.clone(), entry.url.clone(), confidence)
         })
         .collect()
 }
@@ -12296,7 +14499,10 @@ fn detect_tech_stack(html: &str, headers: &HashMap<String, String>) -> Vec<Strin
         ("React", &["react-root", "reactjs", "__NEXT_DATA__"]),
         ("Angular", &["ng-version", "angular"]),
         ("Vue.js", &["vue-app", "vuejs"]),
-        ("Google Analytics", &["google-analytics.com", "gtag/js", "ga.js"]),
+        (
+            "Google Analytics",
+            &["google-analytics.com", "gtag/js", "ga.js"],
+        ),
         ("Google Tag Manager", &["googletagmanager.com", "gtm.js"]),
         ("Hotjar", &["hotjar.com", "static.hotjar"]),
         ("Intercom", &["intercom.io", "intercomSettings"]),
@@ -12379,16 +14585,76 @@ async fn linkedin_search_attempt(
 /// Seed default contextual factors for Turkish market timing (TASK-35).
 fn seed_contextual_factors(conn: &Connection) {
     let factors: &[(&str, &str, &str, &str, &str)] = &[
-        ("holiday", "ramazan_bayrami", "Ramazan Bayramı — avoid outreach", "2026-03-20", "2026-03-23"),
-        ("holiday", "kurban_bayrami", "Kurban Bayramı — avoid outreach", "2026-05-27", "2026-05-30"),
-        ("holiday", "cumhuriyet_bayrami", "Cumhuriyet Bayramı — avoid outreach", "2026-10-29", "2026-10-29"),
-        ("holiday", "yilbasi", "Yılbaşı — avoid outreach", "2026-12-31", "2027-01-01"),
-        ("budget_quarter", "q1_budget", "Q1 budget planning — high activity", "2026-01-02", "2026-03-31"),
-        ("budget_quarter", "q2_budget", "Q2 budget planning — high activity", "2026-04-01", "2026-06-30"),
-        ("budget_quarter", "q3_budget", "Q3 budget planning — high activity", "2026-07-01", "2026-09-30"),
-        ("budget_quarter", "q4_budget", "Q4 budget planning — high activity", "2026-10-01", "2026-12-31"),
-        ("season", "summer_slow", "Summer slowdown — reduced response rates", "2026-07-15", "2026-08-31"),
-        ("regulation", "kvkk", "KVKK (Turkish GDPR) — ensure compliance", "2016-04-07", "2099-12-31"),
+        (
+            "holiday",
+            "ramazan_bayrami",
+            "Ramazan Bayramı — avoid outreach",
+            "2026-03-20",
+            "2026-03-23",
+        ),
+        (
+            "holiday",
+            "kurban_bayrami",
+            "Kurban Bayramı — avoid outreach",
+            "2026-05-27",
+            "2026-05-30",
+        ),
+        (
+            "holiday",
+            "cumhuriyet_bayrami",
+            "Cumhuriyet Bayramı — avoid outreach",
+            "2026-10-29",
+            "2026-10-29",
+        ),
+        (
+            "holiday",
+            "yilbasi",
+            "Yılbaşı — avoid outreach",
+            "2026-12-31",
+            "2027-01-01",
+        ),
+        (
+            "budget_quarter",
+            "q1_budget",
+            "Q1 budget planning — high activity",
+            "2026-01-02",
+            "2026-03-31",
+        ),
+        (
+            "budget_quarter",
+            "q2_budget",
+            "Q2 budget planning — high activity",
+            "2026-04-01",
+            "2026-06-30",
+        ),
+        (
+            "budget_quarter",
+            "q3_budget",
+            "Q3 budget planning — high activity",
+            "2026-07-01",
+            "2026-09-30",
+        ),
+        (
+            "budget_quarter",
+            "q4_budget",
+            "Q4 budget planning — high activity",
+            "2026-10-01",
+            "2026-12-31",
+        ),
+        (
+            "season",
+            "summer_slow",
+            "Summer slowdown — reduced response rates",
+            "2026-07-15",
+            "2026-08-31",
+        ),
+        (
+            "regulation",
+            "kvkk",
+            "KVKK (Turkish GDPR) — ensure compliance",
+            "2016-04-07",
+            "2099-12-31",
+        ),
     ];
     for (factor_type, factor_key, factor_value, eff_from, eff_until) in factors {
         let id = stable_sales_id("ctx_factor", &[factor_type, factor_key]);
@@ -12472,7 +14738,11 @@ fn calibrate_scoring_from_outcomes(conn: &Connection) -> Result<Vec<String>, Str
         if negative_rate > 0.5 && total >= 5 {
             let proposal_id = stable_sales_id(
                 "rule_proposal",
-                &[&signal_type, "weight_down", &Utc::now().format("%Y-%W").to_string()],
+                &[
+                    &signal_type,
+                    "weight_down",
+                    &Utc::now().format("%Y-%W").to_string(),
+                ],
             );
             let _ = conn.execute(
                 "INSERT OR IGNORE INTO retrieval_rule_versions
@@ -12486,14 +14756,20 @@ fn calibrate_scoring_from_outcomes(conn: &Connection) -> Result<Vec<String>, Str
                     Utc::now().to_rfc3339(),
                 ],
             );
-            proposals.push(format!("Propose reducing weight for signal '{signal_type}': neg_rate={negative_rate:.2}"));
+            proposals.push(format!(
+                "Propose reducing weight for signal '{signal_type}': neg_rate={negative_rate:.2}"
+            ));
         }
 
         // If this signal type has high positive correlation, propose increasing weight
         if positive_rate > 0.6 && total >= 5 {
             let proposal_id = stable_sales_id(
                 "rule_proposal",
-                &[&signal_type, "weight_up", &Utc::now().format("%Y-%W").to_string()],
+                &[
+                    &signal_type,
+                    "weight_up",
+                    &Utc::now().format("%Y-%W").to_string(),
+                ],
             );
             let _ = conn.execute(
                 "INSERT OR IGNORE INTO retrieval_rule_versions
@@ -12507,7 +14783,9 @@ fn calibrate_scoring_from_outcomes(conn: &Connection) -> Result<Vec<String>, Str
                     Utc::now().to_rfc3339(),
                 ],
             );
-            proposals.push(format!("Propose increasing weight for signal '{signal_type}': pos_rate={positive_rate:.2}"));
+            proposals.push(format!(
+                "Propose increasing weight for signal '{signal_type}': pos_rate={positive_rate:.2}"
+            ));
         }
     }
 
@@ -12530,7 +14808,14 @@ fn create_experiment(
             hypothesis = excluded.hypothesis,
             variant_a = excluded.variant_a,
             variant_b = excluded.variant_b",
-        params![id, name, hypothesis, variant_a, variant_b, Utc::now().to_rfc3339()],
+        params![
+            id,
+            name,
+            hypothesis,
+            variant_a,
+            variant_b,
+            Utc::now().to_rfc3339()
+        ],
     )
     .map_err(|e| format!("Failed to create experiment: {e}"))?;
     Ok(id)
@@ -12663,7 +14948,8 @@ fn canonical_contact_key(
     email: Option<&str>,
     linkedin_url: Option<&str>,
 ) -> String {
-    if let Some(email) = email.and_then(|value| normalize_email_candidate(Some(value.to_string()))) {
+    if let Some(email) = email.and_then(|value| normalize_email_candidate(Some(value.to_string())))
+    {
         return email;
     }
     if let Some(linkedin) = linkedin_url.and_then(normalize_outreach_linkedin_url) {
@@ -12768,14 +15054,12 @@ fn compute_fit_score(account_id: &str, db: &Connection) -> Result<f64, String> {
         )
         .unwrap_or(0);
     let directory_score: f64 = if directory_membership > 0 { 1.0 } else { 0.25 };
-    Ok(
-        (sector_match * 0.3
-            + size_match * 0.2
-            + geo_match * 0.2
-            + site_content_match * 0.15
-            + directory_score * 0.15)
-            .clamp(0.0, 1.0),
-    )
+    Ok((sector_match * 0.3
+        + size_match * 0.2
+        + geo_match * 0.2
+        + site_content_match * 0.15
+        + directory_score * 0.15)
+        .clamp(0.0, 1.0))
 }
 
 fn compute_intent_score(account_id: &str, db: &Connection) -> Result<f64, String> {
@@ -12844,11 +15128,26 @@ fn compute_reachability_score(account_id: &str, db: &Connection) -> Result<f64, 
         .next()
         .map_err(|e| format!("Failed to read reachability state: {e}"))?
     {
-        let channel = row.get::<_, Option<String>>(0).unwrap_or_default().unwrap_or_default();
-        let classification = row.get::<_, Option<String>>(1).unwrap_or_default().unwrap_or_default();
-        let full_name = row.get::<_, Option<String>>(2).unwrap_or_default().unwrap_or_default();
-        let title = row.get::<_, Option<String>>(3).unwrap_or_default().unwrap_or_default();
-        let title_confidence = row.get::<_, Option<f64>>(4).unwrap_or_default().unwrap_or(0.0);
+        let channel = row
+            .get::<_, Option<String>>(0)
+            .unwrap_or_default()
+            .unwrap_or_default();
+        let classification = row
+            .get::<_, Option<String>>(1)
+            .unwrap_or_default()
+            .unwrap_or_default();
+        let full_name = row
+            .get::<_, Option<String>>(2)
+            .unwrap_or_default()
+            .unwrap_or_default();
+        let title = row
+            .get::<_, Option<String>>(3)
+            .unwrap_or_default()
+            .unwrap_or_default();
+        let title_confidence = row
+            .get::<_, Option<f64>>(4)
+            .unwrap_or_default()
+            .unwrap_or(0.0);
         if channel == "email" && classification == "personal" {
             has_personal_email = true;
         }
@@ -13029,7 +15328,9 @@ fn activation_priority(score: &FiveAxisScore) -> f64 {
 }
 
 fn thesis_confidence(score: &FiveAxisScore) -> f64 {
-    ((score.fit_score + score.intent_score + score.reachability_score
+    ((score.fit_score
+        + score.intent_score
+        + score.reachability_score
         + (1.0 - score.deliverability_risk)
         + (1.0 - score.compliance_risk))
         / 5.0)
@@ -13051,10 +15352,7 @@ fn recommended_activation_channel(
         .ok()?;
     let methods = stmt
         .query_map(params![contact_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-            ))
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })
         .ok()?
         .collect::<Result<Vec<_>, _>>()
@@ -13254,6 +15552,22 @@ fn osint_source_priority(raw: &str) -> i32 {
     if host.ends_with("thbb.org") && path.contains("yazismali-uyeler") {
         return 2;
     }
+    if host.ends_with("eder.org.tr")
+        && (path.contains("/uyelerimiz") || path.contains("/our-members"))
+    {
+        return 2;
+    }
+    if host.ends_with("lojider.org.tr")
+        && (path.contains("/member-list") || path.contains("/uye-listesi"))
+    {
+        return 2;
+    }
+    if host.ends_with("tfyd.org.tr") && path.contains("/uyelerimiz") {
+        return 2;
+    }
+    if host.ends_with("oss.org.tr") && (path.contains("/members") || path.contains("/uyeler")) {
+        return 2;
+    }
     0
 }
 
@@ -13356,6 +15670,22 @@ fn osint_link_cluster_key(raw: &str) -> Option<String> {
     }
     if host.ends_with("thbb.org") && path.contains("yazismali-uyeler") {
         return Some("thbb_directory".to_string());
+    }
+    if host.ends_with("eder.org.tr")
+        && (path.contains("/uyelerimiz") || path.contains("/our-members"))
+    {
+        return Some("eder_member_directory".to_string());
+    }
+    if host.ends_with("lojider.org.tr")
+        && (path.contains("/member-list") || path.contains("/uye-listesi"))
+    {
+        return Some("lojider_member_directory".to_string());
+    }
+    if host.ends_with("tfyd.org.tr") && path.contains("/uyelerimiz") {
+        return Some("tfyd_member_directory".to_string());
+    }
+    if host.ends_with("oss.org.tr") && (path.contains("/members") || path.contains("/uyeler")) {
+        return Some("oss_member_directory".to_string());
     }
     if normalize_company_linkedin_url(&canonical).is_some() {
         return Some(format!("linkedin_company:{host}:{}", parsed.path()));
@@ -14837,7 +17167,10 @@ fn detect_industry(brief: &str) -> Option<String> {
         ("facility", "Facility Management"),
         ("bakım", "Maintenance Services"),
         ("maintenance", "Maintenance Services"),
+        ("enerji", "Energy"),
+        ("energy", "Energy"),
         ("lojistik", "Logistics"),
+        ("supply chain", "Logistics"),
         ("logistics", "Logistics"),
         ("telekom", "Telecommunications"),
         ("telecom", "Telecommunications"),
@@ -14845,8 +17178,20 @@ fn detect_industry(brief: &str) -> Option<String> {
         ("security", "Cybersecurity"),
         ("fintech", "Fintech"),
         ("bank", "Financial Services"),
+        ("e-ticaret", "E-commerce"),
+        ("eticaret", "E-commerce"),
         ("e-commerce", "E-commerce"),
         ("ecommerce", "E-commerce"),
+        ("otomotiv", "Automotive"),
+        ("automotive", "Automotive"),
+        ("yedek parça", "Automotive"),
+        ("yedek parca", "Automotive"),
+        ("fuarcılık", "Events & Exhibitions"),
+        ("fuarcilik", "Events & Exhibitions"),
+        ("fuar", "Events & Exhibitions"),
+        ("kongre", "Events & Exhibitions"),
+        ("exhibition", "Events & Exhibitions"),
+        ("events", "Events & Exhibitions"),
         ("health", "Healthcare"),
         ("saas", "SaaS"),
         ("education", "Education"),
@@ -15847,7 +18192,9 @@ async fn discover_via_web_search(
 
     let mut candidate_list: Vec<DomainCandidate> = candidates
         .into_values()
-        .filter_map(|mut candidate| normalize_candidate_gateway(&mut candidate).then_some(candidate))
+        .filter_map(|mut candidate| {
+            normalize_candidate_gateway(&mut candidate).then_some(candidate)
+        })
         .collect();
     let mut search_unavailable =
         discovery_successes == 0 && discovery_failures >= discovery_fail_fast_threshold;
@@ -16872,6 +19219,7 @@ async fn llm_validate_candidate_relevance(
     candidates: &[DomainCandidate],
 ) -> Result<HashMap<String, (bool, f64, Option<String>)>, String> {
     let driver = build_sales_llm_driver(&kernel.config.home_dir).await?;
+    let relevance_context = llm_candidate_relevance_prompt_context(profile);
 
     let companies_list = candidates
         .iter()
@@ -16890,17 +19238,15 @@ async fn llm_validate_candidate_relevance(
          Our product: {} - {}\n\
          Target industry: {}\n\
          Target geography: {}\n\
-         We sell to companies with field/on-site operations (construction, maintenance, facility management, etc.)\n\n\
+         {}\n\n\
          Companies to evaluate:\n{}\n\n\
-         For each company, assess:\n\
-         - Is it a real company in our target industry with field operations teams?\n\
-         - Would they benefit from our product?\n\n\
          Return strict JSON only:\n\
          {{\"results\":[{{\"domain\":\"...\",\"relevant\":true/false,\"confidence\":0.0-1.0,\"reason\":\"...\"}}]}}",
         profile.product_name,
         profile.product_description,
         profile.target_industry,
         profile.target_geo,
+        relevance_context,
         companies_list
     );
 
@@ -17673,7 +20019,9 @@ pub async fn run_sales_now(State(state): State<Arc<AppState>>) -> impl IntoRespo
     {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Sales profile is incomplete; product_name, product_description, target_industry, and target_geo are required"})),
+            Json(
+                serde_json::json!({"error": "Sales profile is incomplete; product_name, product_description, target_industry, and target_geo are required"}),
+            ),
         );
     }
 
@@ -17695,11 +20043,8 @@ pub async fn run_sales_now(State(state): State<Arc<AppState>>) -> impl IntoRespo
             .run_generation_with_job(&kernel, Some(&spawned_job_id))
             .await
         {
-            let _ = engine_for_task.fail_job_stage(
-                &spawned_job_id,
-                PipelineStage::QueryPlanning,
-                &err,
-            );
+            let _ =
+                engine_for_task.fail_job_stage(&spawned_job_id, PipelineStage::QueryPlanning, &err);
         }
     });
 
@@ -17733,6 +20078,28 @@ pub async fn get_sales_job_progress(
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Job not found"})),
         ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
+        ),
+    }
+}
+
+pub async fn get_active_sales_job_progress(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let engine = match engine_from_state(&state) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+        }
+    };
+
+    match engine.latest_running_job_progress("discovery") {
+        Ok(progress) => (StatusCode::OK, Json(serde_json::json!({ "job": progress }))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e})),
@@ -17781,11 +20148,8 @@ pub async fn retry_sales_job(
             .run_generation_with_job(&kernel, Some(&spawned_job_id))
             .await
         {
-            let _ = engine_for_task.fail_job_stage(
-                &spawned_job_id,
-                PipelineStage::QueryPlanning,
-                &err,
-            );
+            let _ =
+                engine_for_task.fail_job_stage(&spawned_job_id, PipelineStage::QueryPlanning, &err);
         }
     });
 
@@ -17865,7 +20229,10 @@ pub async fn approve_sales_policy_proposal(
     };
 
     match engine.update_policy_proposal_status(&id, "active", Some("operator")) {
-        Ok(Some(proposal)) => (StatusCode::OK, Json(serde_json::json!({"proposal": proposal}))),
+        Ok(Some(proposal)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"proposal": proposal})),
+        ),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Policy proposal not found"})),
@@ -17892,7 +20259,10 @@ pub async fn reject_sales_policy_proposal(
     };
 
     match engine.update_policy_proposal_status(&id, "retired", None) {
-        Ok(Some(proposal)) => (StatusCode::OK, Json(serde_json::json!({"proposal": proposal}))),
+        Ok(Some(proposal)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"proposal": proposal})),
+        ),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Policy proposal not found"})),
@@ -17921,7 +20291,10 @@ pub async fn sales_unsubscribe(
     let Some(email) = verify_unsubscribe_token(&query.token) else {
         return (
             StatusCode::BAD_REQUEST,
-            Html("<html><body><h1>OpenFang</h1><p>Invalid unsubscribe token.</p></body></html>".to_string()),
+            Html(
+                "<html><body><h1>OpenFang</h1><p>Invalid unsubscribe token.</p></body></html>"
+                    .to_string(),
+            ),
         );
     };
 
@@ -17930,14 +20303,20 @@ pub async fn sales_unsubscribe(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Html(format!("<html><body><h1>OpenFang</h1><p>{}</p></body></html>", e)),
+                Html(format!(
+                    "<html><body><h1>OpenFang</h1><p>{}</p></body></html>",
+                    e
+                )),
             )
         }
     };
     if let Err(e) = engine.suppress_contact(&conn, &email, "one_click_unsubscribe", true, None) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Html(format!("<html><body><h1>OpenFang</h1><p>{}</p></body></html>", e)),
+            Html(format!(
+                "<html><body><h1>OpenFang</h1><p>{}</p></body></html>",
+                e
+            )),
         );
     }
     let _ = conn.execute(
@@ -17971,7 +20350,10 @@ pub async fn sales_outcomes_webhook(
         Ok(result) => {
             // After outcome ingestion, advance sequences (TASK-30)
             let advanced = engine.advance_sequences().unwrap_or(0);
-            (StatusCode::OK, Json(serde_json::json!({"result": result, "sequences_advanced": advanced})))
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"result": result, "sequences_advanced": advanced})),
+            )
         }
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -17980,9 +20362,7 @@ pub async fn sales_outcomes_webhook(
     }
 }
 
-pub async fn advance_sales_sequences(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+pub async fn advance_sales_sequences(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let engine = match engine_from_state(&state) {
         Ok(e) => e,
         Err(e) => {
@@ -18003,9 +20383,7 @@ pub async fn advance_sales_sequences(
 
 // --- Experiment endpoints (TASK-37) ---
 
-pub async fn list_sales_experiments(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+pub async fn list_sales_experiments(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let engine = match engine_from_state(&state) {
         Ok(e) => e,
         Err(e) => {
@@ -18050,7 +20428,10 @@ pub async fn list_sales_experiments(
         })
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default();
-    (StatusCode::OK, Json(serde_json::json!({"experiments": experiments})))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"experiments": experiments})),
+    )
 }
 
 pub async fn create_sales_experiment(
@@ -18080,7 +20461,10 @@ pub async fn create_sales_experiment(
         }
     };
     match create_experiment(&conn, name, hypothesis, variant_a, variant_b) {
-        Ok(id) => (StatusCode::OK, Json(serde_json::json!({"id": id, "status": "active"}))),
+        Ok(id) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"id": id, "status": "active"})),
+        ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e})),
@@ -18121,9 +20505,7 @@ pub async fn get_sales_experiment_results(
 
 // --- Context Factors endpoint (TASK-35) ---
 
-pub async fn list_sales_context_factors(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+pub async fn list_sales_context_factors(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let engine = match engine_from_state(&state) {
         Ok(e) => e,
         Err(e) => {
@@ -18182,9 +20564,7 @@ pub async fn list_sales_context_factors(
 
 // --- Score Calibration endpoint (TASK-36) ---
 
-pub async fn run_sales_calibration(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+pub async fn run_sales_calibration(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let engine = match engine_from_state(&state) {
         Ok(e) => e,
         Err(e) => {
@@ -18389,7 +20769,10 @@ pub async fn edit_sales_approval(
     };
 
     match engine.edit_approval(&id, body.edited_payload) {
-        Ok(approval) => (StatusCode::OK, Json(serde_json::json!({"approval": approval}))),
+        Ok(approval) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"approval": approval})),
+        ),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": e})),
@@ -18412,7 +20795,10 @@ pub async fn get_sales_account_dossier(
     };
 
     match engine.get_account_dossier(&id) {
-        Ok(Some(dossier)) => (StatusCode::OK, Json(serde_json::json!({"dossier": dossier}))),
+        Ok(Some(dossier)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"dossier": dossier})),
+        ),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Account dossier not found"})),
@@ -19392,6 +21778,67 @@ mod tests {
     }
 
     #[test]
+    fn job_progress_surfaces_checkpoints_and_active_lookup() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let engine = SalesEngine::new(temp.path());
+        engine.init().expect("init");
+
+        let job_id = engine.create_job_run("discovery").expect("create job");
+        engine
+            .set_job_stage_running(&job_id, PipelineStage::LeadGeneration)
+            .expect("set stage running");
+        engine
+            .update_job_stage_checkpoint(
+                &job_id,
+                PipelineStage::LeadGeneration,
+                &LeadGenerationCheckpoint {
+                    total_candidates: 18,
+                    processed_candidates: 7,
+                    profiled_accounts: 11,
+                    inserted: 2,
+                    approvals_queued: 1,
+                    current_domain: Some("ornek.com".to_string()),
+                },
+            )
+            .expect("update checkpoint");
+
+        let progress = engine
+            .get_job_progress(&job_id)
+            .expect("get job progress")
+            .expect("job exists");
+        assert_eq!(progress.status, "running");
+        assert_eq!(progress.current_stage.as_deref(), Some("LeadGeneration"));
+
+        let lead_generation = progress
+            .stages
+            .iter()
+            .find(|stage| stage.name == "LeadGeneration")
+            .expect("lead generation stage");
+        let checkpoint = lead_generation
+            .checkpoint
+            .as_ref()
+            .expect("checkpoint attached");
+        assert_eq!(
+            checkpoint
+                .get("processed_candidates")
+                .and_then(|value| value.as_u64()),
+            Some(7)
+        );
+        assert_eq!(
+            checkpoint
+                .get("current_domain")
+                .and_then(|value| value.as_str()),
+            Some("ornek.com")
+        );
+
+        let active = engine
+            .latest_running_job_progress("discovery")
+            .expect("active lookup")
+            .expect("running job");
+        assert_eq!(active.job_id, job_id);
+    }
+
+    #[test]
     fn list_approvals_skips_non_actionable_email_payloads() {
         let temp = tempfile::tempdir().expect("tempdir");
         let engine = SalesEngine::new(temp.path());
@@ -19511,7 +21958,10 @@ mod tests {
             .expect("edit approval");
 
         assert_eq!(
-            edited.payload.get("subject").and_then(|value| value.as_str()),
+            edited
+                .payload
+                .get("subject")
+                .and_then(|value| value.as_str()),
             Some("Updated subject")
         );
         assert_eq!(
@@ -19558,7 +22008,10 @@ mod tests {
             serde_json::from_str(&steps_json).expect("decode steps json");
         let steps = steps.as_array().expect("steps array");
         assert_eq!(steps.len(), 5);
-        assert_eq!(steps[0].get("channel").and_then(|value| value.as_str()), Some("email"));
+        assert_eq!(
+            steps[0].get("channel").and_then(|value| value.as_str()),
+            Some("email")
+        );
         assert_eq!(
             steps[3].get("channel").and_then(|value| value.as_str()),
             Some("linkedin_assist")
@@ -20445,6 +22898,406 @@ mod tests {
             .matched_keywords
             .iter()
             .any(|value| value == "construction equipment"));
+    }
+
+    #[test]
+    fn parse_eder_member_candidates_extracts_domain_and_source() {
+        let html = r#"
+        <div class="ui-e-ico-box" onclick="window.open(&#039;https://www.kolaymagaza.com/&#039;, &#039;_blank&#039;)">
+            <div class="ui-e-box-content">
+                <div class="ui-e-description">
+                    <p>Kolaymağaza E-Ticaret Yazılımları</p>
+                </div>
+            </div>
+        </div>
+        "#;
+        let profile = SalesProfile {
+            target_industry: "E-commerce".to_string(),
+            target_geo: "TR".to_string(),
+            ..SalesProfile::default()
+        };
+
+        let candidates = parse_eder_member_candidates(html, &profile, 0, 8);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].candidate.domain, "kolaymagaza.com");
+        assert_eq!(
+            candidates[0].contact_hint.source.as_deref(),
+            Some("EDER members page")
+        );
+        assert!(candidates[0]
+            .candidate
+            .matched_keywords
+            .iter()
+            .any(|value| value == "digital commerce"));
+    }
+
+    #[test]
+    fn parse_lojider_member_candidates_extracts_domain_contact_and_email() {
+        let html = r#"
+        <div class="row mb-4 member-row">
+            <div class="Uye p-3">
+                <div class="row">
+                    <b class="d-block">2H Gümrük ve Lojistik Hizmetleri Tic. Ltd. Şti.</b>
+                </div>
+                <div class="row row-cols-1 row-cols-md-2 row-cols-lg-4 mt-2">
+                    <div class="col">
+                        <i class="fa-solid fa-phone me-2"></i>
+                        <a href="tel:02163052325">0216 305 23 25</a>
+                    </div>
+                    <div class="col"><i class="fa-solid fa-envelope me-2"></i><a target="_blank" href="mailto:aysun@2hgumrukleme.com.tr">aysun@2hgumrukleme.com.tr</a></div>
+                    <div class="col">
+                        <i class="fa-solid fa-paper-plane me-2"></i>
+                        <a target="_blank" href="http://2hgumrukleme.com.tr/">2hgumrukleme.com.tr/</a>
+                    </div>
+                    <div class="col"><i class="fa-solid fa-user me-2"></i>Aysun KÜÇÜKÇİTRAZ</div>
+                </div>
+            </div>
+        </div>
+        "#;
+        let profile = SalesProfile {
+            target_industry: "Logistics".to_string(),
+            target_geo: "TR".to_string(),
+            ..SalesProfile::default()
+        };
+
+        let candidates = parse_lojider_member_candidates(html, &profile, 0, 8);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].candidate.domain, "2hgumrukleme.com.tr");
+        assert_eq!(
+            candidates[0].contact_hint.contact_name.as_deref(),
+            Some("Aysun Küçükçitraz")
+        );
+        assert_eq!(
+            candidates[0].contact_hint.email.as_deref(),
+            Some("aysun@2hgumrukleme.com.tr")
+        );
+        assert_eq!(
+            candidates[0].contact_hint.source.as_deref(),
+            Some("LojiDer members page")
+        );
+    }
+
+    #[test]
+    fn parse_tfyd_member_candidates_extracts_domain_and_phone() {
+        let html = r#"
+        <table>
+            <tr>
+                <td colspan="2"><div align="center">KURULUŞ</div></td>
+                <td><div align="center">WEB SİTESİ</div></td>
+                <td><div align="center">TELEFON</div></td>
+            </tr>
+            <tr>
+                <td align="center">1</td>
+                <td align="left">&nbsp;AJANS ASYA FUARCILIK ORG. LTD. ŞTİ</td>
+                <td align="left">&nbsp;www.vanfuar.com&nbsp;</td>
+                <td align="center">0432 215 81 80</td>
+            </tr>
+        </table>
+        "#;
+        let profile = SalesProfile {
+            target_industry: "Events & Exhibitions".to_string(),
+            target_geo: "TR".to_string(),
+            ..SalesProfile::default()
+        };
+
+        let candidates = parse_tfyd_member_candidates(html, &profile, 0, 8);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].candidate.domain, "vanfuar.com");
+        assert_eq!(
+            candidates[0].candidate.phone.as_deref(),
+            Some("+904322158180")
+        );
+        assert_eq!(
+            candidates[0].contact_hint.source.as_deref(),
+            Some("TFYD members page")
+        );
+    }
+
+    #[test]
+    fn parse_oss_member_candidates_extracts_domain_and_source() {
+        let html = r#"
+        <div class="card membercard">
+            <div class="card-body">
+                <h5 class="card-title"> 5S Otomotiv İmalat San. ve Tic. A.Ş. </h5>
+            </div>
+            <ul class="list-group list-group-flush">
+                <li class="list-group-item">
+                    <i class="bi bi-telephone-fill"></i>  444 52 89
+                </li>
+                <li class="list-group-item">
+                    <i class="bi bi-globe"></i>
+                    <a onclick="window.open('http://www.5sotomotiv.com')" href="javascript:void(0)">5sotomotiv.com </a>
+                </li>
+            </ul>
+        </div>
+        "#;
+        let profile = SalesProfile {
+            target_industry: "Automotive".to_string(),
+            target_geo: "TR".to_string(),
+            ..SalesProfile::default()
+        };
+
+        let candidates = parse_oss_member_candidates(html, &profile, 0, 8);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].candidate.domain, "5sotomotiv.com");
+        assert_eq!(
+            candidates[0].contact_hint.source.as_deref(),
+            Some("OSS members page")
+        );
+        assert!(candidates[0]
+            .candidate
+            .matched_keywords
+            .iter()
+            .any(|value| value == "automotive aftermarket"));
+    }
+
+    #[test]
+    fn parse_ida_member_candidates_extracts_domain_and_contact() {
+        let html = r#"
+        <table border="0" cellspacing="0" cellpadding="3">
+            <tbody>
+                <tr>
+                    <td colspan="2"><strong>ARTI İletişim Yönetimi</strong></td>
+                </tr>
+                <tr>
+                    <td style="white-space: nowrap;"><strong>Yönetici Ortak:</strong></td>
+                    <td>Esra ŞENGÜLEN ÜNSÜR</td>
+                </tr>
+                <tr>
+                    <td><strong>Telefon:</strong></td>
+                    <td>+90 212 347 03 30</td>
+                </tr>
+                <tr>
+                    <td><strong>Web:</strong></td>
+                    <td><a href="http://www.artipr.com.tr/" target="_blank">www.artipr.com.tr</a></td>
+                </tr>
+            </tbody>
+        </table>
+        "#;
+        let profile = SalesProfile {
+            target_industry: "PR agency".to_string(),
+            target_geo: "TR".to_string(),
+            ..SalesProfile::default()
+        };
+
+        let candidates = parse_ida_member_candidates(html, &profile, 0, 8);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].candidate.domain, "artipr.com.tr");
+        assert_eq!(
+            candidates[0].contact_hint.contact_name.as_deref(),
+            Some("Esra Şengülen Ünsür")
+        );
+        assert_eq!(
+            candidates[0].contact_hint.source.as_deref(),
+            Some("IDA members page")
+        );
+    }
+
+    #[test]
+    fn parse_tesid_member_candidates_extracts_domain_and_source() {
+        let html = r#"
+        <div class="boxuye_detay">
+            <p><strong>BÜYÜK FİRMALAR</strong></p>
+            <p><strong><a href="http://www.karel.com.tr" target="_blank">KAREL Elektronik Sanayi ve Ticaret A.Ş.</a></strong></p>
+        </div>
+        <p><strong><a href="https://tesid.org.tr/alt_sektor_dagilimi">TESİD ÜYELERİ ALT SEKTÖR DAĞILIMI</a></strong></p>
+        "#;
+        let profile = SalesProfile {
+            target_industry: "Electronics".to_string(),
+            target_geo: "TR".to_string(),
+            ..SalesProfile::default()
+        };
+
+        let candidates = parse_tesid_member_candidates(html, &profile, 0, 8);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].candidate.domain, "karel.com.tr");
+        assert_eq!(
+            candidates[0].contact_hint.source.as_deref(),
+            Some("TESID members page")
+        );
+    }
+
+    #[test]
+    fn parse_tudis_member_candidates_extracts_domain_and_email() {
+        let html = r#"
+        <table>
+            <tr>
+                <td><strong>Cihan Deri San.A.Ş.</strong></td>
+                <td>info@cihanderi.com</td>
+                <td><a href="https://www.cihanderi.com/">https://www.cihanderi.com/</a></td>
+            </tr>
+        </table>
+        "#;
+        let profile = SalesProfile {
+            target_industry: "Leather".to_string(),
+            target_geo: "TR".to_string(),
+            ..SalesProfile::default()
+        };
+
+        let candidates = parse_tudis_member_candidates(html, &profile, 0, 8);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].candidate.domain, "cihanderi.com");
+        assert_eq!(
+            candidates[0].contact_hint.email.as_deref(),
+            Some("info@cihanderi.com")
+        );
+        assert_eq!(
+            candidates[0].contact_hint.source.as_deref(),
+            Some("TUDIS members page")
+        );
+    }
+
+    #[test]
+    fn parse_emsad_member_candidates_extracts_domain_contact_and_email() {
+        let html = r#"
+        <table width="100%" border="0" cellspacing="1" cellpadding="2">
+          <tr>
+            <td width="192" align="center" valign="top"><img class="foto1" width="128px" height="58px" src="/Resim/495,aksanpng.png?0" /></td>
+            <td width="788" align="left" valign="top"><b>AKSAN PANO TANITIM İNŞ. ELK. İML. TAAH. VE PAZ. TİC. LTD. ŞTİ</b><br />
+             <b>Temsilci Adı:</b> Şahin ŞANLITÜRK<br />
+             <b>Adres:</b> Kahramankazan / ANKARA<br />
+             <b> Tel: </b> 0312 386 12 08<br />
+             <b> e-posta: </b> info@aksanpano.com.tr<br />
+             <b>  web:</b> <a target="_blank" href="http://www.aksanpano.com.tr">www.aksanpano.com.tr</a><br /><br />
+            </td>
+          </tr>
+        </table>
+        "#;
+        let profile = SalesProfile {
+            target_industry: "Electromechanical".to_string(),
+            target_geo: "TR".to_string(),
+            ..SalesProfile::default()
+        };
+
+        let candidates = parse_emsad_member_candidates(html, &profile, 0, 8);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].candidate.domain, "aksanpano.com.tr");
+        assert_eq!(
+            candidates[0].contact_hint.contact_name.as_deref(),
+            Some("Şahin Şanlıtürk")
+        );
+        assert_eq!(
+            candidates[0].contact_hint.email.as_deref(),
+            Some("info@aksanpano.com.tr")
+        );
+        assert_eq!(
+            candidates[0].contact_hint.source.as_deref(),
+            Some("EMSAD members page")
+        );
+    }
+
+    #[test]
+    fn parse_tgsd_member_candidates_extracts_company_contact_and_domain() {
+        let html = r#"
+        <table id="aplus-uye-listesi">
+            <tbody>
+                <tr>
+                    <td><img src="https://tgsd.org.tr/wp-content/uploads/2025/11/Suglobal_Denimvillage_logo.jpg" alt="Logo" class="aplus-logo"></td>
+                    <td>Abdulhadi Karasu</td>
+                    <td>Suglobal Tekstil ve Konfeksiyon San. A.Ş.</td>
+                    <td><a href="https://www.denimvillage.com" target="_blank" rel="noopener">www.denimvillage.com</a></td>
+                </tr>
+            </tbody>
+        </table>
+        "#;
+        let profile = SalesProfile {
+            target_industry: "Textile".to_string(),
+            target_geo: "TR".to_string(),
+            ..SalesProfile::default()
+        };
+
+        let candidates = parse_tgsd_member_candidates(html, &profile, 0, 8);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].candidate.domain, "denimvillage.com");
+        assert_eq!(
+            candidates[0].contact_hint.contact_name.as_deref(),
+            Some("Abdulhadi Karasu")
+        );
+        assert_eq!(
+            candidates[0].contact_hint.source.as_deref(),
+            Some("TGSD members page")
+        );
+    }
+
+    #[test]
+    fn parse_ared_member_candidates_extracts_domain_contact_and_phone() {
+        let html = r#"
+        <div class="col-lg-12 load-post">
+            <article class="post hentry post-list post-list-small">
+                <div class="content-entry-wrap">
+                    <div class="entry-content">
+                        <h3 class="entry-title">24 Saat Dijital Baskı - İstanbul</h3>
+                    </div>
+                    <div class="entry-meta-content">
+                        <div class="entry-date">
+                            <span><i class="fa fa-user pr-1"></i>İsa Yavuz </span><br>
+                            <span><i class="fa fa-phone-square pr-1"></i>(0212) 268 28 77 </span><br>
+                            <span><i class="fa fa-globe pr-1"></i><a href="mailto:info@24saatdijital.com">info@24saatdijital.com</a> - <a href="http://www.24saatdijital.com" target="_blank">http://www.24saatdijital.com</a></span><br>
+                            <span><i class="fa fa-building pr-1"></i>Baskı Hizmetleri</span>
+                        </div>
+                    </div>
+                </div>
+            </article>
+        </div>
+        "#;
+        let profile = SalesProfile {
+            target_industry: "Signage".to_string(),
+            target_geo: "TR".to_string(),
+            ..SalesProfile::default()
+        };
+
+        let candidates = parse_ared_member_candidates(html, &profile, 0, 8);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].candidate.domain, "24saatdijital.com");
+        assert_eq!(
+            candidates[0].contact_hint.contact_name.as_deref(),
+            Some("İsa Yavuz")
+        );
+        assert_eq!(
+            candidates[0].contact_hint.email.as_deref(),
+            Some("info@24saatdijital.com")
+        );
+        assert_eq!(
+            candidates[0].candidate.phone.as_deref(),
+            Some("+902122682877")
+        );
+        assert_eq!(
+            candidates[0].contact_hint.source.as_deref(),
+            Some("ARED members page")
+        );
+    }
+
+    #[test]
+    fn parse_todeb_member_candidates_extracts_domain_and_source() {
+        let html = r#"
+        <div class="flexCerceve logoBorder">
+            <div class="row">
+                <div class="col-lg-6">
+                    <a href="https://1000pay.com" target="_blank">
+                        <img src="https://todeb.org.tr/source/uye_iliskileri/uye_logolari/1000pay.png" class="img-responsive">
+                    </a>
+                </div>
+                <div class="col-lg-6">
+                    <p><h2>1000 Ödeme Hizmetleri ve Elektronik Para A.Ş.</h2>
+                    <p><strong>Telefon: <br /></strong>444 10 04<br />
+                    <strong>Web:<br /></strong><a href="https://1000pay.com">www.1000pay.com</a></p></p>
+                </div>
+            </div>
+        </div>
+        "#;
+        let profile = SalesProfile {
+            target_industry: "Payments".to_string(),
+            target_geo: "TR".to_string(),
+            ..SalesProfile::default()
+        };
+
+        let candidates = parse_todeb_member_candidates(html, &profile, 0, 8);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].candidate.domain, "1000pay.com");
+        assert_eq!(
+            candidates[0].contact_hint.source.as_deref(),
+            Some("TODEB members page")
+        );
     }
 
     #[test]
@@ -21530,10 +24383,7 @@ Bergiz Holding altyapi ve insaat projeleri yurutur.
         assert_eq!(classify_reply_content("ilginc gorunuyor"), "interested");
         assert_eq!(classify_reply_content("simdi degil"), "not_now");
         assert_eq!(classify_reply_content("yanlis kisi"), "wrong_person");
-        assert_eq!(
-            classify_reply_content("beni listeden cikar"),
-            "unsubscribe"
-        );
+        assert_eq!(classify_reply_content("beni listeden cikar"), "unsubscribe");
     }
 
     // =======================================================================
@@ -21573,7 +24423,8 @@ Bergiz Holding altyapi ve insaat projeleri yurutur.
 
     #[test]
     fn spec_tech_stack_detection_finds_hubspot() {
-        let html = r#"<html><body><script src="//js.hs-scripts.com/1234.js"></script></body></html>"#;
+        let html =
+            r#"<html><body><script src="//js.hs-scripts.com/1234.js"></script></body></html>"#;
         let headers = HashMap::new();
         let stack = detect_tech_stack(html, &headers);
         assert!(stack.contains(&"HubSpot".to_string()));
@@ -21664,7 +24515,10 @@ Bergiz Holding altyapi ve insaat projeleri yurutur.
     #[test]
     fn spec_seniority_from_title_detects_clevel() {
         assert_eq!(seniority_from_title(Some("CEO")), "c_level");
-        assert_eq!(seniority_from_title(Some("Chief Operating Officer")), "c_level");
+        assert_eq!(
+            seniority_from_title(Some("Chief Operating Officer")),
+            "c_level"
+        );
         assert_eq!(seniority_from_title(Some("Genel Müdür")), "c_level");
         assert_eq!(seniority_from_title(Some("Founder & CEO")), "c_level");
     }
@@ -21729,11 +24583,13 @@ Bergiz Holding altyapi ve insaat projeleri yurutur.
         let advanced = engine.advance_sequences().unwrap();
         assert!(advanced >= 1);
 
-        let status: String = conn.query_row(
-            "SELECT status FROM sequence_instances WHERE id = 'seq1'",
-            [],
-            |r: &rusqlite::Row| r.get(0),
-        ).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM sequence_instances WHERE id = 'seq1'",
+                [],
+                |r: &rusqlite::Row| r.get(0),
+            )
+            .unwrap();
         assert_eq!(status, "completed");
     }
 
@@ -21770,11 +24626,13 @@ Bergiz Holding altyapi ve insaat projeleri yurutur.
         ).unwrap();
 
         engine.advance_sequences().unwrap();
-        let status: String = conn.query_row(
-            "SELECT status FROM sequence_instances WHERE id = 'seq2'",
-            [],
-            |r: &rusqlite::Row| r.get(0),
-        ).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM sequence_instances WHERE id = 'seq2'",
+                [],
+                |r: &rusqlite::Row| r.get(0),
+            )
+            .unwrap();
         assert_eq!(status, "cancelled");
     }
 
@@ -21884,7 +24742,8 @@ Bergiz Holding altyapi ve insaat projeleri yurutur.
 
     #[test]
     fn spec_mailbox_pool_parses_legacy_string_entries() {
-        let pool = mailbox_pool_from_json(r#"["legacy@send.example.com", "SECOND@send.example.com "]"#);
+        let pool =
+            mailbox_pool_from_json(r#"["legacy@send.example.com", "SECOND@send.example.com "]"#);
         assert_eq!(pool.len(), 2);
         assert_eq!(pool[0].email, "legacy@send.example.com");
         assert_eq!(pool[1].email, "second@send.example.com");
@@ -21937,7 +24796,10 @@ Bergiz Holding altyapi ve insaat projeleri yurutur.
         let count: i32 = conn
             .query_row("SELECT COUNT(*) FROM contextual_factors", [], |r| r.get(0))
             .unwrap();
-        assert!(count >= 10, "Expected at least 10 contextual factors, got {count}");
+        assert!(
+            count >= 10,
+            "Expected at least 10 contextual factors, got {count}"
+        );
         // Check specific factors exist
         let ramazan: i32 = conn
             .query_row(
@@ -21982,7 +24844,14 @@ Bergiz Holding altyapi ve insaat projeleri yurutur.
         )
         .unwrap();
 
-        let exp_id = create_experiment(&conn, "subject_line_test", "Shorter subjects get more opens", "short", "long").unwrap();
+        let exp_id = create_experiment(
+            &conn,
+            "subject_line_test",
+            "Shorter subjects get more opens",
+            "short",
+            "long",
+        )
+        .unwrap();
         assert!(!exp_id.is_empty());
 
         // Assign multiple sequences — should balance a/b
@@ -22049,8 +24918,17 @@ Bergiz Holding altyapi ve insaat projeleri yurutur.
             ).unwrap();
             conn.execute(
                 "INSERT INTO outcomes (id, touch_id, outcome_type) VALUES (?1, ?2, ?3)",
-                params![format!("out_{i}"), touch_id, if i < 8 { "hard_bounce" } else { "meeting_booked" }],
-            ).unwrap();
+                params![
+                    format!("out_{i}"),
+                    touch_id,
+                    if i < 8 {
+                        "hard_bounce"
+                    } else {
+                        "meeting_booked"
+                    }
+                ],
+            )
+            .unwrap();
             conn.execute(
                 "INSERT INTO signals (id, account_id, signal_type, text) VALUES (?1, ?2, 'directory_membership', ?3)",
                 params![format!("sig_{i}"), account_id, format!("Signal {i}")],
@@ -22058,14 +24936,20 @@ Bergiz Holding altyapi ve insaat projeleri yurutur.
         }
 
         let proposals = calibrate_scoring_from_outcomes(&conn).unwrap();
-        assert!(!proposals.is_empty(), "Should have created calibration proposals");
+        assert!(
+            !proposals.is_empty(),
+            "Should have created calibration proposals"
+        );
     }
 
     #[test]
     fn spec_verify_domain_exists_basic() {
         // This is an async function — just verify it compiles and the signature is correct
         // Actual HTTP verification would require network access
-        let _fn_exists: fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> =
-            |domain| Box::pin(verify_domain_exists(domain));
+        let _fn_exists: fn(
+            &str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = bool> + Send + '_>,
+        > = |domain| Box::pin(verify_domain_exists(domain));
     }
 }

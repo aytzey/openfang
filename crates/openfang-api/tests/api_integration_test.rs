@@ -9,6 +9,7 @@
 
 mod support;
 
+use base64::Engine;
 use governor::{clock::DefaultClock, state::keyed::DashMapStateStore, Quota, RateLimiter};
 use openfang_types::memory::MemorySource;
 use std::collections::HashMap;
@@ -52,6 +53,19 @@ fn codex_cli_auth_path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     let path = PathBuf::from(home).join(".codex").join("auth.json");
     path.exists().then_some(path)
+}
+
+fn fake_codex_access_token(account_id: &str) -> String {
+    let header =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+        serde_json::json!({
+            "chatgpt_account_id": account_id,
+            "scope": "openid profile email offline_access model.request",
+        })
+        .to_string(),
+    );
+    format!("{header}.{payload}.signature")
 }
 
 fn skip_if_codex_auth_missing(label: &str) -> bool {
@@ -400,6 +414,40 @@ async fn test_codex_auth_import_status_and_logout_roundtrip() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["connected"], false);
     assert_eq!(body["source"], "logged_out");
+}
+
+#[tokio::test]
+async fn test_codex_auth_auto_loaded_on_startup_from_cli_auth_file() {
+    let _guard = CODEX_AUTH_TEST_GUARD.lock().await;
+    let _env = EnvSnapshot::capture(&["OPENAI_CODEX_ACCESS_TOKEN", "OPENAI_CODEX_ACCOUNT_ID"]);
+    std::env::remove_var("OPENAI_CODEX_ACCESS_TOKEN");
+    std::env::remove_var("OPENAI_CODEX_ACCOUNT_ID");
+
+    let server = TestServerBuilder::default()
+        .with_model(OLLAMA_TEST_MODEL)
+        .with_codex_cli_auth_json(serde_json::json!({
+            "access_token": fake_codex_access_token("acct-startup"),
+            "refresh_token": "refresh-token"
+        }))
+        .start()
+        .await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{}/api/auth/codex/status", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["connected"], true);
+    assert_eq!(body["provider"], "openai-codex");
+    assert_eq!(body["source"], "codex_cli_import");
+
+    assert_eq!(
+        std::env::var("OPENAI_CODEX_ACCOUNT_ID").unwrap(),
+        "acct-startup"
+    );
 }
 
 #[tokio::test]

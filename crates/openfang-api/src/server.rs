@@ -79,6 +79,8 @@ pub async fn build_router_with_options(
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
     });
 
+    codex_oauth::initialize_codex_auth(&state).await;
+
     // CORS: allow localhost origins by default. If API key is set, the API
     // is protected anyway. For development, permissive CORS is convenient.
     let cors = if state.kernel.config.api_key.is_empty() {
@@ -465,6 +467,10 @@ pub async fn build_router_with_options(
         )
         .route("/api/sales/run", axum::routing::post(sales::run_sales_now))
         .route(
+            "/api/sales/jobs/active",
+            axum::routing::get(sales::get_active_sales_job_progress),
+        )
+        .route(
             "/api/sales/jobs/{job_id}/progress",
             axum::routing::get(sales::get_sales_job_progress),
         )
@@ -502,8 +508,7 @@ pub async fn build_router_with_options(
         )
         .route(
             "/api/sales/experiments",
-            axum::routing::get(sales::list_sales_experiments)
-                .post(sales::create_sales_experiment),
+            axum::routing::get(sales::list_sales_experiments).post(sales::create_sales_experiment),
         )
         .route(
             "/api/sales/experiments/{id}/results",

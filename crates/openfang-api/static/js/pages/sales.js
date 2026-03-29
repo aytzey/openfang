@@ -208,6 +208,7 @@ function salesPage() {
           this.loadSourceHealth(),
           this.loadOnboardingStatus()
         ]);
+        await this.restoreJobProgress();
       } catch (e) {
         this.loadError = e && e.message ? e.message : 'Satis paneli yuklenemedi.';
       }
@@ -216,6 +217,56 @@ function salesPage() {
         await this.loadSelectedDossier();
       }
       this.loading = false;
+    },
+
+    persistCurrentJobId(jobId) {
+      try {
+        if (jobId) {
+          localStorage.setItem('openfang-sales-current-job', jobId);
+        }
+      } catch (e) {}
+    },
+
+    clearPersistedJobId() {
+      try {
+        localStorage.removeItem('openfang-sales-current-job');
+      } catch (e) {}
+    },
+
+    async restoreJobProgress() {
+      var storedJobId = '';
+      try {
+        storedJobId = localStorage.getItem('openfang-sales-current-job') || '';
+      } catch (e) {}
+
+      try {
+        var active = await OpenFangAPI.get('/api/sales/jobs/active');
+        if (active && active.job && active.job.job_id) {
+          this.currentJobId = active.job.job_id;
+          this.jobProgress = active.job;
+          this.persistCurrentJobId(active.job.job_id);
+          if (active.job.status === 'running') {
+            this.startJobPolling(active.job.job_id);
+          }
+          return;
+        }
+      } catch (e) {}
+
+      if (!storedJobId) return;
+      try {
+        var progress = await OpenFangAPI.get('/api/sales/jobs/' + encodeURIComponent(storedJobId) + '/progress');
+        if (!progress || !progress.job_id) {
+          this.clearPersistedJobId();
+          return;
+        }
+        this.currentJobId = progress.job_id;
+        this.jobProgress = progress;
+        if (progress.status === 'running') {
+          this.startJobPolling(progress.job_id);
+        }
+      } catch (e) {
+        this.clearPersistedJobId();
+      }
     },
 
     async loadOnboardingStatus() {
@@ -311,6 +362,7 @@ function salesPage() {
           throw new Error('Job baslatildi ancak job_id donmedi');
         }
         this.currentJobId = jobId;
+        this.persistCurrentJobId(jobId);
         this.jobProgress = {
           job_id: jobId,
           status: (data && data.status) || 'running',
@@ -753,6 +805,10 @@ function salesPage() {
         try {
           var data = await OpenFangAPI.get('/api/sales/jobs/' + encodeURIComponent(jobId) + '/progress');
           self.jobProgress = data || null;
+          if (data && data.job_id) {
+            self.currentJobId = data.job_id;
+            self.persistCurrentJobId(data.job_id);
+          }
           if (!data || data.status === 'completed' || data.status === 'failed') {
             self.stopJobPolling();
             self.currentJobId = jobId;
@@ -789,6 +845,98 @@ function salesPage() {
         self.jobPollTimer = setTimeout(tick, 2500);
       };
       tick();
+    },
+
+    currentJobStageRecord() {
+      if (!this.jobProgress || !Array.isArray(this.jobProgress.stages)) return null;
+      var current = this.jobProgress.current_stage || '';
+      var stages = this.jobProgress.stages;
+      for (var i = 0; i < stages.length; i++) {
+        if (stages[i] && stages[i].name === current) return stages[i];
+      }
+      return stages.length ? stages[stages.length - 1] : null;
+    },
+
+    jobProgressPercent() {
+      if (!this.jobProgress || !Array.isArray(this.jobProgress.stages) || !this.jobProgress.stages.length) {
+        return this.jobProgress && this.jobProgress.status === 'completed' ? 100 : 0;
+      }
+      var stages = this.jobProgress.stages;
+      var completed = 0;
+      for (var i = 0; i < stages.length; i++) {
+        if (stages[i] && stages[i].status === 'completed') completed += 1;
+      }
+      var currentStage = this.currentJobStageRecord();
+      var checkpoint = currentStage && currentStage.checkpoint ? currentStage.checkpoint : null;
+      if (
+        currentStage &&
+        currentStage.status === 'running' &&
+        checkpoint &&
+        typeof checkpoint.total_candidates === 'number' &&
+        checkpoint.total_candidates > 0 &&
+        typeof checkpoint.processed_candidates === 'number'
+      ) {
+        var stageFraction = checkpoint.processed_candidates / checkpoint.total_candidates;
+        if (stageFraction < 0) stageFraction = 0;
+        if (stageFraction > 1) stageFraction = 1;
+        return Math.round(((completed + stageFraction) / stages.length) * 100);
+      }
+      return Math.round((completed / stages.length) * 100);
+    },
+
+    jobProgressSummary() {
+      var stage = this.currentJobStageRecord();
+      var checkpoint = stage && stage.checkpoint ? stage.checkpoint : null;
+      if (checkpoint) {
+        var parts = [];
+        if (
+          typeof checkpoint.processed_candidates === 'number' &&
+          typeof checkpoint.total_candidates === 'number' &&
+          checkpoint.total_candidates > 0
+        ) {
+          parts.push(String(checkpoint.processed_candidates) + '/' + String(checkpoint.total_candidates) + ' aday isleme alindi');
+        }
+        if (typeof checkpoint.profiled_accounts === 'number') {
+          parts.push(String(checkpoint.profiled_accounts) + ' dossier kaydedildi');
+        }
+        if (typeof checkpoint.inserted === 'number') {
+          parts.push(String(checkpoint.inserted) + ' lead uretildi');
+        }
+        if (typeof checkpoint.approvals_queued === 'number' && checkpoint.approvals_queued > 0) {
+          parts.push(String(checkpoint.approvals_queued) + ' onay kuyruga alindi');
+        }
+        if (checkpoint.current_domain) {
+          parts.push('Siradaki domain: ' + checkpoint.current_domain);
+        }
+        if (parts.length) return parts.join(' | ');
+      }
+      if (this.jobProgress && this.jobProgress.status === 'completed') {
+        return 'Job tamamlandi. Run, prospect ve lead listeleri yenileniyor.';
+      }
+      if (this.jobProgress && this.jobProgress.status === 'failed') {
+        return this.jobProgress.error_message || 'Job basarisiz tamamlandi.';
+      }
+      return '';
+    },
+
+    jobStageNote(stage) {
+      if (!stage || !stage.checkpoint) return '-';
+      var checkpoint = stage.checkpoint;
+      var parts = [];
+      if (
+        typeof checkpoint.processed_candidates === 'number' &&
+        typeof checkpoint.total_candidates === 'number' &&
+        checkpoint.total_candidates > 0
+      ) {
+        parts.push(String(checkpoint.processed_candidates) + '/' + String(checkpoint.total_candidates));
+      }
+      if (checkpoint.current_domain) {
+        parts.push(checkpoint.current_domain);
+      }
+      if (typeof checkpoint.inserted === 'number') {
+        parts.push('lead ' + String(checkpoint.inserted));
+      }
+      return parts.length ? parts.join(' | ') : '-';
     },
 
     approvalRecipient(a) {
@@ -970,6 +1118,7 @@ function salesPage() {
         var jobId = (data && data.job_id) || '';
         if (!jobId) throw new Error('Retry job_id donmedi');
         this.currentJobId = jobId;
+        this.persistCurrentJobId(jobId);
         this.jobProgress = {
           job_id: jobId,
           status: (data && data.status) || 'running',
