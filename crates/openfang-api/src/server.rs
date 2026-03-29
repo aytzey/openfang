@@ -465,6 +465,38 @@ pub async fn build_router_with_options(
         )
         .route("/api/sales/run", axum::routing::post(sales::run_sales_now))
         .route(
+            "/api/sales/jobs/{job_id}/progress",
+            axum::routing::get(sales::get_sales_job_progress),
+        )
+        .route(
+            "/api/sales/jobs/{job_id}/retry",
+            axum::routing::post(sales::retry_sales_job),
+        )
+        .route(
+            "/api/sales/source-health",
+            axum::routing::get(sales::list_sales_source_health),
+        )
+        .route(
+            "/api/sales/policy/proposals",
+            axum::routing::get(sales::list_sales_policy_proposals),
+        )
+        .route(
+            "/api/sales/policy/proposals/{id}/approve",
+            axum::routing::post(sales::approve_sales_policy_proposal),
+        )
+        .route(
+            "/api/sales/policy/proposals/{id}/reject",
+            axum::routing::post(sales::reject_sales_policy_proposal),
+        )
+        .route(
+            "/api/sales/unsubscribe",
+            axum::routing::get(sales::sales_unsubscribe),
+        )
+        .route(
+            "/api/sales/outcomes/webhook",
+            axum::routing::post(sales::sales_outcomes_webhook),
+        )
+        .route(
             "/api/sales/runs",
             axum::routing::get(sales::list_sales_runs),
         )
@@ -477,8 +509,20 @@ pub async fn build_router_with_options(
             axum::routing::get(sales::list_sales_prospects),
         )
         .route(
+            "/api/sales/accounts/{id}/dossier",
+            axum::routing::get(sales::get_sales_account_dossier),
+        )
+        .route(
             "/api/sales/approvals",
             axum::routing::get(sales::list_sales_approvals),
+        )
+        .route(
+            "/api/sales/approvals/bulk-approve",
+            axum::routing::post(sales::bulk_approve_sales_approvals),
+        )
+        .route(
+            "/api/sales/approvals/{id}/edit",
+            axum::routing::patch(sales::edit_sales_approval),
         )
         .route(
             "/api/sales/approvals/{id}/approve",

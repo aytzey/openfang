@@ -1,4 +1,4 @@
-# OpenFang Prospecting Engine — Birlesmis Mega Dokuman
+# OpenFang Signal-to-Meeting Engine — Birlesmis Mega Dokuman
 
 > Bu dokuman 5 ayri analiz dokumaninin birlesmis halidir.
 > Herhangi bir LLM veya insan gelistirici, uygulamayi hic gormeden
@@ -22,11 +22,11 @@
 **PARCA 3** — [Canli Veride 12 Bug + Hedef Tasarim + Ekran Wireframe](#parca-3--hedef-tasarim-ve-ekranlar)
 (12 bug, 0-1000 puanlama, LLM mesaj uretimi, 6 ekran wireframe)
 
-**PARCA 4** — [Uzman Degerlendirmesi + Guncel Implementasyon Plani](#parca-4--uzman-degerlendirmesi-ve-gercek-implementasyon-plani)
-(ChatGPT Pro + Gemini + Gemini Deep Research birlesmis. Revenue Graph +
-Activation Engine + Learning Loop + Multi-Agent Swarm + Niyet Motoru +
-Deliverability Zirhi + Deger Uretimi + Omnichannel Durum Makinesi.
-**53 maddelik 5 fazli plan**)
+**PARCA 4** — [Mimari Kararlar + Implementasyon Plani](#parca-4--mimari-kararlar-ve-implementasyon-plani)
+(Signal-to-Meeting Engine mimarisi. Canonical Relational Core + Graph Projection +
+5 Eksenli Decision Engine + Learning Loop v2 + Multi-Agent Swarm + Niyet Motoru +
+Deliverability Zirhi + Secici Deger Uretimi + Omnichannel Durum Makinesi.
+**61 maddelik 5 fazli plan**)
 
 ---
 
@@ -5003,74 +5003,93 @@ Gunluk gonderim cap'i:
 ---
 
 ===============================================================
-# PARCA 4 — UZMAN DEGERLENDIRMESI VE GERCEK IMPLEMENTASYON PLANI
+
+===============================================================
+# PARCA 4 — MIMARI KARARLAR VE IMPLEMENTASYON PLANI
 ===============================================================
 
-> Asagidaki bolum, Parca 1-3'teki analiz ve hedef mimarinin bir uzman
-> LLM (ChatGPT Pro) tarafindan degerlendirilmesi sonucu ortaya cikan
-> kritik tespitleri ve bunlara dayanan GUNCELLENMIS implementasyon
-> planini icerir.
+> Bu bolum, Signal-to-Meeting Engine'in mimari kararlarini ve
+> 61 maddelik 5 fazli implementasyon planini icerir.
+> Herhangi bir LLM veya gelistirici, bu bolumu okuyarak sistemi
+> sifirdan implement edebilmelidir.
 
 ---
 
-## 27. Uzman Degerlendirmesi: Mevcut Skor Karti
+## 27. Mevcut Durum Degerlendirmesi
 
-| Katman | Mevcut Puan | Aciklama |
-|--------|-------------|----------|
+| Katman | Puan | Aciklama |
+|--------|------|----------|
 | Kesif (Discovery) | 7/10 | TR dizin paketleri guclu, LLM kesfii calisiyor |
+| Dogruluk (Truth) | 4/10 | Normalization gateway yok, field-level confidence yok, generic/consumer email filtresi kirik |
 | Zenginlestirme (Research) | 5/10 | Site + arama OSINT var ama LinkedIn %0, telefon kayip |
-| Aktivasyon (Activation) | 3/10 | Sablon mesajlar, tek skor, onay kuyrugu ilkel |
+| Karar (Decision) | 3/10 | Tek skor, send gate yok, risk routing yok |
+| Aktivasyon (Activation) | 3/10 | Sablon mesajlar, sekans yok, onay kuyrugu ilkel |
+| Teslimat (Deliverability) | 2/10 | Tek mailbox, warm-up yok, bounce tracking yok, SPF/DKIM/DMARC yapisi eksik |
 | Ogrenme (Learning) | 1/10 | Bounce/yanit/outcome takibi neredeyse yok |
 
-**Temel Tespit:** Sistem "kac aday buldum?" sorusunu optimize ediyor.
-Oysa para getiren makine "en guvenilir sekilde en cok olumlu cevabi
-ureten" makinedir.
+**Kuzey yildizi metrikleri:**
+- `verified_decision_maker_rate` — dogru kisi orani
+- `positive_reply_rate` — olumlu yanit orani
+- `meeting_booked_rate` — toplanti orani
+- `bounce_complaint_rate` — bounce + sikayet orani (<%0.3 hedef)
+- `suppression_hygiene` — baskilama hijyeni
+- `manual_minutes_per_positive_reply` — verimlilik
+- `discovery_count` yardimci metriktir, kuzey yildizi degil
 
 ---
 
-## 28. Kabul Edilen Mimari Elestiriler
+## 28. Mimari Kararlar
 
-### 28.1 Kuzey Yildizi Yanlis
+### 28.1 Discovery ve Activation Ayrimi
 
-**Mevcut metrikler:** discovered, inserted, approvals_queued (uretim metrikleri)
-**Olmasi gereken:** positive_reply_rate, meeting_rate, opportunity_rate,
-spam_risk, dogru_kisi_orani (is sonucu metrikleri)
+`run_generation()` fonksiyonu durumlu is akisi + stage checkpointing + kuyruk
+bazli orkestrasyon olarak yeniden yapilandirilir:
 
-### 28.2 Discovery ile Activation Yapisik
+- **Discovery Reservoir** — surekli hesap evreni doldurur (daily_target ile KESILMEZ)
+- **Research Queue** — eksik kimlikleri tamamlar, tez olusturur
+- **Activation Queue** — bugun gonderilecek en iyi firsatlari secer
 
-`run_generation()` tek bir akista kesif + arastirma + lead uretimi +
-onay kuyrugu yapiyor. Bu yanlis.
+`daily_target` SADECE gonderimi sinirlar, kesfii degil.
 
-**Dogru ayrim:**
-- **Discovery Reservoir** — surekli hesap evreni doldurur
-- **Research Queue** — eksik kimlikleri tamamlar
-- **Activation Queue** — sadece bugun gonderilecek en iyi firsatlari secer
+### 28.2 Account-Merkezli Yapi + Canonical Relational Core
 
-`daily_target` SADECE gonderimi sinirlamali, kesfii degil.
+Bir domain = bir prospect varsayimi B2B icin yetersiz. Gercek outbound
+**account + buying committee + signal history** uzerinden calisir.
 
-### 28.3 Lead-Merkezli Degil, Account-Merkezli Olmali
+**Source-of-truth:** Canonical Relational Core (SQLite, relation-first).
+Suppression, idempotency, approval, retry, audit, queue state, experiment
+assignment ve delivery event'ler deterministik kayit ister.
 
-Bir domain = bir prospect varsayimi B2B icin fazla sig.
-Gercekte: bir hesabin birden fazla domaini, holdinglerin alt markalari,
-ayni sirketin farkli ulkelerde farkli alan adlari olabilir.
+**Tablolar:** `accounts`, `account_aliases`, `domains`, `contacts`,
+`contact_methods`, `evidence`, `signals`, `signal_rationales`, `buyer_roles`,
+`score_snapshots`, `research_queue`, `activation_queue`, `account_theses`,
+`sequence_templates`, `sequence_instances`, `touches`, `outcomes`,
+`outcome_attribution_snapshots`, `missed_signal_reviews`,
+`retrieval_rule_versions`, `contextual_factors`, `exploration_log`,
+`suppressions`, `experiments`, `experiment_assignments`, `source_health`,
+`job_runs`, `job_stages`, `icp_definitions`, `segments`, `personas`,
+`sender_policies`
 
-Ihtiyac: **Lead tablosu degil, Account Graph.**
-Node'lar: account, domain, contact, signal, message, reply
-Edge'lar: works_at, mentioned_in, derived_from, replied_to, referred_to
+**Graph layer:** Relational core'dan beslenen analytical projection.
+Graphiti burada temporal relation, dossier recall ve buyer committee
+reasoning icin kullanilir — transactional source-of-truth olarak degil.
 
-### 28.4 LLM Pipeline'da Cok Erken
+### 28.3 Normalize + Verify + Classify Gateway
 
-LLM ile sirket uretimi ve relevance validation mantikli gorunuyor ama
-model "dusunur gibi" gorunurken dusuk guvenli veri enjekte edebilir.
+Ham veriden aktivasyona giden yolda TUM kaynaklar icin TEK normalization
+gateway:
+- Domain validity (`is_valid_company_domain()`)
+- Email classification (Personal / Generic / Role / Consumer / Invalid)
+- Phone normalization (E.164)
+- Kisi adi placeholder filtresi (Turkce: "baskanin mesaji", "hakkimizda" vb.)
+- LinkedIn normalization
+- Legal entity resolution
 
-**Dogru yaklasim:**
-- LLM kesfitte opsiyonel, dusuk guvenli yardimci
-- LLM sentezde (ozet, mesaj, pain point) ana arac
-- Deterministik katmanlar dogrulama, dedup, idempotency, policy, scheduling
+LLM kesfitte opsiyonel, dusuk guvenli yardimci (confidence 0.4). LLM sentezde
+ana arac — ama ANCAK kanit paketi ve tez oturduktan sonra. Mesaj motoru kanit
+paketi (evidence bundle) olmadan CALISMAZ.
 
-### 28.5 Tek Skor Yetersiz — 5 Eksenli Puanlama
-
-Tek skor (0-100 veya 0-1000) sunlari birbriine karistiriyor:
+### 28.4 5 Eksenli Puanlama + Send Gate
 
 | Eksen | Soru | Ornek |
 |-------|------|-------|
@@ -5080,12 +5099,13 @@ Tek skor (0-100 veya 0-1000) sunlari birbriine karistiriyor:
 | **DeliverabilityRisk** | Gondermek guvenli mi? | Bounce riski, domain itibari |
 | **ComplianceRisk** | Yasal risk var mi? | KVKK, opt-out, suppression |
 
-Sonra bir **Send Gate** koyulur:
-Yuksek oncelikli hesap bile gonderilebilir olmak ZORUNDA degildir.
+Operator tek toplami degil, her ekseni ayri gorur. Send Gate karari:
+- **Block:** DeliverabilityRisk > 0.7 VEYA ComplianceRisk > 0.5
+- **Research:** ReachabilityScore < 0.3
+- **Nurture:** IntentScore < 0.2
+- **Ready to Activate:** FitScore > 0.5 VE ReachabilityScore > 0.4 VE Risk < 0.5
 
-### 28.6 Alan Bazli Guven Skoru
-
-`research_confidence` profil seviyesinde cok kaba. Gercek ihtiyac:
+### 28.5 Alan Bazli Guven Skoru
 
 ```
 company_name_confidence: 0.95
@@ -5097,13 +5117,8 @@ linkedin_confidence: 0.00
 phone_confidence: 0.80          // dizinden gelmis, dogrulanmamis
 ```
 
-Operator "profil %87 guvenli" degil, "isim supeli, email zayif" bilgisini ister.
+### 28.6 Canonical Account Dedup
 
-### 28.7 Domain Bazli Dedup Ilkel
-
-`company_domain` primary key + `discovered_domains` tekillestime hizli ama kirilgan.
-
-**Dogru model:**
 - canonical_account (ana hesap)
 - account_alias (alternatif isimler)
 - domain (birden fazla olabilir)
@@ -5111,39 +5126,64 @@ Operator "profil %87 guvenli" degil, "isim supeli, email zayif" bilgisini ister.
 - legal_entity_name
 - brand_name
 
-Dedup: domain + ad benzerligi + site kimligi + iletisim sinyali + kaynak dogrulama
+Dedup: domain + ad benzerligi + site kimligi + iletisim sinyali + kaynak dogrulama.
 
-### 28.8 LinkedIn Stratejik Hata
+### 28.7 LinkedIn Stratejisi
 
-LinkedIn Help, ucuncu taraf yazilimlarla scrape/automation kullanimina
-izin vermiyor. Resmi Marketing API de member data'nin sales/lead creation
-icin kullanilmasini ve mass messaging'i yasakliyor.
+LinkedIn tarayici otomasyonu codebase'den tamamen temizlenir. Yerine:
+1. **Partner-gated resmi API hatti** (Sales Navigator API, LinkedIn Ads API)
+2. **Operator-asist kanali** — dashboard'da "LinkedIn'de su mesaji gonder" gorevi olusturur
 
-**LinkedIn bu mimaride:** otomatik DM kanali degil,
-**icerik + manuel asist + first-party engagement** kanali olmali.
+### 28.8 Bounce Shield
 
-### 28.9 Bounce/Reply Intelligence Faz 5'te Degil, Faz 1'de Olmali
+Syntax (RFC 5322) + MX kayit kontrolu + domain health skoru + historical bounce
+kontrolu + suppression kontrolu + selective verifier (catch-all domainlerde).
+SMTP VRFY temel mekanizma degil (RFC 5321: kapatilabilir, guvenilir degil).
 
-Sonuc verisini toplamadan skoru da mesaji da kalibre edemezsin.
-Bu "ileri faz" degil, temel altyapi.
+### 28.9 Compliance Temelleri
 
-### 28.10 Frontend/Backend Schema Drift
+Turkiye 6563 sayili Kanun: tacir/esnafa onceden onaysiz ileti gonderimi mumkun,
+ama ret hakki kullanildiktan sonra tekrar gonderim yapILAMAZ — kalici suppress.
+SPF/DKIM/DMARC, one-click unsubscribe (RFC 8058) ve suppression ledger ilk haftada olur.
 
-Rust: `target_geo = "US"`, JS: `target_geo = "TR"` — bu kucuk bug degil,
-contract-first gelistirme eksikliginin isareti.
+### 28.10 Mesaj Varyasyonu
+
+Mesaj varyasyonu **rol, seniority, sektor, dil, sirket sinyali ve itiraz turu**
+temelli. Kisilik cikarimi (dijital ayak izinden profil) kullanilmaz — ground-truth
+dusuk, izinli veri erisimi sorunu var.
+
+### 28.11 Deger Asset Uretimi (Secici)
+
+PDF/mikro-rapor sadece **A-tier hesap + dogrulanmis trigger + dusuk risk + operator
+onayi** kosulunda acilir. Cogu durumda ilk mailde PDF eklemek yerine "istersen sana
+2 sayfalik kisa analiz gondereyim" CTA'si kullanilir.
+
+### 28.12 Research Workbench — Tez Once, Lead Sonra
+
+Lead yaratmadan once **tez** olusturulur:
+- Neden bu hesap?
+- Neden simdi?
+- Dogru buyer committee kim?
+- Hangi kanitlarla bunu soyluyoruz?
+- Hangi seyi soylemeyecegiz?
+- Hangi kanal en guvenli ve mantikli?
 
 ---
 
-## 29. Hedef Mimari: Revenue Graph + Activation Engine + Learning Loop
+## 29. Hedef Mimari: Signal-to-Meeting Engine
 
-Tek boru hatti yerine **3 buyuk motor**:
+4 katmanli yapi:
 
 ```
-                     REVENUE GRAPH
-                     (kim hedef, neden simdi, hangi kanitla)
+                 STRATEGY / CONTROL PLANE
+                 (ICP'ler, persona haritasi, kanal politikalari, sender policy,
+                  compliance profile, scoring/prompt/sequence versiyonlari)
                           |
-                     ACTIVATION ENGINE
-                     (kime, hangi sirayla, hangi kanalla, hangi mesaj)
+                     EVIDENCE + TRUTH LAYER
+                     (normalize, verify, classify — tek gateway)
+                          |
+                     DECISION + ACTIVATION ENGINE
+                     (kim hedef, neden simdi, hangi kanitla, hangi kanal, hangi mesaj)
                           |
                      LEARNING LOOP
                      (ne ise yaradi, ne yaramadi, neyi kapat, neyi buyut)
@@ -5152,56 +5192,60 @@ Tek boru hatti yerine **3 buyuk motor**:
 ### 29.1 Tam Akis
 
 ```
-[First-party signals]   [External source packs]   [CRM/history]
-        \                     |                        /
-         \                    |                       /
-          ---> [Evidence Ingestion + Source Health] ---->
-                    |
-                    v
-             [Account / Contact Graph]
-                    |
-                    v
-      [Fit + Intent + Reachability + Risk Engine]
-                    |
-         +----------+-----------+
-         |                      |
-         v                      v
- [Research Queue]        [Activation Queue]
-         |                      |
-         v                      v
- [Evidence-bound Dossier] [Sequence Planner]
-         |                      |
-         +----------+-----------+
-                    v
-        [Message Generation + QA + Policy]
-                    |
-                    v
-       [Sendability / Compliance Guardrail]
-                    |
-         +----------+-----------+
-         |                      |
-         v                      v
-   [Email Execution]    [LinkedIn Manual Assist / Call Task]
-         |
-         v
- [Inbox / Bounce / Reply / Unsubscribe Ingestion]
-         |
-         v
- [Suppression + Experimentation + Score Calibration]
+[Source Packs + First-Party Signals + CRM]
+                  |
+                  v
+         [Artifact Store / Raw Evidence]
+                  |
+                  v
+    [Normalize + Verify + Classify Gateway]
+                  |
+                  v
+   [Canonical Operational Core (relational, source-of-truth)]
+                  |
+      +-----------+------------+
+      |                        |
+      v                        v
+[Decision Engine]      [Graph Projection / Temporal Memory]
+(5 eksenli skor)       (Graphiti — analytical projection)
+      |                        |
+      v                        |
+[Research Queue]              |
+      |                       |
+      v                       |
+[Evidence-Bound Dossier] <----+
+(tez: neden bu hesap? neden simdi? kim? hangi kanit?)
+      |
+      v
+[Sequence + Message + Value Asset Engine]
+(2 asamali: strateji → copy, kanit-bagli, claims[] + evidence_ids[])
+      |
+      v
+[Send Gate]
+  |      |       |         |
+Block  Research Nurture  Activate
+                        |
+                        v
+         [Email / Phone Task / LinkedIn Human Assist / Ads]
+                        |
+                        v
+          [Bounce / Reply / Unsub / Meeting / Referral]
+                        |
+                        v
+              [Learning + Calibration + Suppression]
 ```
 
-### 29.2 ICP Control Plane
+### 29.2 Strategy / Control Plane
 
-Tek `sales_profile` yerine:
+Strateji nesneleri:
 - ICP tanimlari (birden fazla)
 - Alt segmentler
-- Negatif ICP kurallari
-- Persona haritasi
-- Mesaj stratejileri
-- Sender policy
-- Scoring version + prompt version
-
-Profil bir form degil, **strateji nesnesi**.
+- Negatif ICP kurallari (dislanacak sektorler, domainler, roller)
+- Persona haritasi (buyer role → mesaj stratejisi esleme)
+- Kanal politikalari (email first, phone if high-fit, LinkedIn human-assist)
+- Sender policy (hangi mailbox, hangi subdomain, gunluk cap)
+- Compliance profile (pazar bazli kural seti: TR 6563, GDPR, CAN-SPAM)
+- Scoring version + prompt version + sequence version
 
 ### 29.3 Source Pack Katmani
 
@@ -5218,461 +5262,226 @@ Her kaynak adapter'in contract'i:
 - parse status + parser health
 - legal notes
 
-### 29.4 Account Graph — Graphiti Acik Kaynak Temporal Knowledge Graph
+### 29.4 Graph Layer — Analytical Projection (Graphiti)
 
-> **Graphiti** (Apache 2.0, github.com/getzep/graphiti, v0.28.2) acik kaynak
-> kutuphanesi dogrudan kullanilir. arXiv:2501.13956, Rasmussen et al. 2025.
-> Dis bulut servisi YOK — Graphiti'nin **Kuzu embedded driver'i** ile
-> tamamen yerel (offline) calisir. Neo4j gerekmez.
+Graph katmani **analytical projection / temporal memory** olarak calisir.
+Operasyonel hakikat relational cekirdekte durur.
 
-Account graph icin Graphiti'nin zamansal-duyarli (temporally-aware)
-bilgi grafi motorunu dogrudan kullaniyoruz. Python kutuphanesi olarak
-OpenFang'in `process_manager` veya ayri bir sidecar sureci uzerinden
-calistirilir.
+**Graphiti** (Apache 2.0, github.com/getzep/graphiti, >=0.28.2) kullanilir.
 
-**Neden Graphiti (dogrudan kutuphane)?**
-- Mevcut OpenFang `KnowledgeStore` statik entity-relation modeli kullaniyor.
-  Prospecting'de ise veriler surekli degisiyor: kisi unvan degistirir, sirket
-  el degistirir, e-posta gecersiz olur, yeni sinyal gelir.
-- Graphiti bi-temporal model ile hem "gercekte ne zaman oldu" (T timeline)
-  hem "sisteme ne zaman girdi" (T' timeline) takip eder.
-- 3 katmanli hiyerarsi (Episode → Semantic Entity → Community) prospecting
-  pipeline'inin kesfetten analize, analizden aksiyona akisina birebir uyar.
-- **Kuzu embedded driver** (`KuzuDriver(db='~/.openfang/data/prospect_graph.kuzu')`)
-  ile tamamen dosya-bazli, sunucusuz calisir — SQLite gibi ama graf icin.
-- Apache 2.0 lisansli, ticari kullanima uygun.
+**Kullanim alanlari:**
+- Temporal relation: kisi unvan degistirir, sirket el degistirir, e-posta gecersiz olur
+- Bi-temporal model: "gercekte ne zaman oldu" (T) + "sisteme ne zaman girdi" (T')
+- Buyer committee reasoning: account → contact → signal → touch → reply zinciri
+- Community detection: sektor bazli kumeleme, benzer hesap onerisi
+- Dossier recall: temporal context window icinde ilgili tum fact'leri getirme
 
 **Teknik profil:**
 ```
-Kutuphane:  graphiti-core v0.28.2
+Kutuphane:  graphiti-core >=0.28.2 (version pin zorunlu)
 Lisans:     Apache 2.0
 Dil:        Python >=3.10
-Graf DB:    Kuzu embedded (sunucusuz, dosya-bazli) ← TERCIH
-            + Neo4j, FalkorDB, Neptune (opsiyonel)
-LLM:        OpenAI (varsayilan) + Anthropic, Groq, Gemini (opsiyonel)
-Embedder:   OpenAI (varsayilan) + Voyage, sentence-transformers (opsiyonel)
+Graf DB:    Neo4j / FalkorDB (production)
+            Kuzu embedded (deneysel/offline-only — repo Ekim 2025'te arsivlenmis)
+LLM:        OpenAI (varsayilan) + Anthropic, Groq, Gemini
+Embedder:   OpenAI (varsayilan) + Voyage, sentence-transformers
 Reranker:   OpenAI, BGE, Gemini
-Bagimllik:  pydantic, neo4j (sdk, kuzu icin gerekmez), openai, numpy
 ```
 
 **OpenFang entegrasyonu:**
 ```
-OpenFang (Rust) ←→ Graphiti (Python) baglantisi:
-  Secenek A: OpenFang python_runtime ile subprocess olarak calistir
-  Secenek B: OpenFang process_manager ile kalici Python sureci
-  Secenek C: Graphiti MCP server modu (graphiti/mcp_server/) ile MCP uzerinden
+OpenFang (Rust) ←→ Graphiti (Python):
+  Tercih: Graphiti MCP server modu — sifir ek kod ile entegrasyon.
+  ZORUNLU: MCP aramalari strict allowlist + sanitization ile sinirli.
+  (Mart 2026 advisory: 0.28.1'de Cypher injection riski, 0.28.2'de kapali)
+```
 
-  Tercih: Secenek C (MCP) — OpenFang zaten MCP destegi olan bir platform,
-  Graphiti'nin kendi MCP server'i var, sifir ek kod ile entegrasyon.
+**Veri akisi:**
+```
+Relational Core (SoT) → [event-driven projection] → Graphiti Graph
+→ [Dossier recall, temporal query, community analysis, buyer committee map]
 ```
 
 #### 29.4.1 Kuzu Embedded DB Semasi (Graphiti otomatik olusturur)
 
 ```sql
--- Graphiti'nin KuzuDriver'i baslatildiginda otomatik olusturulan sema
--- Kaynak: graphiti_core/driver/kuzu_driver.py SCHEMA_QUERIES
-
 CREATE NODE TABLE IF NOT EXISTS Episodic (
     uuid STRING PRIMARY KEY,
     name STRING,
-    group_id STRING,            -- prospect run ID ile grupla
+    group_id STRING,
     created_at TIMESTAMP,
-    source STRING,              -- "text" | "json" | "message"
-    source_description STRING,  -- "TMB members scrape" vb.
-    content STRING,             -- ham episode icerigi
+    source STRING,
+    source_description STRING,
+    content STRING,
     valid_at TIMESTAMP,
     entity_edges STRING[]
 );
 
 CREATE NODE TABLE IF NOT EXISTS Entity (
     uuid STRING PRIMARY KEY,
-    name STRING,                -- "Alarko", "Izzet Garih"
+    name STRING,
     group_id STRING,
-    labels STRING[],            -- ["Account"], ["Contact"] vb.
+    labels STRING[],
     created_at TIMESTAMP,
-    name_embedding FLOAT[],     -- 1024-dim vektor
-    summary STRING,             -- entity ozeti
-    attributes STRING           -- JSON: {sector, geo, title, ...}
+    name_embedding FLOAT[],
+    summary STRING,
+    attributes STRING
 );
 
 CREATE NODE TABLE IF NOT EXISTS Community (
     uuid STRING PRIMARY KEY,
-    name STRING,                -- "TR Insaat Muteahhitleri"
+    name STRING,
     group_id STRING,
     created_at TIMESTAMP,
     name_embedding FLOAT[],
-    summary STRING              -- topluluk ozeti
+    summary STRING
 );
 
 CREATE NODE TABLE IF NOT EXISTS RelatesToNode_ (
     uuid STRING PRIMARY KEY,
     group_id STRING,
     created_at TIMESTAMP,
-    name STRING,                -- edge/fact kisa adi
-    fact STRING,                -- "Alarko employs Izzet Garih as Chairman"
-    fact_embedding FLOAT[],     -- fact vektoru
-    episodes STRING[],          -- kaynak episode UUID'leri
-    expired_at TIMESTAMP,       -- t'_expired (sistemde gecersiz kilindi)
-    valid_at TIMESTAMP,         -- t_valid (gercekte basladigi tarih)
-    invalid_at TIMESTAMP,       -- t_invalid (gercekte bittigi tarih)
-    attributes STRING           -- JSON: {confidence, channel_type, ...}
+    name STRING,
+    fact STRING,
+    fact_embedding FLOAT[],
+    episodes STRING[],
+    expired_at TIMESTAMP,
+    valid_at TIMESTAMP,
+    invalid_at TIMESTAMP,
+    attributes STRING
 );
 
--- Iliskiler
-CREATE REL TABLE IF NOT EXISTS RELATES_TO(
-    FROM Entity TO RelatesToNode_,
-    FROM RelatesToNode_ TO Entity
-);
-CREATE REL TABLE IF NOT EXISTS MENTIONS(
-    FROM Episodic TO Entity      -- episode hangi entity'leri cikartti
-);
-CREATE REL TABLE IF NOT EXISTS HAS_MEMBER(
-    FROM Community TO Entity,    -- community hangi entity'leri icerir
-    FROM Community TO Community
-);
-CREATE REL TABLE IF NOT EXISTS HAS_EPISODE(
-    FROM Saga TO Episodic        -- saga (run grubu) hangi episode'lari icerir
-);
-CREATE REL TABLE IF NOT EXISTS NEXT_EPISODE(
-    FROM Episodic TO Episodic    -- kronolojik siralama
-);
+CREATE REL TABLE IF NOT EXISTS RELATES_TO(FROM Entity TO RelatesToNode_, FROM RelatesToNode_ TO Entity);
+CREATE REL TABLE IF NOT EXISTS MENTIONS(FROM Episodic TO Entity);
+CREATE REL TABLE IF NOT EXISTS HAS_MEMBER(FROM Community TO Entity, FROM Community TO Community);
+CREATE REL TABLE IF NOT EXISTS HAS_EPISODE(FROM Saga TO Episodic);
+CREATE REL TABLE IF NOT EXISTS NEXT_EPISODE(FROM Episodic TO Episodic);
 ```
 
-#### 29.4.1b Uc Katmanli Graf Yapisi
+#### 29.4.2 Uc Katmanli Graf Yapisi
 
 ```
-┌─────────────────────────────────────────────────────┐
-│           COMMUNITY SUBGRAPH (Gc)                    │
-│  Guclu bagli entity kümelerinin ozet temsilcileri    │
-│  Ornek: "TR Insaat Muteahhitleri", "Makine Sanayi"  │
-│  Label propagation ile otomatik kumeleme             │
-│  Community ozeti: map-reduce ile ozetleme            │
-│  Yeni entity eklendiginde dinamik guncelleme         │
-└──────────────────────┬──────────────────────────────┘
-                       │ community_member
-┌──────────────────────▼──────────────────────────────┐
-│         SEMANTIC ENTITY SUBGRAPH (Gs)                │
-│  Episode'lardan cikarilan varliklar ve iliskiler     │
-│                                                      │
-│  ENTITY DUGÜMLERI (Ns):                             │
-│    Account — canonical_id, display_name, legal_name, │
-│              employee_estimate, sector, geo          │
-│    Contact — name, title, department, seniority      │
-│    Domain — domain, verified, is_primary             │
-│    Product — name, category                          │
-│    Event — type(ihale|tesis|sertifika), date         │
-│                                                      │
-│  SEMANTIC KENARLAR (Es) — zamansal fact'ler:        │
-│    Account --EMPLOYS--> Contact                      │
-│      fact: "Alarko employs Izzet Garih as Chairman" │
-│      valid_at: 2020-01-01, invalid_at: null         │
-│    Account --HAS_DOMAIN--> Domain                    │
-│    Contact --REACHABLE_VIA--> ContactMethod          │
-│      fact: "Izzet reachable via info@alarko.com.tr" │
-│      confidence: 0.3 (generic email)                 │
-│    Account --OBSERVED_SIGNAL--> Signal               │
-│    Account --USES_PRODUCT--> Product (tech-stack)    │
-│    Account --PARTICIPATED_IN--> Event                │
-│    Touch --SENT_TO--> Contact                        │
-│    Reply --IN_RESPONSE_TO--> Touch                   │
-│                                                      │
-│  Her kenar (fact) sunlari tasir:                     │
-│    t_valid: gercekligin basladigi tarih              │
-│    t_invalid: gercekligin bittigi tarih (null=hala)  │
-│    t'_created: sisteme giris tarihi                  │
-│    t'_expired: sistemde gecersiz kilinma tarihi      │
-│    source_episode_id: hangi episode'dan geldi        │
-│    confidence: 0.0-1.0                               │
-└──────────────────────┬──────────────────────────────┘
-                       │ extracted_from
-┌──────────────────────▼──────────────────────────────┐
-│           EPISODE SUBGRAPH (Ge)                      │
-│  Ham girdi verileri — kayipsiz (non-lossy) depo     │
-│                                                      │
-│  Episode turleri:                                    │
-│    message: Konusma mesajlari, e-posta yanitlari    │
-│    text: Site HTML icerigi, dizin listesi metni      │
-│    json: Yapilandirilmis API ciktilari, CRM verisi  │
-│                                                      │
-│  Her episode sunlari tasir:                          │
-│    content: ham metin/JSON                           │
-│    actor: kim uretti (scraper, LLM, kullanici)       │
-│    t_ref: referans zaman damgasi                     │
-│    source: kaynak (TMB, web_search, site_html, vb.)  │
-│                                                      │
-│  Episode → Entity baglantilari cift yonlu:           │
-│    Episode'dan entity'ye: "bu episode sunu cikartti" │
-│    Entity'den episode'a: "bu entity su kaynaktan"    │
-└─────────────────────────────────────────────────────┘
+COMMUNITY SUBGRAPH (Gc)
+  Label propagation ile otomatik kumeleme
+  Ornek: "TR Insaat Muteahhitleri", "Makine Sanayi"
+         |
+SEMANTIC ENTITY SUBGRAPH (Gs)
+  Entity turleri: Account, Contact, Domain, ContactMethod, Signal, Product, Event
+  Kenarlar (zamansal fact'ler):
+    EMPLOYS, HAS_DOMAIN, REACHABLE_VIA, OBSERVED_SIGNAL,
+    USES_PRODUCT, PARTICIPATED_IN, SENT_TO, REPLIED_TO
+  Her kenar: valid_at, invalid_at, confidence, source_episode_id
+         |
+EPISODE SUBGRAPH (Ge)
+  Ham girdi verileri: text (site/dizin), json (API/LLM), message (reply/bounce)
+  Kayipsiz depolama, kaynak izlenebilirligi
 ```
 
-#### 29.4.2 Zamansal Yonetim (Temporal Management)
+#### 29.4.3 Zamansal Yonetim
 
-Graphiti'nin en kritik farki: **edge invalidation**. Yeni bilgi geldiginde
-eski bilgiyi silmez, gecersiz kilar (invalidate). Ornek:
+Yeni bilgi geldiginde eski bilgi silinmez, gecersiz kilinir (invalidate):
 
 ```
 Zaman 1: "Ali Vural is CEO of ABC Ltd"
-  → Edge: Ali --WORKS_AT--> ABC, title=CEO
-    valid_at: 2023-01, invalid_at: null
+  → Edge: valid_at: 2023-01, invalid_at: null
 
-Zaman 2: "Ali Vural left ABC Ltd, joined XYZ Inc as CTO"
-  → Eski edge guncellenir: invalid_at = 2025-03
-  → Yeni edge: Ali --WORKS_AT--> XYZ, title=CTO
-    valid_at: 2025-03, invalid_at: null
-
-Sonuc: Her iki iliski de grafta kalir.
-Sorguda "Ali simdi nerede?" → XYZ (invalid_at = null)
-Sorguda "Ali 2024'te neredeydi?" → ABC (tarih araligina gore)
+Zaman 2: "Ali Vural left ABC, joined XYZ as CTO"
+  → Eski edge: invalid_at = 2025-03
+  → Yeni edge: valid_at: 2025-03, invalid_at: null
 ```
 
-Bu, prospecting icin KRITIK: Insanlar is degistirir, sirketler el degistirir,
-e-postalar gecersiz olur. Geleneksel statik graf bunu yonetemez.
-
-#### 29.4.3 Episode Turleri ve Kaynak Esleme
-
-Prospecting pipeline'daki her veri kaynagi bir episode turune eslesir:
-
-| Kaynak | Episode Turu | Actor | Ornek Icerik |
-|--------|-------------|-------|--------------|
-| TMB dizin taramasi | text | scraper:tmb | "ALARKO CONTRACTING GROUP, Chairman: Izzet Garih, web: alarko.com.tr" |
-| ASMUD uye listesi | text | scraper:asmud | "FERNAS INSAAT A.S., tel: ..., email: ankaramerkez@fernas.com.tr" |
-| Site HTML | text | scraper:site | "Hakkimizda... 50 yillik deneyim... altyapi ve insaat" |
-| Web arama sonucu | json | search:brave | {"title": "...", "url": "...", "snippet": "..."} |
-| LLM sirket uretimi | json | llm:codex | {"company": "...", "domain": "...", "reason": "..."} |
-| LLM profil zenginlestirme | json | llm:codex | {"summary": "...", "pain_points": [...]} |
-| E-posta yaniti | message | reply:email | "Tesekkurler, su an icin ihtiyacimiz yok" |
-| Bounce bildirimi | json | system:smtp | {"type": "hard_bounce", "email": "..."} |
-| Kullanici duzenleme | message | user:operator | "Bu kisi artik CEO degil, CFO olmus" |
-
-Her episode Graphiti'ye `add_episode()` ile gonderilir. Graphiti sirasiyla:
-1. **Entity extraction** — LLM ile varlik cikarma (son 4 mesaj baglam)
-   + reflexion teknigi ile hallucination azaltma
-2. **Entity resolution** — embedding cosine similarity + fulltext arama
-   ile mevcut entity esleme, LLM ile dogrulama
-3. **Fact extraction** — entity ciftleri arasindaki iliskileri cikarma,
-   her fact icin anahtar yuklem (predicate) olusturma
-4. **Fact resolution** — ayni entity cifti arasindaki mevcut fact'lerle
-   karsilastirma, duplicate tespiti
-5. **Temporal extraction** — t_ref referans zamani ile mutlak/goreli
-   tarih cikarma, celisen fact'lerin invalidation'i
-6. **Community detection** — label propagation ile kumeleme,
-   yeni entity eklendiginde dinamik guncelleme
-
-#### 29.4.4 Arama ve Geri Getirme
-
-Graphiti'nin dahili arama sistemi 3 yontemi birlestirerek kullanir:
+#### 29.4.4 Prospecting Ontolojisi
 
 ```python
-# Graphiti search API — tek cagirim, 3'lu hibrit arama
-results = await graphiti.search(
-    query="insaat sektoru CEO'lari Turkiye",
-    group_ids=["prospect_run_2026_03_26"],
-    num_results=20,
-    search_config=SearchConfig(...)  # opsiyonel: ince ayar
-)
-# results.edges → fact'ler (valid_at/invalid_at ile)
-# results.nodes → entity'ler (name + summary)
-# results.communities → topluluk ozetleri
-
-# Dahili akis:
-# f(sorgu) = constructor( reranker( search(sorgu) ) )
-
-# search(sorgu) = {
-#   cosine_similarity: Entity name_embedding + fact_embedding uzerinden
-#   bm25_fulltext: Entity name + fact metni uzerinden (Kuzu FTS)
-#   breadth_first: Bulunan entity'lerin n-hop komsulugu
-# }
-
-# reranker:
-#   RRF (Reciprocal Rank Fusion) — 3 arama sonucunu birlestirme
-#   + episode-mentions — sik bahsedilen = daha erisilebilir
-#   + opsiyonel cross-encoder — OpenAI/BGE/Gemini reranker
-
-# constructor: FACTS + ENTITIES + COMMUNITIES → context string
-```
-
-Bu 3'lu arama, prospecting'in farkli ihtiyaclarini karsilar:
-- **Semantik arama**: "insaat sektoru CEO'lari" → anlam bazli esleme
-- **Tam metin arama**: "alarko.com.tr" → kesin esleme
-- **Graf yurume**: Alarko'nun tum contact'lari, domain'leri, sinyalleri → baglam
-
-#### 29.4.5 Prospecting Ontolojisi
-
-Ontoloji tanimi, Graphiti'nin entity ve edge extraction sirasinda hangi
-tipleri arayacagini belirler. Graphiti 29.4.1'deki Kuzu semasini otomatik
-olusturur. Biz ek olarak LLM extraction prompt'larina ontoloji bilgisini
-enjekte ediyoruz:
-
-```python
-# Prospecting ontoloji tanimi (Graphiti kullanimi)
-# Graphiti'nin Kuzu driver'i su semavi otomatik olusturur:
-#   Episodic (uuid, name, group_id, content, valid_at, ...)
-#   Entity (uuid, name, labels[], summary, attributes, name_embedding[])
-#   Community (uuid, name, summary, name_embedding[])
-#   RelatesToNode_ (uuid, fact, fact_embedding[], valid_at, invalid_at, ...)
-#
-# Biz entity extraction prompt'una su ontoloji bilgisini ekliyoruz:
-
 PROSPECTING_ENTITY_TYPES = """
-Entity types to extract:
-- Account: B2B target company / organization (display_name, legal_name, sector, geo, employee_estimate)
-- Contact: Person at a target company, potential buyer (full_name, title, seniority, department)
-- Domain: Web domain owned by an account (domain, is_primary, verified)
+- Account: B2B target company (display_name, legal_name, sector, geo, employee_estimate)
+- Contact: Person at target company (full_name, title, seniority, department)
+- Domain: Web domain owned by account (domain, is_primary, verified)
 - ContactMethod: Communication channel (channel_type: email|phone|linkedin, value, confidence)
 - Signal: Observable business signal (signal_type, text, source, observed_at)
-- Event: Business event like tender, new facility, certification (event_type, date)
+- Event: Business event (event_type, date)
 """
 
 PROSPECTING_EDGE_TYPES = """
-Relationship types to extract:
-- EMPLOYS: Account employs a Contact (with title attribute)
-- HAS_DOMAIN: Account owns a Domain
-- REACHABLE_VIA: Contact reachable through a ContactMethod
-- OBSERVED_SIGNAL: Signal observed for an Account
-- USES_PRODUCT: Account uses a Product (tech-stack)
-- PARTICIPATED_IN: Account participated in an Event
+- EMPLOYS: Account employs Contact (with title)
+- HAS_DOMAIN: Account owns Domain
+- REACHABLE_VIA: Contact reachable through ContactMethod
+- OBSERVED_SIGNAL: Signal observed for Account
+- USES_PRODUCT: Account uses Product (tech-stack)
+- PARTICIPATED_IN: Account participated in Event
 """
-
-# Bu ontoloji Graphiti'nin entity/fact extraction prompt'larina
-# ek context olarak eklenir (Graphiti custom prompt destegi var)
 ```
 
-#### 29.4.6 Gercek Zamanli Guncelleme
+#### 29.4.5 Arama ve Geri Getirme
 
-Her pipeline asamasinda ortaya cikan veri, Graphiti'ye episode olarak
-batch halinde gonderilir. Graphiti her episode icin 29.4.3'teki 6 adimli
-isleme zincirini otomatik calistirir:
+Graphiti 3 yontemi birlestirir:
+- **Cosine similarity**: name_embedding + fact_embedding
+- **BM25 fulltext**: Entity name + fact metni
+- **BFS graf yurume**: Bulunan entity'lerin n-hop komsulugu
 
-```python
-# OpenFang → Graphiti entegrasyonu (MCP veya subprocess)
+Sonuclar RRF (Reciprocal Rank Fusion) ile birlestirilir.
 
-from graphiti_core import Graphiti
-from graphiti_core.driver.kuzu_driver import KuzuDriver
-from graphiti_core.nodes import EpisodeType
-from graphiti_core.llm_client import OpenAIClient  # veya AnthropicClient
-
-# Baslangicta: Kuzu embedded DB ile offline graf olustur
-driver = KuzuDriver(db='~/.openfang/data/prospect_graph.kuzu')
-graphiti = Graphiti(driver=driver, llm_client=OpenAIClient())
-
-# Pipeline sirasinda: Episode ekle
-await graphiti.add_episode(
-    name="TMB member: Alarko",
-    episode_body="ALARKO CONTRACTING GROUP, Chairman: Izzet Garih, web: alarko.com.tr",
-    source=EpisodeType.text,
-    source_description="TMB members directory scrape",
-    reference_time=datetime.now(),
-    group_id="prospect_run_2026_03_26"
-)
-# Graphiti OTOMATIK olarak:
-# → "Alarko" Account entity cikarir/esler
-# → "Izzet Garih" Contact entity cikarir
-# → EMPLOYS edge olusturur (valid_at=now)
-# → Community gunceller ("TR Insaat Muteahhitleri")
-
-# Bounce geldiginde:
-await graphiti.add_episode(
-    name="Bounce: old@alarko.com.tr",
-    episode_body='{"type": "hard_bounce", "email": "old@alarko.com.tr"}',
-    source=EpisodeType.json,
-    source_description="SMTP bounce notification",
-    reference_time=datetime.now(),
-)
-# → REACHABLE_VIA edge invalidate edilir (invalid_at=now)
-
-# Arama:
-results = await graphiti.search(
-    query="insaat sektoru CEO'lari Turkiye",
-    group_ids=["prospect_run_2026_03_26"],
-    num_results=20
-)
-# → facts + entities + communities doner
-```
-
-**Gercek pipeline ornekleri:**
-```
-TMB taramasi → 8 uye buldu
-  → 8 text episode, Graphiti.add_episode() ile batch
-  → Graphiti: entity extraction + resolution + community update
-
-Site HTML zenginlestirme → "Izzet Garih, Chairman" buldu
-  → 1 text episode
-  → Graphiti: Contact entity esler, EMPLOYS edge olusturur
-
-Bounce geldi
-  → 1 json episode
-  → Graphiti: REACHABLE_VIA edge invalidate (invalid_at=now)
-
-Kullanici duzenleme: "Bu kisi artik CEO degil"
-  → 1 message episode
-  → Graphiti: eski EMPLOYS fact invalidate, yeni fact olustur
-```
-
-#### 29.4.7 Avantajlar vs Mevcut SQLite Modeli
-
-| Ozellik | Mevcut (SQLite JSON) | Graphiti + Kuzu Embedded |
-|---------|---------------------|------------------------|
-| Iliski takibi | Yok (flat tablo) | Tam graf: Entity → RelatesToNode_ → Entity |
-| Zamansal degisim | Upsert (eski kaybolur) | Bi-temporal: valid_at/invalid_at + created_at/expired_at |
-| Entity resolution | Domain bazli dedup | Embedding cosine + fulltext + LLM dogrulama |
-| Arama | SQL LIKE | Cosine similarity + BM25 fulltext + BFS graf yurume |
-| Buying committee | Tek primary_contact | Coklu Contact per Account, her biri ayri entity |
-| Community/kumeleme | Yok | Label propagation ile otomatik, dinamik guncelleme |
-| Kaynak izleme | Yok | Episode → Entity cift yonlu index (provenance) |
-| Depolama | Tek SQLite dosyasi | Kuzu dosya-bazli DB (sunucusuz, SQLite gibi) |
-| Dis bagimllik | Yok | graphiti-core Python + kuzu embedded (tek dosya) |
-| Sinyal birikimi | matched_signals[] string | Episode → fact → entity zinciri |
-| Kaynak izleme | Yok | Episode → entity cift yonlu index |
-| Community/kumeleme | Yok | Otomatik label propagation |
-| Holding/istirak | Yok | Account → Account iliskileri |
-| Olceklenebilirlik | Tek SQLite dosyasi | Neo4j backend, dagitik |
-
-### 29.5 Decision Engine (5 Eksenli)
+### 29.5 Decision Engine (5 Eksenli Skor Formulleri)
 
 ```
 FitScore:
-  sektor_esleme * 0.3
-  + buyukluk_esleme * 0.2
-  + cografya_esleme * 0.2
-  + site_icerik_esleme * 0.15
-  + dizin_uyelik * 0.15
+  sektor_esleme * 0.3 + buyukluk_esleme * 0.2 + cografya_esleme * 0.2
+  + site_icerik_esleme * 0.15 + dizin_uyelik * 0.15
 
 IntentScore:
-  yeni_tesis_sinyali * 0.3
-  + ihale_sinyali * 0.3
-  + buyume_sinyali * 0.2
-  + web_aktivite * 0.2
+  yeni_tesis_sinyali * 0.3 + ihale_sinyali * 0.3
+  + buyume_sinyali * 0.2 + web_aktivite * 0.2
 
 ReachabilityScore:
-  kisisel_email * 0.35
-  + linkedin_profil * 0.25
-  + telefon * 0.2
-  + gercek_kisi_adi * 0.1
-  + dogrulanmis_unvan * 0.1
+  kisisel_email * 0.35 + linkedin_profil * 0.25 + telefon * 0.2
+  + gercek_kisi_adi * 0.1 + dogrulanmis_unvan * 0.1
 
 DeliverabilityRisk:
-  bounce_gecmisi * 0.3
-  + domain_itibari * 0.3
-  + generic_email * 0.2
-  + sender_health * 0.2
+  bounce_gecmisi * 0.3 + domain_itibari * 0.3
+  + generic_email * 0.2 + sender_health * 0.2
 
 ComplianceRisk:
-  suppression_listesi * 0.4
-  + opt_out_gecmisi * 0.3
-  + kvkk_risk * 0.3
+  suppression_listesi * 0.4 + opt_out_gecmisi * 0.3 + kvkk_risk * 0.3
 ```
 
-**Send Gate karari:**
-- Block: DeliverabilityRisk > 0.7 VEYA ComplianceRisk > 0.5
-- Research: ReachabilityScore < 0.3
-- Nurture: IntentScore < 0.2
-- Ready to Activate: FitScore > 0.5 VE ReachabilityScore > 0.4 VE Risk < 0.5
+### 29.6 Research Workbench / Tez Motoru
 
-### 29.6 Sequence Planner
+Lead yaratmadan once TEZ olusturulur:
 
-Tek mesaj degil, **sekans**:
+```
+account_thesis:
+  why_this_account: "..."
+  why_now: "..."
+  buyer_committee:
+    - {role: "decision_maker", name: "...", confidence: 0.8}
+    - {role: "champion", name: "...", confidence: 0.5}
+    - {role: "blocker", name: null, confidence: 0.0}
+  evidence_refs: ["ev_123", "ev_456"]
+  do_not_say: ["..."]
+  recommended_channel: "email"
+  recommended_pain_angle: "saha_koordinasyon"
+  thesis_confidence: 0.7
+  thesis_status: "ready" | "needs_research" | "blocked"
+```
 
+### 29.7 Value Asset Engine (Secici)
+
+Asset otomatik degil, **earned-right icerik**.
+Kosullar: A-tier hesap + dogrulanmis trigger + dusuk risk + operator onayi.
+
+Ornek asset'ler:
+- 3 maddelik saha koordinasyon teardown'u
+- Dispatch gorunurluk check-list'i
+- Alt yuklenici koordinasyon risk notu
+- Bakim ticket gecikme mini-auditi
+- 2 sayfalik sirket-ozel operasyon brief'i
+
+CTA: PDF'yi ilk mailde eklemek yerine "istersen sana 2 sayfalik kisa analiz
+gondereyim" CTA'si.
+
+### 29.8 Sequence Planner
+
+5 adimli sekans:
 ```
 Touch 1: Kisa e-posta (kanit bazli, kisisellestirmis)
 Touch 2: Deger icerigi (teardown / case study)
@@ -5682,19 +5491,26 @@ Touch 5: Son nazik kapanis
 
 Zamanlama: Segment, persona, kanal, ilk temas sonucu,
 domain turu ve onceki engagement'a gore DINAMIK.
-Sabit 7/14 gun degil.
 ```
 
-### 29.7 Evidence-Bound Message Engine
+### 29.9 Evidence-Bound Message Engine (2 Asamali)
 
-LLM mesaj uretimi kontrollü olmali:
+Mesaj motoru kanit paketi olmadan CALISMAZ.
+
+**Asama 1 — Strateji:**
+Hangi pain, hangi trigger, hangi kanit, hangi CTA, hangi dil?
+Mesaj varyasyonu: rol, seniority, sektor, dil, sirket sinyali, itiraz turu temelli.
+
+**Asama 2 — Copy (LLM, temperature 0.4-0.6):**
 
 ```
 Girdi:
   evidence_bundle: [kanit_1, kanit_2, ...]
-  persona: {isim, unvan, sektor, aci_noktasi}
+  thesis: {neden_bu_hesap, neden_simdi, kanit_ozeti}
+  persona: {isim, unvan, sektor, aci_noktasi, rol_tipi}
   sequence_step: 1
   language: "tr"
+  variant_config: {cta_type, tone, pain_angle}
 
 Cikti:
   subject: "..."
@@ -5704,157 +5520,320 @@ Cikti:
   evidence_ids: ["ev_123", "ev_456"]
   risk_flags: ["generic_email", "unverified_name"]
   language_confidence: 0.95
-  similarity_score: 0.12  // onceki mesajlara benzerlik
+  similarity_score: 0.12
+  variant_id: "a1"
 ```
 
-Her mesaj: iddialarini hangi kanita dayandirdigini soyler.
-Spammy phrasing kontrolu + compliance footer + opt-out + 2 varyant.
+### 29.10 Sendability / Compliance Guardrail
 
-### 29.8 Sendability / Compliance Guardrail
+**Email dogrulama (Bounce Shield):**
+- Syntax kontrolu (RFC 5322)
+- MX kayit kontrolu
+- Domain health skoru (yas, SPF/DKIM kaydi, blacklist durumu)
+- Historical bounce kontrolu
+- Suppression ledger kontrolu
+- Selective verifier (catch-all domainlerde)
 
-**Email tarafinda:**
+**Email gonderim:**
 - Sender mailbox pool (tek adres degil)
 - Brand domain / sending subdomain ayrimi
 - Mailbox warm-state takibi
 - Daily cap PER MAILBOX (global degil)
 - Per-domain throttle
-- Bounce/complaint suppression
-- Unsubscribe ledger
 - SPF + DKIM + DMARC zorunlu
+- One-click unsubscribe header (RFC 8058)
 - 0.3% alti spam orani hedefi
 
-**KVKK / Ticari Elektronik Ileti:**
+**KVKK / Ticari Elektronik Ileti (6563 sayili Kanun):**
 - Tacir/esnaf alicilara onceden onay istisnasi VAR
-- AMA ret hakki kullanildiktan sonra tekrar ileti gonderilemez
-- Onay istemek icin ayrica ticari ileti atilamaz
-- opt-out, suppression, retention ve purpose logging mimarinin MERKEZINDE
+- Ret hakki kullanildiktan sonra tekrar ileti gonderilemez — KALICI suppress
+- Her iletide acik gonderici kimligi + kolay ret mekanizmasi zorunlu
 
-### 29.9 Learning Loop (Feedback Brain)
+**Kanal hiyerarsisi:**
+- **Email:** birincil otomasyon kanali
+- **Phone task:** yuksek fit + telefon confidence yuksekse operator gorevi
+- **LinkedIn:** partner/approved API hatti VEYA operator-asist (otomasyon YOK)
+- **Ads / gated content:** yuksek degerli ama dusuk reachability hesaplarda
 
-Sistem sunlari ingest etmeli:
+### 29.11 Learning Loop v2 (Signal-to-Meeting Feedback Brain)
+
+Learning katmani sadece "kim cevap verdi" degil; "neden cevap verdi, neden
+bazi dogru hesaplari kacirdik, hangi sinyalin etkisi kisa/uzun vadeli, bir
+daha neyi farkli yapacagiz?" seviyesinde calisir.
+
+#### A) Outcome Collector
 
 | Olay | Siniflandirma | Aksiyon |
 |------|---------------|---------|
 | Hard bounce | deliverability_fail | Suppression + score guncelle |
 | Soft bounce | deliverability_warn | Retry sonra suppress |
+| No reply | silence | Log + sequence devam |
+| Open / click | engagement_signal | Sequence hizlandir |
 | Auto reply | neutral | Parse + log |
 | Unsubscribe | compliance_action | Kalici suppress |
+| Wrong person | enrichment_fail | Contact guncelle |
+| Forwarded | outcome_redirect | Yeni contact olustur |
 | Positive reply | outcome_positive | Meeting akisina al |
 | Referral | outcome_redirect | Yeni contact olustur |
-| Wrong person | enrichment_fail | Contact guncelle |
 | Not now | timing_miss | Nurture kuyuguna al |
 | Interested | outcome_warm | Hizlandir |
 | Meeting booked | outcome_success | CRM sync |
+| Closed won | revenue_success | Full attribution |
+| Closed lost | revenue_fail | Lost reason analysis |
 
-Bu veriler 3 yere akar:
-1. **Suppression list** — bir daha gonderme
+Outcome'lar 3 yere akar:
+1. **Suppression** — bir daha gonderme
 2. **Score calibration** — hangi sinyaller gercekten ise yariyor?
-3. **Prompt/sequence experimentation** — hangi mesaj/sekans daha iyi?
+3. **Policy/sequence experimentation** — hangi mesaj/zamanlama daha iyi?
+
+#### B) Signal Snapshot Builder
+
+Touch aninda hesapta gorulebilen TUM sinyallerin snapshot'ini dondurur.
+"O gun ne biliyorduk?" sorusunun cevabi kaybolmaz.
+
+```
+outcome_attribution_snapshot:
+  touch_id: "t_8832"
+  snapshot_at: "2026-04-15T10:30:00Z"
+  account_id: "acc_1204"
+  score_at_touch: {fit: 0.72, intent: 0.65, reach: 0.55, deliv_risk: 0.15, comp_risk: 0.08}
+  active_signals: ["sig_901", "sig_902", "sig_905"]
+  unused_signals: ["sig_903", "sig_904"]
+  thesis_id: "thesis_441"
+  sequence_variant: "a1"
+  message_variant: "v2_pain_saha"
+  channel: "email"
+  contextual_factors: {season: "spring", budget_quarter: "Q2_start", industry_pressure: "regulation_deadline_2026_06"}
+```
+
+#### C) Signal Effect Horizon Classifier
+
+Her sinyalin etki ufkunu belirler:
+
+| Horizon | Sure | Ornek | Aksiyon |
+|---------|------|-------|---------|
+| **Immediate** | 0-21 gun | Yeni ihale, operasyon arizasi, kriz, kritik ise alim | Hemen outreach |
+| **Campaign Window** | 21-90 gun | Yeni departman, dijitallesme, yeni lokasyon hazirligi | Sequence baslat |
+| **Structural** | 90+ gun | ERP donusumu, holding birlesmesi, kalici regulasyon baskisi | Priority yuksel, nurture'a al |
+
+Her sinyal icin hipotez objesi kaydi:
+```json
+{
+  "signal_type": "new_operations_manager_hire",
+  "effect_horizon": "campaign_window",
+  "why_it_matters": "Yeni operasyon yoneticileri ilk 30-90 gunde gorunurluk ve surec standardizasyonu arar.",
+  "expected_effect": "meeting_probability_up",
+  "evidence_ids": ["jobs_1832", "site_news_9921"],
+  "confidence": 0.78,
+  "expires_at": "2026-06-30"
+}
+```
+
+#### D) Missed Signal Analyzer
+
+Outcome geldikten sonra inceler:
+
+1. Kullanilan sinyaller — tez/mesajda aktif olarak kullanildi
+2. Kullanilmayan ama mevcut sinyaller — sistemde vardi, teze girmedi
+3. Sonradan bulunan sinyaller — touch'tan sonra kesfedilen
+4. Baglamsal veriler — mevsimsellik, butce donemi, bolgesel olay
+5. Sequence ve message varyanti
+
+**Ciktilar:**
+
+| Cikti | Aciklama |
+|-------|----------|
+| `validated_signals` | Gercekten ise yarayan sinyaller |
+| `false_positive_signals` | Onemli sandik ama degil |
+| `missed_signals` | Sistemde vardi ama kacirdik |
+| `timing_mistakes` | Zamanlama hatasi |
+| `persona_mismatch` | Yanlis kisi |
+| `channel_mismatch` | Yanlis kanal |
+
+#### E) Rule Proposal Sandbox
+
+Evaluator oneri uretir ama canli sisteme dogrudan YAZAMAZ:
+
+```
+Missed Signal Analyzer → Rule Proposal → Sandbox/Backtest
+→ Holdout Set (%10) → Operator Onay → Production Policy
+```
+
+Guncellenebilecek policy turleri:
+
+| Policy Turu | Ornek |
+|-------------|-------|
+| Query expansion | "is ilani aramasi" → +"operasyon muduru" +"saha yoneticisi" |
+| Source priority | Kariyer.net sinyali: 0.6 → 0.8 |
+| Signal weight | "yeni tesis" sinyali: IntentScore +300 → +450 |
+| Pause/suppress | "Q4 son hafta → bekleme moduna al" |
+| Asset esleme | "saha koordinasyon" pain → teardown PDF |
+| Buyer-role oncelikleri | "operasyon muduru > CEO" (bu segmentte) |
+| Timing kurallari | "immediate sinyal → 48 saat icinde temas" |
+
+Tum policy degisiklikleri **VERSIONED** — serbest prompt mutasyonu yok.
+
+#### F) Calibration + Exploration Manager
+
+Outbound'da sadece temas edilen hesaplarda sonuc gorunur — sistem kendi
+onyargisini uretir. Bunu kirmak icin exploration bucket:
+
+```
+Gunluk gonderim: 100
+  ├── %85-90: Exploitation (en yuksek skorlu)
+  └── %10-15: Exploration (orta skor ama ilginc)
+```
+
+Exploration kriterleri:
+- Alisilagelmis disi sinyal kombinasyonu
+- Yeni kaynak/source pack'ten gelen ilk hesaplar
+- Farkli sektor/cografya/buyer role denemesi
+- Denenmemis message variant
+
+#### G) Context Warehouse
+
+| Baglamsal Veri | Nereye Akar |
+|----------------|-------------|
+| Tatil takvimi | Timing optimizer |
+| Mevsimsellik / bolgesel yogunluk | Timing optimizer |
+| Hava durumu / afet | Message framing + send gate |
+| Regulasyon tarihleri | Account priority |
+| Ceyrek sonu / butce donemi | Timing optimizer |
+| Sektorel ekonomik baskilar | Account priority + message |
+| Fuar / etkinlik takvimi | Channel optimizer + timing |
+| CRM gecmisi | Score calibration |
+| Mail deliverability gecmisi | Send gate |
+
+#### Tam Learning Akisi
+
+```
+[Her Touch Gonderimi]
+    → [B: Signal Snapshot Builder] (sinyalleri, skoru, baglami dondur)
+    → [A: Outcome Collector] (bounce/reply/meeting/closed)
+    → [C: Effect Horizon Tagger] (immediate/campaign/structural)
+    → [D: Missed Signal Analyzer] (validated/false_positive/missed)
+    → [E: Rule Proposal Sandbox] (oner → backtest → holdout → production)
+    → [F: Calibration + Exploration] (%85-90 exploit + %10-15 explore)
+    → [Policy Registry guncelleme] (versioned)
+```
 
 ---
 
-## 30. GUNCEL IMPLEMENTASYON PLANI (v4 — ChatGPT Pro + Gemini + Gemini Deep Research birlesmis)
-
-> Bu plan, uc ayri uzman degerlendirmesinin sentezlenmis halidir:
-> - ChatGPT Pro: Mimari yeniden yapilandirma (account graph, 3 motor ayrimi, ogrenme dongusu)
-> - Gemini: Taktiksel detaylar (PipelineStage trait, tier-based kesif, 2-asamali mesaj, UI sekmeleri)
-> - Gemini Deep Research: Stratejik vizyon (niyet motoru, multi-agent swarm, deger uretimi, deliverability zirhi, omnichannel durum makinesi)
-> Catisma durumunda daha spesifik/uygulanabilir olan tercih edilmistir.
+## 30. IMPLEMENTASYON PLANI (61 Madde, 5 Faz)
 
 ### Faz 0: Kan Kaybini Durdur (0-7 Gun)
 
 | # | Is | Detay | Neden Acil |
 |---|------|-------|-----------|
-| 1 | Consumer domain gate TUM kod yollarinda | `is_valid_company_domain()` fonksiyonu: `!is_consumer_email_domain(d) && !is_blocked_company_domain(d)` — her dizin tarayici ciktisinda zorunlu | Spam riski (gmail.com prospect) |
-| 2 | `normalize_and_classify_email()` gateway | Tek giris noktasi: Personal / Generic / Role / Consumer / Invalid siniflandirmasi. info@ = Generic, lead olusturma oncesi TUM kod yollarinda zorunlu | info@ lead %0 |
+| 1 | Normalize + Verify + Classify Gateway | TUM veri icin tek normalization giris noktasi: domain validity, email classification (Personal/Generic/Role/Consumer/Invalid), phone normalization (E.164), kisi adi placeholder filtresi, legal entity resolution. `is_valid_company_domain()` + `normalize_and_classify_email()` + `normalize_phone()` + `is_placeholder_name()` — her kaynak adapter ciktisinda ZORUNLU | Tum veri kalite sorunlarinin koku |
+| 2 | Consumer domain gate TUM kod yollarinda | Gateway'in parcasi: `!is_consumer_email_domain(d) && !is_blocked_company_domain(d)` — her dizin tarayici ciktisinda zorunlu | Spam riski (gmail.com prospect) |
 | 3 | Turkce placeholder listesi genislet | +8 terim: "baskanin mesaji", "genel mudurun mesaji", "hakkimizda", "vizyonumuz", "misyonumuz", "iletisim", "kariyer", "basin" | Sahte kisi adi |
 | 4 | Telefon aktarimi | `phone: None` → `phone: candidate_phone.clone()` + `FreeDiscoveryCandidate`'e `phone: Option<String>` alani | Kayip veri (~15 telefon) |
 | 5 | Idempotency key | `account_domain + contact_name + channel + sequence_step` UNIQUE partial index + outbox pattern | Cift gonderim |
-| 6 | LinkedIn auto-send KAPAT | `send_linkedin()` → sadece operator dashboard'da "LinkedIn'de su mesaji gonder" gorevi olustur, tarayici otomasyonu kaldir | TOS ihlali riski |
-| 7 | Async job + stage checkpointing | `run_generation()` icin `PipelineStage` trait: her asama DB'ye state yazar, hata durumunda sadece o asama retry edilir, API sadece job_id dondurur + progress endpoint | 240sn timeout |
-| 8 | Suppression tablosu + unsubscribe ledger | `suppressions(contact_method_id, reason, suppressed_at)` + her teslimat oncesi kontrol | Compliance temeli |
+| 6 | LinkedIn auto-send KAPAT + browser automation TEMIZLE | `send_linkedin()` → sadece operator gorevi olustur. Playwright/DOM-click tabanli TUM tarayici otomasyon kodunu codebase'den temizle | TOS ihlali riski |
+| 7 | Async job + stage checkpointing | `run_generation()` parcala: `PipelineStage` trait ile durumlu is akisi + stage checkpointing + kuyruk bazli orkestrasyon. Her asama DB'ye state yazar, hata durumunda sadece o asama retry edilir, API sadece job_id dondurur + progress endpoint | 240sn timeout + gozlemlenebilirlik |
+| 8 | Suppression tablosu + unsubscribe ledger | `suppressions(contact_method_value, reason, source_outcome_id, suppressed_at, permanent)` + her teslimat oncesi kontrol. Ret hakki kullanildiktan sonra KALICI suppress (6563 sayili Kanun) | Compliance temeli |
 | 9 | Field-level confidence semasi | company_name_confidence, domain_confidence, contact_name_confidence, title_confidence, email_confidence, linkedin_confidence, phone_confidence — her alan ayri | Veri kalitesi |
-| 10 | Frontend/backend target_geo duzeltme | Rust default "US" → "TR" veya JS default kaldir, tek kaynak sema | Schema drift |
+| 10 | Frontend/backend target_geo duzeltme | Rust default "US" → "TR" veya JS default kaldir, tek kaynak sema (contract-first) | Schema drift |
 | 11 | Scraper health check | Her tarayici 0 sonuc dondurse alert + sonraki run'da auto-skip + parse_health metrigi | Sessiz kirilma |
-| 12 | Gonderim oncesi Bounce Shield | Her e-posta gonderilmeden once MX kayit kontrolu + SMTP VRFY ping. Gecemeyen (catch-all, gecersiz) mailler KESINLIKLE reddedilir, hedef LinkedIn manuel asist'e kaydirilir | Blacklist onleme |
-| 13 | Gelen kutusu rotasyonu altyapisi | Ana domain (`@machinity.com`) ile dogrudan gonderim YASAKLA. Alt domainler (`getmachinity.com`, `trymachinity.com` vb.) uzerinden 3-5 mailbox ile yuk dengeleme. Her mailbox gunluk cap + warm-up state takibi | Domain itibari |
+| 12 | Bounce Shield | Syntax (RFC 5322) + MX kayit kontrolu + domain health skoru + historical bounce kontrolu + suppression kontrolu + selective verifier (catch-all domainlerde). Gecemeyen mailler → LinkedIn manuel asist'e kaydirilir | Blacklist onleme |
+| 13 | Gelen kutusu rotasyonu altyapisi | Ana domain ile dogrudan gonderim YASAKLA. Alt domainler uzerinden 3-5 mailbox ile yuk dengeleme. Her mailbox gunluk cap + warm-up state takibi | Domain itibari |
+| 14 | SPF + DKIM + DMARC + One-click unsubscribe | Tum gonderim subdomainleri icin sender-authentication ZORUNLU. RFC 8058 one-click unsubscribe header | Sender itibari |
 
-### Faz 1: Revenue Cekirdegi (7-21 Gun)
-
-| # | Is | Detay | Etki |
-|---|------|-------|------|
-| 14 | Account graph — Graphiti + Kuzu embedded | `graphiti-core` (Apache 2.0, v0.28.2) acik kaynak kutuphanesi + `KuzuDriver(db='~/.openfang/data/prospect_graph.kuzu')` embedded graf DB. 3 katmanli hiyerarsi (Episode → Semantic Entity → Community), bi-temporal model, otomatik entity/fact extraction + resolution + invalidation. OpenFang entegrasyonu: Graphiti MCP server modu veya Python subprocess. Dis bulut servisi YOK, tamamen offline. Detaylar: Bolum 29.4 | Lead flat tablo → temporal account graph |
-| 13 | Discovery ve Activation ayirimi | Discovery Reservoir (surekli doldurulan hesap evreni) + Research Queue (eksik kimlik tamamla) + Activation Queue (bugun gonderilecek en iyiler). `daily_target` sadece gonderimi sinirlar, kesfii degil | Dogru optimizasyon |
-| 14 | 5 eksenli puanlama | FitScore, IntentScore, ReachabilityScore, DeliverabilityRisk, ComplianceRisk — formulleri Bolum 29.5'te | Gercek karar kalitesi |
-| 15 | Send Gate mantigi | Block (risk>0.7), Research (reach<0.3), Nurture (intent<0.2), Ready (fit>0.5 & reach>0.4 & risk<0.5) | Risk bazli routing |
-| 16 | Reply/bounce classification ingest | hard_bounce, soft_bounce, auto_reply, unsubscribe, positive_reply, referral, wrong_person, not_now, interested, meeting_booked — her biri suppression/score/experiment'a akar | Ogrenme temeli |
-| 17 | Sender pool + mailbox policy | Birden fazla gonderen mailbox, daily cap PER MAILBOX, warm-state takibi, brand domain / sending subdomain ayrimi | Deliverability |
-| 18 | Evidence provenance + kaynak guvenilirlik hiyerarsisi | Her veri parcasinin kaynagi + guveni. Cakisma cozumu: Dizin uyelik=0.9, Site HTML=0.8, Web arama=0.6, LLM uretimi=0.4. Yuksek guven kazanir | Denetlenebilirlik |
-| 19 | Tier-based kesif modeli | Tier 1 (5 sirket): tam zenginlestirme (site+OSINT+LLM+LinkedIn+tel+email pattern). Tier 2 (10): standart (site+OSINT+LLM). Tier 3 (5): temel bilgi. Kullanici Tier'i gorur | Derinlik > genislik |
-| 20 | 4 katmanli LinkedIn arama | 1: `site:linkedin.com/company/ "{domain_adi}"` 2: `"{sirket_transliterated}"` 3: `"{sirket}" linkedin CEO` 4: `site:tr.linkedin.com "{domain}"` — basarisiz olana kadar sirala | %0 → %30 LinkedIn |
-| 21 | E-posta pattern tahmin motoru | ad.soyad@, a.soyad@, adsoyad@, ad@ + MX kayit kontrolu + opsiyonel SMTP VRFY. Kisi adi bilinip email yoksa otomatik calisir | %0 → %20 kisisel email |
-| 22 | Turkce site sayfa genisletmesi | /yonetim, /ekibimiz, /yonetim-kurulu, /iletisim, /bize-ulasin, /referanslarimiz, /projelerimiz, /haberler + sitemap parsing onceliklendirme | Daha fazla veri |
-| 23 | Niyet motoru: Is ilani sinyalleri | Kariyer.net / LinkedIn Jobs taramasi: Hedef firma "Saha Operasyon Yoneticisi" ariyorsa operasyonel aci noktasi var. IntentScore'a +500 puan. En guclu miknatıs cekimi | Statik veri → canli niyet |
-| 24 | Niyet motoru: Tech-stack dedektifi | Wappalyzer/BuiltWith mantigi ile hedef sitelerin DOM taramas. Rakip urun kullaniliyor mu? Strateji "Rakip Degistirme (Rip & Replace)" acisina doner | Rekabet avantaji |
-
-### Faz 2: Ogrenen Sistem (21-45 Gun)
+### Faz 1: Truth + Decision Layer (7-21 Gun)
 
 | # | Is | Detay | Etki |
 |---|------|-------|------|
-| 23 | 2 asamali LLM mesaj uretimi | Asama 1: Strateji (hangi aci noktasi, hangi kanit, hangi CTA?). Asama 2: Yazim (maks 120 kelime, sirket-ozel gancho, temperature 0.4-0.6). Her mesaj: claims[] + evidence_ids[] + risk_flags + similarity_score | Mesaj kalitesi |
-| 24 | Sequence planner | 5 adimli sekans: (1) kisa email (2) deger icerigi (3) follow-up (4) LinkedIn manuel asist / arama gorevi (5) son kapanis. Zamanlama segment/persona/kanal/engagement'a gore DINAMIK | Tek mesaj → sekans |
-| 25 | Outcome-based score calibration | Reply/bounce/meeting verisi → hangi sinyaller gercekten ise yariyor? Puanlama agirliklarini sonuca gore ayarla | Puanlarin dogrulugu |
-| 26 | Experiment registry + prompt/sequence versioning | Her prompt ve sekans versionlanir. A/B: 2 varyant konu satiri + govde. Hangi varyant secildi + sonucu loglanir | Optimizasyon |
-| 27 | Source pack health metrikleri | Her kaynak icin: precision, freshness, parser_health, legal_mode, historical_reply_yield. 0 sonuc = alert + auto-skip | Kaynak kalite |
-| 28 | Dossier builder (kanit-bagli) | company thesis, why-now thesis, buyer committee map, top 3 pains, top 3 proofs, objections, do-not-say. Her cumlenin altinda evidence reference | Derinlik |
-| 29 | LLM hallucination dogrulama | LLM sirket uretiminden sonra: HEAD request (200=gercek), WHOIS domain yasi, LLM puani web/dizinden dusuk tutma (0.4 vs 0.8). Alternatif: LLM sorgu uretsin, sonucu web'den al | Veri guveni |
-| 30 | Islem bazli model secimi + multi-agent swarm | Veri cekimi: `gpt-4o-mini` (ucuz, hizli). Mesaj yazimi: `claude-sonnet` (empati, ritim). Strateji/dogrulama: `gpt-5.3-codex`. OpenFang Agent Loop ile 4 uzman ajan: **Arastirmaci** (headless browser + DOM→Markdown→JSON, regex'i devre disi birakir), **Psikolog** (karar verici LinkedIn ayak izinden kisilik profili: Titiz/Analitik → ROI ve sayi odakli veri, Vizyoner → buyuk resim anlatimi — mesaj tonu buna gore ayarlanir), **Yazar** (claude-sonnet ile kisisellestirmis mesaj, asla sablona benzemeyen gancho), **Uyum** (spam kelime kontrolu, uzunluk, ton, benzerlik skoru — basarisizsa Yazar'a iade eder) | Kalite + maliyet + uzmanlik ayrimi + kisilik-bazli ton |
-| 31 | Dinamik deger uretimi (miknatıs yemi) | Hedef sirkete ozel **Mikro-Rapor PDF** uretimi: LLM ile sirket verilerinden 2 sayfalik "Operasyonel Darboğaz Analizi" olustur (OpenFang `image_generate` + HTML→PDF template). Icerik: sirketin sektoru + tespit edilen aci noktalari + benchmark karsilastirma + 3 adimlik iyilestirme onerisi. Mail govdesinde sadece teaser: "Alarko'ya ozel 2 sayfalik operasyonel analiz simülasyonu hazirladik. Gondereyim mi?" — musteri "Gonder" dediginde cekim alanina girmis olur. **Bu asla satis maili degil, deger sunumudur.** | Push → Pull donusumu |
-| 32 | Geri besleme dongusu: Ton ogrenme (RLHF + Vector Memory) | Kullanici mesaj uzerinde kelime degisikligi yaptiginda (ozellikle buzkırıcı/gancho duzenlemesi), degisiklik OpenFang `SemanticStore`'a `(orijinal, duzenlenmis, baglam)` uclus olarak kaydedilir. Sonraki calismalarda Yazar Ajan, kullanicinin tercih ettigi stili (Tone of Voice) RAG mimarisiyle taklit etmeye baslar. Ek: Hizli onay ekraninda Sag Ok (onayla), Sol Ok (reddet), Yukari Ok (yeniden yaz) aksiyonlari da tercih verisi olarak loglanir — hangi mesajlar onaylandi, hangileri reddedildi, hangileri yeniden yazdirildi | Zaman icinde kisisellesen + operator tercihinden ogrenen sistem |
-| 33 | Omnichannel durum makinesi detayi | OpenFang WorkflowEngine ile: Gun 1: LinkedIn profil ziyareti (sessiz) → Gun 2: Deger e-postasi → Gun 5: Acildi ama yanitlanmadiysa LinkedIn baglanti istegi → Gun 8: Follow-up email → Gun 12: Son kapanis. Her gecis olay-gudumlü (pixel acilma, bounce, reply) | Tek atis → coklu temas |
+| 15 | Canonical Relational Core (SoT) | `accounts`, `account_aliases`, `domains`, `contacts`, `contact_methods`, `evidence`, `signals`, `score_snapshots`, `research_queue`, `activation_queue` tablolari. Detaylar: Bolum 32. Mevcut `prospect_profiles` + `leads` → yeni tablolara migration | Normalized relational model |
+| 16 | Discovery ve Activation ayirimi | Discovery Reservoir + Research Queue + Activation Queue. `daily_target` sadece gonderimi sinirlar, kesfii ASLA kesmez | Dogru optimizasyon |
+| 17 | 5 eksenli puanlama | FitScore, IntentScore, ReachabilityScore, DeliverabilityRisk, ComplianceRisk — formulleri Bolum 29.5'te. Operator her ekseni ayri gorur | Gercek karar kalitesi |
+| 18 | Send Gate mantigi | Block (risk>0.7), Research (reach<0.3), Nurture (intent<0.2), Ready (fit>0.5 & reach>0.4 & risk<0.5) | Risk bazli routing |
+| 19 | Reply/bounce classification ingest | hard_bounce, soft_bounce, no_reply, open, click, auto_reply, unsubscribe, wrong_person, forwarded, referral, interested, not_now, meeting_booked, closed_won, closed_lost — her biri suppression/score/experiment'a akar | Ogrenme temeli |
+| 19b | Signal Effect Horizon classifier | Her sinyale etki ufku ata: immediate (0-21 gun), campaign_window (21-90 gun), structural (90+ gun). Farkli horizon = farkli aksiyon. `signals` tablosuna `effect_horizon` + `expires_at` | Sinyal zamanlama zekasi |
+| 19c | Signal Rationale kaydi | Her sinyal icin "neden onemli" hipotez objesi: `why_it_matters`, `expected_effect`, `evidence_ids`, `confidence`, `expires_at` | Ogrenme temeli |
+| 20 | Sender pool + mailbox policy | Birden fazla gonderen mailbox, daily cap PER MAILBOX, warm-state takibi, brand domain / sending subdomain ayrimi | Deliverability |
+| 21 | Evidence provenance + kaynak guvenilirlik hiyerarsisi | Her veri parcasinin kaynagi + guveni. Cakisma cozumu: Dizin uyelik=0.9, Site HTML=0.8, Web arama=0.6, LLM uretimi=0.4 | Denetlenebilirlik |
+| 22 | Research Workbench / Tez motoru | Lead yaratmadan once TEZ yarat: neden bu hesap, neden simdi, buyer committee, kanitlar, soylenmeyecekler, kanal onerisi. Detaylar: Bolum 29.6 | Kanitli karar |
+| 23 | Tier-based kesif modeli | Tier 1 (5): tam zenginlestirme. Tier 2 (10): standart. Tier 3 (5): temel bilgi | Derinlik > genislik |
+| 24 | 4 katmanli LinkedIn arama | 1: `site:linkedin.com/company/ "{domain}"` 2: `"{sirket_transliterated}"` 3: `"{sirket}" linkedin CEO` 4: `site:tr.linkedin.com "{domain}"` | %0 → %30 LinkedIn |
+| 25 | E-posta pattern tahmin motoru | ad.soyad@, a.soyad@, adsoyad@, ad@ + MX kontrolu + selective verifier | %0 → %20 kisisel email |
+| 26 | Turkce site sayfa genisletmesi | /yonetim, /ekibimiz, /yonetim-kurulu, /iletisim, /bize-ulasin, /referanslarimiz, /projelerimiz, /haberler + sitemap parsing | Daha fazla veri |
+| 27 | Niyet motoru: Is ilani sinyalleri | Kariyer.net / LinkedIn Jobs taramasi: hedef firma "Saha Operasyon Yoneticisi" ariyorsa operasyonel aci noktasi var | Statik veri → canli niyet |
+| 28 | Niyet motoru: Tech-stack dedektifi | Wappalyzer/BuiltWith mantigi ile hedef sitelerin DOM taramasi. Rakip urun kullaniliyor mu? | Rekabet avantaji |
+
+### Faz 2: Activation + Learning (21-45 Gun)
+
+| # | Is | Detay | Etki |
+|---|------|-------|------|
+| 29 | 2 asamali LLM mesaj uretimi | Asama 1: Strateji (pain, trigger, kanit, CTA). Asama 2: Copy (maks 120 kelime, temperature 0.4-0.6). Her mesaj: claims[] + evidence_ids[] + risk_flags[] + similarity_score + variant_id. Kanit paketi olmadan CALISMAZ | Mesaj kalitesi |
+| 30 | Sequence planner | 5 adimli sekans: (1) kisa email (2) deger icerigi (3) follow-up (4) LinkedIn manuel asist / arama gorevi (5) son kapanis. Zamanlama DINAMIK | Tek mesaj → sekans |
+| 31 | Outcome Attribution Snapshot builder | Her touch gonderiminde tum sinyalleri, skoru, baglamsal faktorleri dondur. `outcome_attribution_snapshots` tablosu | Ogrenme temeli |
+| 32 | Missed Signal Analyzer | Outcome sonrasi: kullanilan vs kullanilmayan vs sonradan bulunan sinyaller. Her positive reply / meeting / closed-won sonrasi otomatik calisir | Ogrenmenin kalbi |
+| 33 | Rule Proposal Sandbox + versioned policy | Evaluator canli sisteme dogrudan YAZAMAZ. Proposal → backtest → holdout (%10) → operator onay → production. Policy turleri: query_expansion, source_priority, signal_weight, timing_rule, buyer_role_priority, asset_matching, pause_rule | Guvenli ogrenme |
+| 34 | Calibration + Exploration Manager | %85-90 exploitation + %10-15 exploration. Yeni kaynak, alisilagelmis disi sinyal kombinasyonu, farkli segment, denenmemis variant | Onyargi kirma |
+| 35 | Context Warehouse | Tatil takvimi, mevsimsellik, hava durumu/afet, regulasyon tarihleri, butce donemi, sektorel baskilar, fuar/etkinlik takvimi. `contextual_factors` tablosu | Zamanlama zekasi |
+| 36 | Outcome-based score calibration | Reply/bounce/meeting verisi → puanlama agirliklarini sonuca gore ayarla. Signal rationale dogrulanmasi: validated / false_positive / inconclusive | Puanlarin dogrulugu |
+| 37 | Experiment registry + prompt/sequence versioning | Her prompt ve sekans versionlanir. A/B: 2 varyant konu satiri + govde | Optimizasyon |
+| 38 | Source pack health metrikleri | Her kaynak: precision, freshness, parser_health, legal_mode, historical_reply_yield. 0 sonuc = alert + auto-skip | Kaynak kalite |
+| 39 | Dossier builder (kanit-bagli) | Tez motorunun goruntulenebilir hali: company thesis, why-now thesis, buyer committee map, top 3 pains, top 3 proofs, objections, do-not-say | Derinlik |
+| 40 | LLM hallucination dogrulama | LLM sirket uretiminden sonra: HEAD request (200=gercek), WHOIS domain yasi, LLM puani web/dizinden dusuk (0.4 vs 0.8) | Veri guveni |
+| 41 | Graph projection devreye alma | Relational core'dan Graphiti'ye event-driven projection. Neo4j/FalkorDB (production) veya Kuzu (deneysel). Temporal relation + dossier recall + community detection + buyer committee reasoning | Iliski analizi |
+| 42 | Multi-agent swarm | Veri cekimi: `gpt-4o-mini`. Mesaj: `claude-sonnet`. Strateji: `gpt-5.3-codex`. 3 ajan: **Arastirmaci** (DOM→Markdown→JSON), **Yazar** (rol/seniority/sektor bazli mesaj, kisilik profili degil), **Uyum** (spam kelime, uzunluk, ton, benzerlik — basarisizsa Yazar'a iade) | Uzmanlik ayrimi |
+| 43 | Dinamik deger uretimi (A-tier only) | Mikro-Rapor PDF sadece: A-tier + dogrulanmis trigger + dusuk risk + operator onayi. CTA: "istersen kisa analiz gondereyim" | Push → Pull (secici) |
+| 44 | Ton ogrenme (RLHF + Vector Memory) | Kullanici mesaj duzenlemesi → SemanticStore'a (orijinal, duzenlenmis, baglam) uclus. Yazar Ajan Tone of Voice'u RAG ile taklit eder | Operator'dan ogrenen sistem |
+| 45 | Omnichannel durum makinesi | Gun 1: LinkedIn ziyaret (operator-asist) → Gun 2: Email → Gun 5: Acildi ama yanit yoksa LinkedIn baglanti (operator-asist) → Gun 8: Follow-up → Gun 12: Kapanis. Olay-gudumlu gecisler | Coklu temas |
 
 ### Faz 3: UI/UX Donusumu (30-50 Gun, Faz 2 ile paralel)
 
 | # | Is | Detay | Etki |
 |---|------|-------|------|
-| 31 | Sekme bazli navigasyon | 4 sekme: Komuta Merkezi (ozet+hizli eylem) / Profiller (master-detail) / Onay Kuyrugu (toplu islem) / Teslimat (analitik) | Odakli is akisi |
-| 32 | 8 kartli dashboard | +Email Only (sari) + Ortalama Kalite Puani (0-1000, trend oku) ayrimlari. info@ "Contact Ready" dan cikarilir | Dogru veri |
-| 33 | Puan breakdown bileseni | Dossier'de 4 eksenli yatay cubuk grafik: Temel ██░░ 80/200, Iletisim ████ 200/300, ICP ██████ 240/300, Sinyal ███░ 100/200 | Seffaflik |
-| 34 | Toplu onay/reddet | Checkbox + "Secilileri Onayla" + "Tum 750+ puanlilari onayla" akilli filtre butonu | UX hizi 10x |
-| 35 | Inline mesaj duzenleme | Onay kartinda mesaj govdesi tiklanabilir textarea. "Duzenlenmis Onayla" butonu. `edited_payload` JSON alani | Esneklik |
-| 36 | info@ uyari kutusu | Sari uyari: "Bu genel bir e-posta adresidir. Yanit orani dusuk olabilir." + dusuk puan (<400) uyarisi | Farkindalik |
-| 37 | Baglam-duyarli aksiyon onerileri | contact_ready+yuksek: "Hemen email gonderin". email_only: "LinkedIn'de {title} arayin". contact_identified+tel: "Telefon ile ulasin: {phone}" | Aksiyon netligi |
-| 38 | Hizli onay modu (Tinder-style) | Dev "Profil + Mesaj Karti" gorunumu. Klavye kisayollari: Sag Ok = Onayla, Sol Ok = Reddet, Yukari Ok = LLM'e yeniden yazdır. 100 lead'i 3 dakikada eritme | Onay hizi 20x |
-| 39 | Buzkırıcı (Icebreaker) editoru | Mesajin tamamini degil, LLM'in urettigi ilk "kisisellestirmis cumleyi" hizlica duzenleme alani. Geri kalan mesaj sabit, sadece gancho degisir | Hassas kontrol |
+| 46 | Sekme bazli navigasyon | 4 sekme: Komuta Merkezi / Profiller / Onay Kuyrugu / Teslimat | Odakli is akisi |
+| 47 | Dashboard | 5 eksenli skor ozeti. Kuzey yildizi metrikleri: positive_reply_rate, meeting_rate | Dogru veri |
+| 48 | Puan breakdown bileseni | 5 eksenli yatay cubuk grafik: Fit, Intent, Reach, Deliv.Risk, Comp.Risk | Seffaflik |
+| 49 | Toplu onay/reddet | Checkbox + "Tum Ready hesaplari onayla" (Send Gate kararina gore) | UX hizi 10x |
+| 50 | Inline mesaj duzenleme | Onay kartinda tiklanabilir textarea. `edited_payload` JSON alani | Esneklik |
+| 51 | info@ uyari kutusu | Sari uyari: "Bu genel bir e-posta adresidir. Yanit orani dusuk olabilir." | Farkindalik |
+| 52 | Baglam-duyarli aksiyon onerileri | contact_ready+yuksek: "Hemen email gonderin". email_only: "LinkedIn'de arayin" | Aksiyon netligi |
+| 53 | Hizli onay modu (Tinder-style) | Sag Ok = Onayla, Sol Ok = Reddet, Yukari Ok = Yeniden yazdır. 100 lead'i 3 dakikada eritme | Onay hizi 20x |
+| 54 | Buzkırıcı editoru | LLM'in urettigi ilk kisisellestirmis cumleyi duzenleme alani. Geri kalan sabit | Hassas kontrol |
 
 ### Faz 4: Olcekleme (60-90 Gun)
 
 | # | Is | Detay | Etki |
 |---|------|-------|------|
-| 40 | First-party intent collector + tersine IP | Site ziyaret, demo form, webinar, iceric indirme, urun deneme, eski CRM hareketi, LinkedIn sirket sayfasi etkilesimi, gelen reply/referral. **Ek: Tersine IP sinyali (de-anonymization)** — web sitesine eklenen script ile ziyaretci sirket agini tespit et (Clearbit/Leadfeeder mantigi), dogrudan sicak hedef olarak account graph'a ekle ve IntentScore'u yuksel | Inbound + outbound + anonim ziyaretci yakalama |
-| 41 | ICP control plane | Coklu ICP tanimlari, alt segmentler, negatif ICP kurallari, persona haritasi, mesaj stratejileri, sender policy, scoring version, prompt version | Strateji yonetimi |
-| 42 | CRM sync (HubSpot/Pipedrive) | Webhook bazli cift yonlu sync. Account+contact+activity gonderimi | Is akisi |
-| 43 | Canonical account dedup | Ad benzerligi + site kimligi + iletisim sinyali + kaynak dogrulama. canonical_account, account_alias, domain, location, legal_entity_name, brand_name | Veri hijyeni |
-| 44 | Compliance dashboard | KVKK durum takibi, suppression listesi yonetimi, retention suresi, purpose logging, opt-out gecmisi | Yasal guvence |
-| 45 | Operator auto-approve segments | Risk bazli routing: auto-block (acik riskli), research-needed (generic/dusuk guven), manual-review (yuksek deger+risk), auto-send (kanitli+guvenli segment) | Olcek |
-| 46 | LLM-assisted scraper extraction | Regex yerine HTML → LLM → yapilandirilmis veri. HTML degisikliklerine dayanikli. Orta vadeli regex yedegi korunur | Kirilganlik azaltma |
+| 55 | First-party intent collector + tersine IP | Site ziyaret, demo form, webinar, iceric indirme, reply/referral. Tersine IP: ziyaretci sirket agini tespit et, IntentScore yuksel | Inbound + outbound |
+| 56 | ICP control plane (tam UI) | Coklu ICP, alt segmentler, negatif kurallar, persona haritasi, sender policy. Temel tablolar Faz 1'de olusturuldu, bu faz tam UI ekler | Strateji yonetimi |
+| 57 | CRM sync (HubSpot/Pipedrive) | Webhook bazli cift yonlu sync. Account+contact+activity gonderimi | Is akisi |
+| 58 | Canonical account dedup | Ad benzerligi + site kimligi + iletisim sinyali + kaynak dogrulama | Veri hijyeni |
+| 59 | Compliance dashboard | KVKK durum takibi, suppression yonetimi, retention suresi, purpose logging, opt-out gecmisi | Yasal guvence |
+| 60 | Operator auto-approve segments | auto-block (riskli), research-needed (generic), manual-review (yuksek deger+risk), auto-send (kanitli+guvenli) | Olcek |
+| 61 | LLM-assisted scraper extraction | Regex yerine HTML → LLM → yapilandirilmis veri. HTML degisikliklerine dayanikli | Kirilganlik azaltma |
 
 ---
 
 ### Faz Bazli Beklenen Metrikler
 
-| Metrik | Mevcut | Faz 0 Sonrasi | Faz 1 Sonrasi | Faz 2-3 Sonrasi | Faz 4 Sonrasi |
-|--------|--------|--------------|--------------|--------------|----------------|
+**Kuzey Yildizi (is sonucu):**
+
+| Metrik | Mevcut | Faz 0 | Faz 1 | Faz 2-3 | Faz 4 |
+|--------|--------|-------|-------|---------|-------|
+| Dogru kisi orani | ? | ? | %50+ | %70+ | %80+ |
+| Positive reply rate | ? | ? | ? | ~%3-5 | %5-8 |
+| Meeting booked rate | ? | ? | ? | ~%1 | %2+ |
+| Bounce/complaint rate | ? | <%1 | <%0.5 | <%0.3 | <%0.1 |
+| Suppression hijyeni | Yok | Temel | Iyi | Cok Iyi | Otomatik |
+
+**Yardimci (veri kalitesi):**
+
+| Metrik | Mevcut | Faz 0 | Faz 1 | Faz 2-3 | Faz 4 |
+|--------|--------|-------|-------|---------|-------|
 | Gecersiz domain | %3 | %0 | %0 | %0 | %0 |
 | info@ lead orani | %80 | %0 (onayda) | %0 | %0 | %0 |
 | LinkedIn bulma | %0 | %0 | %30+ | %30+ | %35+ |
 | Kisisel e-posta | %0 | %0 | %20+ | %20+ | %25+ |
 | Telefon | %0 | %50+ | %50+ | %50+ | %50+ |
-| Puan ayristirma | 30/32=100 | Hala eski | Normal dagilim | Kalibre edilmis | Optimized |
-| Mesaj kisisellestirme | %0 sablon | %0 | %0 | %100 LLM | %100 + A/B |
-| E-posta acilma | Bilinmiyor | Bilinmiyor | Bilinmiyor | ~%20 | %25+ |
-| E-posta yanit | Bilinmiyor | Bilinmiyor | Bilinmiyor | ~%3 | %5+ |
-| Kullanici guveni | Dusuk | Orta | Yuksek | Yuksek | Cok Yuksek |
+| Puan ayristirma | 30/32=100 | eski | 5 eksen | Kalibre | Optimized |
+| Mesaj kisisellestirme | %0 | %0 | %0 | %100 LLM + kanit-bagli | %100 + A/B |
 
 ---
 
@@ -5863,24 +5842,30 @@ Bu veriler 3 yere akar:
 | OpenFang Parcasi | Kullanim |
 |-----------------|----------|
 | WorkflowEngine | Stage orchestration (discovery → research → activation) |
-| Knowledge Graph / Memory | Account graph + relationship memory |
+| Knowledge Graph / Memory | Graph projection + temporal memory |
 | Approval System | Risk-based review (Send Gate) |
 | Audit Log | Send/reply/compliance trail |
 | MeteringEngine | LLM/task cost visibility |
 | Model Catalog | Provider abstraction |
-| EventBus | Olay bazli tetikleme (reply geldi → score guncelle) |
+| EventBus | Olay bazli tetikleme (reply → score guncelle → graph projection guncelle) |
 | CronScheduler | Gunluk kesif + gonderim zamanlama |
 
 **Core path'ten CIKARILACAKLAR:**
-- A2A/OFP mesh (satis icin gereksiz karmasiklik)
-- 40 kanal fantazisi (email + LinkedIn manual yeterli)
+- A2A/OFP mesh (satis icin gereksiz)
+- 40 kanal fantazisi (email + LinkedIn manual + phone task yeterli)
 - Serbest agent autonomy (typed workflow daha guvenli)
+- LinkedIn browser automation (TOS ihlali)
+- Graph'i transactional SoT yapmak (relational core SoT)
+- Kuzu'yu production backbone yapmak (arsivlenmis, risk)
+- Kisilik cikarimi / psikolog ajan (ground-truth dusuk, riskli)
+- VRFY tabanli bounce shield (guvenilir degil)
+- Discovery'yi daily_target ile kesmek
 
 ---
 
-## 32. Veri Modeli Gecis Plani
+## 32. Veri Modeli
 
-### Mevcut (8 tablo, SQLite, JSON blob agirlikli)
+### Mevcut (8 tablo, JSON blob agirlikli)
 ```
 sales_profile → JSON blob
 prospect_profiles → JSON blob
@@ -5889,78 +5874,165 @@ approvals → flat tablo
 deliveries → flat tablo
 ```
 
-### Hedef: Hibrit Model (Graphiti/Kuzu + SQLite)
+### Hedef: Canonical Relational Core (SoT) + Graph Projection
 
-**Graphiti + Kuzu Embedded — Account Graph:**
-```
-graphiti-core acik kaynak kutuphanesi (Apache 2.0) + Kuzu embedded graf DB.
-Dosya-bazli, sunucusuz — ~/.openfang/data/prospect_graph.kuzu
-Dis bulut servisi yok, tamamen offline calisir.
+**Katman 1: Canonical Operational Core (SQLite, source-of-truth):**
+```sql
+-- EVIDENCE PLANE
+artifacts (
+  id, source_type, source_id, raw_content, parse_status,
+  parser_health, freshness, legal_mode, created_at
+)
+evidence (
+  id, artifact_id, field_type, field_value, confidence,
+  extraction_method, verified_at
+)
 
-Episode Subgraph (Ge):
-  - Ham girdi verileri (text, json, message)
-  - Kayipsiz (non-lossy) depolama
-  - Kaynak izlenebilirligi
+-- ACCOUNT / CONTACT CORE
+accounts (
+  id, canonical_name, display_name, legal_name, sector, geo,
+  employee_estimate, website, created_at, updated_at
+)
+account_aliases (id, account_id, alias_name, alias_type)
+domains (id, account_id, domain, is_primary, verified, mx_valid)
+contacts (
+  id, account_id, full_name, title, seniority, department,
+  name_confidence, title_confidence, is_decision_maker
+)
+contact_methods (
+  id, contact_id, channel_type, value, confidence,
+  verified_at, classification, suppressed
+)
+-- channel_type: email | phone | linkedin
+-- classification: personal | generic | role | consumer | invalid
+buyer_roles (id, account_id, contact_id, role_type, inferred_from)
 
-Semantic Entity Subgraph (Gs):
-  Account (canonical_id, display_name, legal_name, sector, geo, employee_est)
-  Contact (full_name, title, seniority, department)
-  Domain (domain, is_primary, verified)
-  ContactMethod (type, value, confidence, verified_at)
-  Signal (type, text, source, observed_at)
-  Product (name, category — tech-stack tespiti icin)
-  Event (type, date — ihale, tesis, sertifika)
+-- SIGNALS + SCORING
+signals (
+  id, account_id, signal_type, text, source, observed_at, confidence,
+  effect_horizon,        -- immediate | campaign_window | structural
+  expires_at
+)
+signal_rationales (
+  id, signal_id, account_id,
+  why_it_matters, expected_effect, evidence_ids, confidence,
+  created_at, validated_at, validation_result
+  -- validation_result: validated | false_positive | inconclusive
+)
+score_snapshots (
+  id, account_id, fit_score, intent_score, reachability_score,
+  deliverability_risk, compliance_risk, activation_priority,
+  computed_at, scoring_version
+)
 
-  Semantic Edges (zamansal fact'ler):
-  EMPLOYS (valid_at, invalid_at, title)
-  HAS_DOMAIN (valid_at, invalid_at)
-  REACHABLE_VIA (channel_type, confidence, verified_at)
-  OBSERVED_SIGNAL (observed_at, source)
-  USES_PRODUCT (detected_at, source)
-  PARTICIPATED_IN (date)
-  SENT_TO (sequence_step, sent_at)
-  REPLIED_TO (type, received_at)
+-- RESEARCH + THESIS
+research_queue (id, account_id, priority, reason, status, assigned_at)
+account_theses (
+  id, account_id, why_this_account, why_now, buyer_committee_json,
+  evidence_ids, do_not_say, recommended_channel, recommended_pain,
+  thesis_confidence, thesis_status, created_at
+)
 
-Community Subgraph (Gc):
-  - Otomatik kumeleme (label propagation)
-  - Sektor bazli community'ler: "TR Insaat", "Makine Sanayi"
-  - Community ozetleri (map-reduce)
-```
+-- ACTIVATION + SEQUENCES
+activation_queue (id, account_id, contact_id, thesis_id, priority, status)
+sequence_templates (id, name, steps_json, icp_id, persona_id)
+sequence_instances (
+  id, template_id, account_id, contact_id, thesis_id,
+  current_step, status, started_at
+)
+touches (
+  id, sequence_instance_id, step, channel, message_payload,
+  claims_json, evidence_ids, variant_id, sent_at, mailbox_id
+)
 
-**SQLite (sales.db) — Operasyonel Veriler (korunan):**
-```
--- Strateji (YENi)
-icp_definitions
-segments
-personas
-sender_policies
+-- OUTCOMES + LEARNING
+outcomes (
+  id, touch_id, outcome_type, raw_text, classified_at, classifier_confidence
+)
+-- outcome_type: hard_bounce | soft_bounce | no_reply | open | click |
+--   auto_reply | unsubscribe | wrong_person | forwarded | referral |
+--   interested | not_now | meeting_booked | closed_won | closed_lost
 
--- Aktivasyon (YENi)
-campaigns (icp_id, segment_id, status)
-sequence_instances (campaign_id, account_graph_id, contact_graph_id, current_step)
-touch_instances (sequence_id, step, channel, message_id, sent_at)
+outcome_attribution_snapshots (
+  id, touch_id, account_id, snapshot_at,
+  score_at_touch_json, active_signal_ids, unused_signal_ids,
+  thesis_id, sequence_variant, message_variant, channel, mailbox_id,
+  contextual_factors_json
+)
+missed_signal_reviews (
+  id, outcome_id, snapshot_id, reviewed_at,
+  validated_signals, false_positive_signals, missed_signals,
+  timing_mistakes, persona_mismatch, channel_mismatch, reviewer_type
+)
+retrieval_rule_versions (
+  id, rule_type, rule_key, old_value, new_value,
+  proposal_source, backtest_result_json, holdout_result_json,
+  status, approved_by, activated_at, version
+)
+-- rule_type: query_expansion | source_priority | signal_weight |
+--   pause_rule | asset_matching | buyer_role_priority | timing_rule
 
--- Teslimat (mevcut, genisletilmis)
-send_events (touch_id, status, mailbox_id, sent_at)
-reply_events (touch_id, type, classified_at, raw_text)
-suppressions (contact_method_value, reason, suppressed_at)
+contextual_factors (
+  id, factor_type, factor_key, factor_value,
+  effective_from, effective_until, source
+)
+exploration_log (
+  id, touch_id, account_id, exploration_reason,
+  exploration_type, outcome_id, learned_pattern
+)
 
--- Deney (YENi)
-experiments (name, hypothesis, variant_a, variant_b, status)
-experiment_assignments (experiment_id, sequence_id, variant)
+-- SUPPRESSION + COMPLIANCE
+suppressions (
+  id, contact_method_value, reason, source_outcome_id,
+  suppressed_at, permanent
+)
 
--- Mevcut (korunan, temporal KG gecis surecinde)
+-- EXPERIMENTS
+experiments (id, name, hypothesis, variant_a, variant_b, status, created_at)
+experiment_assignments (id, experiment_id, sequence_instance_id, variant)
+
+-- OPERATIONS
+source_health (
+  id, source_type, precision, freshness, parser_health,
+  legal_mode, historical_reply_yield, last_checked_at
+)
+job_runs (id, job_type, status, started_at, completed_at, error_message)
+job_stages (id, job_run_id, stage_name, status, checkpoint_data, updated_at)
+
+-- STRATEGY (ICP Control Plane)
+icp_definitions (id, name, sector_rules, geo_rules, size_rules, negative_rules)
+segments (id, icp_id, name, criteria_json)
+personas (id, segment_id, role_type, pain_angles, message_strategy)
+sender_policies (id, icp_id, mailbox_pool, daily_cap, subdomain, warm_state)
+
+-- MEVCUT (korunan, gecis surecinde)
 sales_profile, sales_runs, approvals, deliveries, sales_onboarding
 ```
 
+**Katman 2: Graph Projection (Graphiti + Neo4j/FalkorDB):**
+```
+Relational Core → [event-driven projection] → Graphiti Graph
+
+Graph kullanim alanlari:
+- Temporal relation takibi
+- Buyer committee reasoning
+- Community detection
+- Dossier recall
+- Benzer hesap onerisi
+
+Graph semasi (Graphiti otomatik olusturur):
+  Episode Subgraph: ham girdi verileri
+  Semantic Entity Subgraph: Account, Contact, Domain, Signal, Event
+  Community Subgraph: otomatik kumeleme
+```
+
 **Gecis Stratejisi:**
-- `prospect_profiles` ve `leads` → Graphiti account graph'a tasinir
-  (her mevcut prospect icin bir text episode olustur, Graphiti otomatik isle)
-- `discovered_domains` → Graphiti entity resolution ile degistirilir
-- `sales_profile` → `icp_definitions` + `sender_policies`'e evrilir
-- `approvals` ve `deliveries` SQLite'ta kalir (operasyonel, hizli erisim)
-- Graphiti entity UUID'leri SQLite kayitlarinda referans olarak saklanir
-- Graphiti Kuzu DB dosyasi: `~/.openfang/data/prospect_graph.kuzu`
+- `prospect_profiles` + `leads` → `accounts` + `contacts` + `contact_methods`
+- `discovered_domains` → `domains`
+- `sales_profile` → `icp_definitions` + `sender_policies`
+- `approvals` + `deliveries` korunur, `touches` + `outcomes` ile paralel calisir
+- Relational core'daki degisiklikler event olarak graph projection'a akar
+- Graph projection Faz 2'de devreye alinir (Faz 1'de relational core yeterli)
 
 ---
 
@@ -5968,15 +6040,32 @@ sales_profile, sales_runs, approvals, deliveries, sales_onboarding
 
 Bu dokuman 4 parcadan olusur:
 
-1. **Parca 1:** OpenFang platformunun tum alt sistemleri (kernel, agent, bellek, A2A/OFP, butce, workflow, 40 kanal)
-2. **Parca 2:** Prospecting motorunun birebir teknik referansi (38 sabit, 8 struct, 8 DB tablosu, 7 asamali pipeline, 8 dizin tarayici, 14 filtreleme fonksiyonu, 5 LLM prompt, SMTP/LinkedIn kodu, tam JS/HTML analizi)
-3. **Parca 3:** Ilk hedef mimari + ekran tasarimlari + 12 bug analizi
-4. **Parca 4:** Uzman degerlendirmesi (ChatGPT Pro + Gemini + Gemini Deep Research) sonrasi birlesmis mimari — Revenue Graph + Activation Engine + Learning Loop + Multi-Agent Swarm + Niyet Motoru + Deger Uretimi + **53 maddelik, 5 fazli implementasyon plani**
+1. **Parca 1:** OpenFang platformunun tum alt sistemleri
+2. **Parca 2:** Prospecting motorunun birebir teknik referansi
+3. **Parca 3:** Hedef mimari + ekran tasarimlari + 12 bug analizi
+4. **Parca 4:** Signal-to-Meeting Engine mimarisi + 61 maddelik implementasyon plani
 
-**Temel donus:**
-Sistem "daha cok kaynak eklenerek" degil, "karar katmani ve ogrenme katmani guclendirilerek" mukemmellesir.
-Lead tablosundan account graph'a, tek pipeline'dan discovery-activation-learning ayrimina,
-SMTP+LinkedIn otomasyonundan sendability/compliance/reply-intelligence duzeyine gecis gerekiyor.
+**Korunan degerli parcalar:**
+- TR dikey source pack yaklasimi
+- Async checkpointed jobs
+- Source health metrikleri
+- Evidence-bound dossier'ler
+- ICP control plane
+- Operator approval
+- Suppression ve audit disiplini
+- Deger asset fikri (secici haliyle)
+
+**Oncelik sirasi:**
+1. Once operasyonel gercegi duzelt (relational core, normalization gateway)
+2. Sonra kaniti duzelt (evidence store, field confidence, tez motoru)
+3. Sonra send gate ve learning loop'u duzelt (5 eksen, outcome classification)
+4. En son graph zekasi ve LLM mesaj uretimi (graph projection, multi-agent)
+
+**Bu sistemi musteri miknatisi yapan 4 mekanizma:**
+1. **Dogru zaman sinyali** — "Bu hesap su an neden hareket edebilir?"
+2. **Gercek kanit** — "Bunu hangi veriyle soyluyoruz?"
+3. **Dusuk surtunmeli deger sunumu** — "Demo iste" degil, "istersen kisa analiz gondereyim"
+4. **Sonuctan ogrenen motor** — "Kim cevap verdi, kim vermedi, neden?"
 
 **Gercek musteri bulma miknatisi:** en cok aday bulan sistem degil,
 **en guvenilir sekilde en cok olumlu cevabi ureten sistemdir.**

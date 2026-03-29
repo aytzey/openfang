@@ -8,13 +8,24 @@ function salesPage() {
     autofillingProfile: false,
     runningNow: false,
     oauthBusy: false,
+    currentJobId: '',
+    jobPollTimer: null,
+    jobProgress: null,
+    sourceHealth: [],
+    activeTab: 'command',
+    selectedDossier: null,
+    dossierLoading: false,
+    approvalSelections: {},
+    approvalDrafts: {},
+    approvalEditorId: '',
+    approvalCursorId: '',
 
     profileBrief: '',
     profile: {
       product_name: '',
       product_description: '',
       target_industry: '',
-      target_geo: 'TR',
+      target_geo: '',
       sender_name: '',
       sender_email: '',
       sender_linkedin: '',
@@ -63,6 +74,15 @@ function salesPage() {
       return !this.onboarding.completed;
     },
 
+    get tabItems() {
+      return [
+        { key: 'command', label: 'Command Center' },
+        { key: 'profiles', label: 'Profiles' },
+        { key: 'approvals', label: 'Approval Queue' },
+        { key: 'deliveries', label: 'Delivery' }
+      ];
+    },
+
     get pendingApprovals() {
       return this.approvals.filter(function(a) { return a.status === 'pending'; }).length;
     },
@@ -77,6 +97,40 @@ function salesPage() {
 
     get companyOnlyProspects() {
       return this.prospects.filter(function(p) { return p.profile_status === 'company_only'; }).length;
+    },
+
+    get selectedApprovalCount() {
+      var ids = Object.keys(this.approvalSelections || {});
+      var count = 0;
+      for (var i = 0; i < ids.length; i++) {
+        if (this.approvalSelections[ids[i]]) count += 1;
+      }
+      return count;
+    },
+
+    get selectedDossierScore() {
+      return this.selectedDossier && this.selectedDossier.score ? this.selectedDossier.score : null;
+    },
+
+    get selectedDossierOutcomes() {
+      return this.selectedDossier && this.selectedDossier.outcomes ? this.selectedDossier.outcomes : null;
+    },
+
+    get selectedPositiveReplyRate() {
+      var outcomes = this.selectedDossierOutcomes;
+      return outcomes ? this.asPercent(outcomes.positive_reply_rate) : '-';
+    },
+
+    get selectedMeetingRate() {
+      var outcomes = this.selectedDossierOutcomes;
+      return outcomes ? this.asPercent(outcomes.meeting_rate) : '-';
+    },
+
+    get selectedAccountLabel() {
+      var dossier = this.selectedDossier;
+      if (dossier && dossier.account && dossier.account.display_name) return dossier.account.display_name;
+      var prospect = this.selectedProspectRecord();
+      return prospect ? prospect.company : 'Secili account';
     },
 
     selectedProspectRecord() {
@@ -106,7 +160,7 @@ function salesPage() {
         product_name: src.product_name || '',
         product_description: src.product_description || '',
         target_industry: src.target_industry || '',
-        target_geo: src.target_geo || 'TR',
+        target_geo: src.target_geo || '',
         sender_name: src.sender_name || '',
         sender_email: src.sender_email || '',
         sender_linkedin: src.sender_linkedin || '',
@@ -120,6 +174,16 @@ function salesPage() {
 
     async init() {
       var self = this;
+      this.syncTabFromHash();
+      window.addEventListener('beforeunload', function() {
+        self.stopJobPolling();
+      });
+      window.addEventListener('hashchange', function() {
+        self.syncTabFromHash();
+      });
+      window.addEventListener('keydown', function(evt) {
+        self.handleApprovalHotkeys(evt);
+      });
       window.addEventListener('message', function(evt) {
         var data = evt && evt.data ? evt.data : {};
         if (data && data.type === 'openfang:codex_oauth' && data.status === 'connected') {
@@ -141,10 +205,15 @@ function salesPage() {
           this.loadLeads(),
           this.loadApprovals(),
           this.loadDeliveries(),
+          this.loadSourceHealth(),
           this.loadOnboardingStatus()
         ]);
       } catch (e) {
         this.loadError = e && e.message ? e.message : 'Satis paneli yuklenemedi.';
+      }
+      this.syncApprovalCursor();
+      if (!this.showOnboarding) {
+        await this.loadSelectedDossier();
       }
       this.loading = false;
     },
@@ -237,37 +306,23 @@ function salesPage() {
       this.runningNow = true;
       try {
         var data = await OpenFangAPI.post('/api/sales/run', {});
-        var run = (data && data.run) || {};
-        if (run.id) {
-          await Promise.all([
-            this.loadRunProspects(run.id),
-            this.loadRunLeads(run.id)
-          ]);
+        var jobId = (data && data.job_id) || '';
+        if (!jobId) {
+          throw new Error('Job baslatildi ancak job_id donmedi');
         }
-        var companyOnly = this.runProspects.filter(function(p) { return p.profile_status === 'company_only'; }).length;
-        OpenFangToast.success(
-          'Prospecting run tamamlandi. Profil: ' + String(this.runProspects.length) +
-          ' / action-ready lead: ' + String(run.inserted || 0) +
-          ' / backlog: ' + String(companyOnly)
-        );
-        if (run.error) {
-          OpenFangToast.warn(run.error, 9000);
-        }
+        this.currentJobId = jobId;
+        this.jobProgress = {
+          job_id: jobId,
+          status: (data && data.status) || 'running',
+          current_stage: (data && data.current_stage) || 'QueryPlanning',
+          stages: []
+        };
+        this.startJobPolling(jobId);
+        OpenFangToast.success('Prospecting job baslatildi. Asamalar canli izleniyor.');
       } catch (e) {
         OpenFangToast.error(e && e.message ? e.message : 'Aday musteri kesfi basarisiz');
       } finally {
-        try {
-          await Promise.all([
-            this.loadRuns(),
-            this.loadProspects(),
-            this.loadLeads(),
-            this.loadApprovals(),
-            this.loadDeliveries(),
-            this.loadOnboardingStatus()
-          ]);
-        } finally {
-          this.runningNow = false;
-        }
+        this.runningNow = false;
       }
     },
 
@@ -280,6 +335,7 @@ function salesPage() {
       var data = await OpenFangAPI.get('/api/sales/prospects?limit=200');
       this.prospects = data.prospects || [];
       this.ensureProspectSelection();
+      await this.loadSelectedDossier();
     },
 
     async loadLeads() {
@@ -297,6 +353,7 @@ function salesPage() {
       var data = await OpenFangAPI.get('/api/sales/prospects?limit=100&run_id=' + encodeURIComponent(runId));
       this.runProspects = data.prospects || [];
       this.ensureProspectSelection();
+      await this.loadSelectedDossier();
     },
 
     async loadRunLeads(runId) {
@@ -312,6 +369,8 @@ function salesPage() {
     async loadApprovals() {
       var data = await OpenFangAPI.get('/api/sales/approvals?limit=200');
       this.approvals = data.approvals || [];
+      this.pruneApprovalState();
+      this.syncApprovalCursor();
     },
 
     async loadDeliveries() {
@@ -319,24 +378,411 @@ function salesPage() {
       this.deliveries = data.deliveries || [];
     },
 
+    async loadSourceHealth() {
+      var data = await OpenFangAPI.get('/api/sales/source-health');
+      this.sourceHealth = data.sources || [];
+    },
+
+    tabHash(tab) {
+      return '#sales-' + tab;
+    },
+
+    syncTabFromHash() {
+      var raw = window.location.hash || '';
+      if (raw.indexOf('#sales-') !== 0) return;
+      var key = raw.slice(7);
+      if (['command', 'profiles', 'approvals', 'deliveries'].indexOf(key) >= 0) {
+        this.activeTab = key;
+      }
+    },
+
+    setTab(tab) {
+      if (['command', 'profiles', 'approvals', 'deliveries'].indexOf(tab) === -1) return;
+      this.activeTab = tab;
+      if (window.location.hash !== this.tabHash(tab)) {
+        history.replaceState(null, '', this.tabHash(tab));
+      }
+    },
+
+    async loadSelectedDossier() {
+      var prospect = this.selectedProspectRecord();
+      if (!prospect || !prospect.company_domain) {
+        this.selectedDossier = null;
+        return;
+      }
+      this.dossierLoading = true;
+      try {
+        var data = await OpenFangAPI.get('/api/sales/accounts/' + encodeURIComponent(prospect.company_domain) + '/dossier');
+        this.selectedDossier = data && data.dossier ? data.dossier : null;
+      } catch (_) {
+        this.selectedDossier = null;
+      }
+      this.dossierLoading = false;
+    },
+
+    selectedScoreBars() {
+      var score = this.selectedDossierScore;
+      if (!score) return [];
+      return [
+        { key: 'fit', label: 'Fit', value: Number(score.fit_score || 0), risk: false },
+        { key: 'intent', label: 'Intent', value: Number(score.intent_score || 0), risk: false },
+        { key: 'reach', label: 'Reach', value: Number(score.reachability_score || 0), risk: false },
+        { key: 'deliverability', label: 'Deliverability Risk', value: Number(score.deliverability_risk || 0), risk: true },
+        { key: 'compliance', label: 'Compliance Risk', value: Number(score.compliance_risk || 0), risk: true }
+      ];
+    },
+
+    scoreBarWidth(bar) {
+      return String(Math.round(Math.max(0, Math.min(1, Number(bar && bar.value ? bar.value : 0))) * 100)) + '%';
+    },
+
+    scoreBarClass(bar) {
+      var value = Number(bar && bar.value ? bar.value : 0);
+      if (bar && bar.risk) {
+        return value > 0.5 ? 'is-bad' : (value > 0.25 ? 'is-warn' : 'is-good');
+      }
+      return value >= 0.65 ? 'is-good' : (value >= 0.35 ? 'is-warn' : 'is-bad');
+    },
+
+    sendGateLabel() {
+      var gate = this.selectedDossierScore && this.selectedDossierScore.send_gate;
+      if (!gate || !gate.decision) return '-';
+      return gate.decision.replace(/_/g, ' ');
+    },
+
+    sendGateReason() {
+      var gate = this.selectedDossierScore && this.selectedDossierScore.send_gate;
+      if (!gate || !gate.decision) return '';
+      if (gate.reason) return gate.reason;
+      if (Array.isArray(gate.missing)) return gate.missing.join('; ');
+      return '';
+    },
+
+    asPercent(value) {
+      if (typeof value !== 'number' || isNaN(value)) return '-';
+      return String(Math.round(value * 100)) + '%';
+    },
+
+    approvalSelected(id) {
+      return !!(this.approvalSelections && this.approvalSelections[id]);
+    },
+
+    toggleApprovalSelection(id, checked) {
+      if (!id) return;
+      this.approvalSelections[id] = !!checked;
+    },
+
+    toggleAllPendingApprovals(checked) {
+      var items = this.pendingApprovalItems;
+      for (var i = 0; i < items.length; i++) {
+        this.approvalSelections[items[i].id] = !!checked;
+      }
+    },
+
+    pruneApprovalState() {
+      var keep = {};
+      var ids = {};
+      for (var i = 0; i < this.pendingApprovalItems.length; i++) {
+        ids[this.pendingApprovalItems[i].id] = true;
+      }
+      var selectionIds = Object.keys(this.approvalSelections || {});
+      for (var j = 0; j < selectionIds.length; j++) {
+        if (ids[selectionIds[j]]) keep[selectionIds[j]] = !!this.approvalSelections[selectionIds[j]];
+      }
+      this.approvalSelections = keep;
+
+      var draftKeep = {};
+      var draftIds = Object.keys(this.approvalDrafts || {});
+      for (var k = 0; k < draftIds.length; k++) {
+        if (ids[draftIds[k]]) draftKeep[draftIds[k]] = this.approvalDrafts[draftIds[k]];
+      }
+      this.approvalDrafts = draftKeep;
+
+      if (this.approvalEditorId && !ids[this.approvalEditorId]) {
+        this.approvalEditorId = '';
+      }
+    },
+
+    syncApprovalCursor() {
+      var items = this.pendingApprovalItems;
+      if (!items.length) {
+        this.approvalCursorId = '';
+        return;
+      }
+      for (var i = 0; i < items.length; i++) {
+        if (items[i].id === this.approvalCursorId) return;
+      }
+      this.approvalCursorId = items[0].id;
+    },
+
+    moveApprovalCursor(delta) {
+      var items = this.pendingApprovalItems;
+      if (!items.length) {
+        this.approvalCursorId = '';
+        return;
+      }
+      var idx = 0;
+      for (var i = 0; i < items.length; i++) {
+        if (items[i].id === this.approvalCursorId) {
+          idx = i;
+          break;
+        }
+      }
+      idx = (idx + delta + items.length) % items.length;
+      this.approvalCursorId = items[idx].id;
+    },
+
+    currentPendingApproval() {
+      var items = this.pendingApprovalItems;
+      for (var i = 0; i < items.length; i++) {
+        if (items[i].id === this.approvalCursorId) return items[i];
+      }
+      return items.length ? items[0] : null;
+    },
+
+    approvalRowClass(approval) {
+      return approval && approval.id === this.approvalCursorId ? 'is-active' : '';
+    },
+
+    approvalClassification(approval) {
+      return approval && approval.payload && approval.payload.classification
+        ? approval.payload.classification
+        : '';
+    },
+
+    approvalHasWarning(approval) {
+      var cls = this.approvalClassification(approval);
+      return cls === 'generic' || cls === 'role' || cls === 'consumer';
+    },
+
+    approvalWarningLabel(approval) {
+      var cls = this.approvalClassification(approval);
+      if (cls === 'generic' || cls === 'role') return 'Generic email - low reply probability';
+      if (cls === 'consumer') return 'Consumer mailbox - blocked by policy';
+      return '';
+    },
+
+    approvalDraft(approval) {
+      if (!approval || !approval.id) return {};
+      if (!this.approvalDrafts[approval.id]) {
+        var payload = approval.payload || {};
+        this.approvalDrafts[approval.id] = {
+          to: payload.to || '',
+          profile_url: payload.profile_url || '',
+          subject: payload.subject || '',
+          body: payload.body || '',
+          message: payload.message || '',
+          icebreaker: this.extractIcebreaker(approval)
+        };
+      }
+      return this.approvalDrafts[approval.id];
+    },
+
+    extractIcebreaker(approval) {
+      if (!approval || !approval.payload) return '';
+      var text = approval.channel === 'email' ? (approval.payload.body || '') : (approval.payload.message || '');
+      if (!text) return '';
+      var parts = text.split(/\n+/);
+      return parts[0] || '';
+    },
+
+    approvalBodyRemainder(approval) {
+      if (!approval || !approval.payload) return '';
+      var text = approval.channel === 'email' ? (approval.payload.body || '') : (approval.payload.message || '');
+      if (!text) return '';
+      var parts = text.split(/\n+/);
+      parts.shift();
+      return parts.join('\n').trim();
+    },
+
+    startApprovalEdit(approval) {
+      if (!approval || !approval.id) return;
+      this.approvalEditorId = approval.id;
+      this.approvalCursorId = approval.id;
+      this.approvalDraft(approval);
+    },
+
+    cancelApprovalEdit() {
+      this.approvalEditorId = '';
+    },
+
+    buildEditedPayload(approval) {
+      var draft = this.approvalDraft(approval);
+      if (approval.channel === 'email') {
+        return {
+          to: draft.to || (approval.payload && approval.payload.to) || '',
+          subject: draft.subject || '',
+          body: draft.body || ''
+        };
+      }
+      return {
+        profile_url: draft.profile_url || (approval.payload && approval.payload.profile_url) || '',
+        message: draft.message || ''
+      };
+    },
+
+    async saveApprovalEdit(id) {
+      var approval = null;
+      for (var i = 0; i < this.pendingApprovalItems.length; i++) {
+        if (this.pendingApprovalItems[i].id === id) {
+          approval = this.pendingApprovalItems[i];
+          break;
+        }
+      }
+      if (!approval) {
+        OpenFangToast.error('Duzenlenecek approval bulunamadi');
+        return;
+      }
+      try {
+        var data = await OpenFangAPI.patch(
+          '/api/sales/approvals/' + encodeURIComponent(id) + '/edit',
+          { edited_payload: this.buildEditedPayload(approval) }
+        );
+        var updated = data && data.approval ? data.approval : null;
+        if (updated) {
+          for (var j = 0; j < this.approvals.length; j++) {
+            if (this.approvals[j].id === id) {
+              this.approvals[j] = updated;
+              break;
+            }
+          }
+          delete this.approvalDrafts[id];
+        }
+        this.approvalEditorId = '';
+        OpenFangToast.success('Taslak guncellendi');
+      } catch (e) {
+        OpenFangToast.error(e && e.message ? e.message : 'Taslak guncellenemedi');
+      }
+    },
+
+    async bulkApproveSelected() {
+      var ids = [];
+      var items = this.pendingApprovalItems;
+      for (var i = 0; i < items.length; i++) {
+        if (this.approvalSelections[items[i].id]) ids.push(items[i].id);
+      }
+      if (!ids.length) {
+        OpenFangToast.error('Onaylanacak taslak secilmedi');
+        return;
+      }
+      try {
+        var data = await OpenFangAPI.post('/api/sales/approvals/bulk-approve', { ids: ids });
+        var approved = data && Array.isArray(data.approved) ? data.approved.length : 0;
+        var failed = data && Array.isArray(data.failed) ? data.failed.length : 0;
+        this.approvalSelections = {};
+        await Promise.all([this.loadApprovals(), this.loadDeliveries()]);
+        if (approved > 0) {
+          OpenFangToast.success(String(approved) + ' taslak onaylandi');
+        }
+        if (failed > 0) {
+          OpenFangToast.warn(String(failed) + ' taslak gonderilemedi', 8000);
+        }
+      } catch (e) {
+        OpenFangToast.error(e && e.message ? e.message : 'Toplu onay basarisiz');
+      }
+    },
+
+    handleApprovalHotkeys(evt) {
+      if (this.showOnboarding || this.activeTab !== 'approvals') return;
+      var tag = document.activeElement && document.activeElement.tagName ? document.activeElement.tagName.toUpperCase() : '';
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (!this.pendingApprovalItems.length) return;
+
+      if (evt.key === 'ArrowDown') {
+        evt.preventDefault();
+        this.moveApprovalCursor(1);
+        return;
+      }
+      if (evt.key === 'ArrowRight') {
+        evt.preventDefault();
+        var current = this.currentPendingApproval();
+        if (current) this.approve(current.id);
+        return;
+      }
+      if (evt.key === 'ArrowLeft') {
+        evt.preventDefault();
+        var currentReject = this.currentPendingApproval();
+        if (currentReject) this.reject(currentReject.id);
+        return;
+      }
+      if (evt.key === 'ArrowUp') {
+        evt.preventDefault();
+        var currentEdit = this.currentPendingApproval();
+        if (currentEdit) this.startApprovalEdit(currentEdit);
+      }
+    },
+
+    stopJobPolling() {
+      if (this.jobPollTimer) {
+        clearTimeout(this.jobPollTimer);
+        this.jobPollTimer = null;
+      }
+    },
+
+    startJobPolling(jobId) {
+      this.stopJobPolling();
+      if (!jobId) return;
+      var self = this;
+      var tick = async function() {
+        try {
+          var data = await OpenFangAPI.get('/api/sales/jobs/' + encodeURIComponent(jobId) + '/progress');
+          self.jobProgress = data || null;
+          if (!data || data.status === 'completed' || data.status === 'failed') {
+            self.stopJobPolling();
+            self.currentJobId = jobId;
+            await Promise.all([
+              self.loadRuns(),
+              self.loadProspects(),
+              self.loadLeads(),
+              self.loadApprovals(),
+              self.loadDeliveries(),
+              self.loadSourceHealth(),
+              self.loadOnboardingStatus()
+            ]);
+            var latestRun = self.runs.length ? self.runs[0] : null;
+            if (latestRun && latestRun.id) {
+              await Promise.all([
+                self.loadRunProspects(latestRun.id),
+                self.loadRunLeads(latestRun.id)
+              ]);
+            }
+            if (data && data.status === 'completed') {
+              OpenFangToast.success('Prospecting job tamamlandi');
+            } else if (data && data.error_message) {
+              OpenFangToast.error(data.error_message);
+            } else {
+              OpenFangToast.error('Prospecting job basarisiz');
+            }
+            return;
+          }
+        } catch (e) {
+          self.stopJobPolling();
+          OpenFangToast.error(e && e.message ? e.message : 'Job ilerlemesi alinamadi');
+          return;
+        }
+        self.jobPollTimer = setTimeout(tick, 2500);
+      };
+      tick();
+    },
+
     approvalRecipient(a) {
       if (!a || !a.payload) return '-';
       if (a.channel === 'email') return a.payload.to || '-';
-      if (a.channel === 'linkedin') return a.payload.profile_url || '-';
+      if (a.channel === 'linkedin' || a.channel === 'linkedin_assist') return a.payload.profile_url || '-';
       return '-';
     },
 
     approvalTitle(a) {
       if (!a || !a.payload) return 'Taslak';
       if (a.channel === 'email') return a.payload.subject || 'E-posta taslagi';
-      if (a.channel === 'linkedin') return 'LinkedIn mesaji';
+      if (a.channel === 'linkedin' || a.channel === 'linkedin_assist') return 'LinkedIn operator assist';
       return 'Taslak';
     },
 
     approvalBody(a) {
       if (!a || !a.payload) return '';
       if (a.channel === 'email') return a.payload.body || '';
-      if (a.channel === 'linkedin') return a.payload.message || '';
+      if (a.channel === 'linkedin' || a.channel === 'linkedin_assist') return a.payload.message || '';
       return '';
     },
 
@@ -361,7 +807,7 @@ function salesPage() {
       if (!prospect) return '-';
       var channels = [];
       if (prospect.primary_email) channels.push('email');
-      if (prospect.primary_linkedin_url) channels.push('linkedin');
+      if (prospect.primary_linkedin_url) channels.push('linkedin_assist');
       return channels.length ? channels.join(' + ') : 'sirket seviyesi';
     },
 
@@ -370,7 +816,7 @@ function salesPage() {
       if (prospect.profile_status === 'contact_ready') {
         if (prospect.primary_email && prospect.primary_linkedin_url) return 'Email ile basla, LinkedIn follow-up';
         if (prospect.primary_email) return 'Email taslagini onaya gonder';
-        if (prospect.primary_linkedin_url) return 'LinkedIn mesajini onaya gonder';
+        if (prospect.primary_linkedin_url) return 'LinkedIn operator-assist gorevi ac';
       }
       if (prospect.profile_status === 'contact_identified') return "Kanal dogrulama yap ve lead'e yuksel";
       return 'Buying committee ve temas kanali cikar';
@@ -411,9 +857,10 @@ function salesPage() {
       return String(Math.round(prospect.research_confidence * 100)) + '%';
     },
 
-    selectProspect(prospect) {
+    async selectProspect(prospect) {
       if (!prospect || !prospect.id) return;
       this.selectedProspectId = prospect.id;
+      await this.loadSelectedDossier();
     },
 
     ensureProspectSelection() {
@@ -441,14 +888,66 @@ function salesPage() {
       return 'badge-muted';
     },
 
+    jobStageBadgeClass(stage) {
+      if (!stage) return 'badge-muted';
+      if (stage.status === 'completed') return 'badge-success';
+      if (stage.status === 'running') return 'badge-warn';
+      if (stage.status === 'failed') return 'badge-error';
+      return 'badge-muted';
+    },
+
+    sourceHealthBadgeClass(row) {
+      if (!row) return 'badge-muted';
+      if (row.auto_skip || row.parser_health === 0) return 'badge-error';
+      if (row.parser_health < 1) return 'badge-warn';
+      return 'badge-success';
+    },
+
+    deliveryStatusClass(delivery) {
+      if (!delivery) return 'badge-muted';
+      if (delivery.status === 'sent') return 'badge-success';
+      if (delivery.status === 'operator_pending') return 'badge-warn';
+      if (delivery.status && delivery.status.indexOf('blocked') === 0) return 'badge-error';
+      if (delivery.status === 'failed') return 'badge-error';
+      return 'badge-muted';
+    },
+
     async approve(id) {
       try {
         await OpenFangAPI.post('/api/sales/approvals/' + encodeURIComponent(id) + '/approve', {});
-        OpenFangToast.success('Onaylandi ve gonderildi');
+        OpenFangToast.success('Onaylandi');
         await Promise.all([this.loadApprovals(), this.loadDeliveries()]);
       } catch (e) {
         OpenFangToast.error(e && e.message ? e.message : 'Onay islemi basarisiz');
       }
+    },
+
+    async retryJob(forceFresh) {
+      if (!this.currentJobId) {
+        OpenFangToast.error('Tekrar denenecek job bulunamadi');
+        return;
+      }
+      this.runningNow = true;
+      try {
+        var data = await OpenFangAPI.post(
+          '/api/sales/jobs/' + encodeURIComponent(this.currentJobId) + '/retry',
+          { force_fresh: !!forceFresh }
+        );
+        var jobId = (data && data.job_id) || '';
+        if (!jobId) throw new Error('Retry job_id donmedi');
+        this.currentJobId = jobId;
+        this.jobProgress = {
+          job_id: jobId,
+          status: (data && data.status) || 'running',
+          current_stage: 'QueryPlanning',
+          stages: []
+        };
+        this.startJobPolling(jobId);
+        OpenFangToast.success('Job retry baslatildi');
+      } catch (e) {
+        OpenFangToast.error(e && e.message ? e.message : 'Retry baslatilamadi');
+      }
+      this.runningNow = false;
     },
 
     async reject(id) {

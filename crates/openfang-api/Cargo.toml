@@ -40,6 +40,7 @@ sha2 = { workspace = true }
 rand = { workspace = true }
 url = { workspace = true }
 lettre = { version = "=0.10.4", default-features = false, features = ["tokio1", "tokio1-rustls-tls", "smtp-transport", "builder"] }
+hickory-resolver = { version = "0.24", default-features = false, features = ["system-config", "tokio-runtime"] }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

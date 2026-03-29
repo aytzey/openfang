@@ -13,10 +13,11 @@ use governor::{clock::DefaultClock, state::keyed::DashMapStateStore, Quota, Rate
 use openfang_types::memory::MemorySource;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{LazyLock, Mutex};
+use std::sync::LazyLock;
 use support::{
     skip_if_env_missing, TestServer, TestServerBuilder, GROQ_TEST_MODEL, OLLAMA_TEST_MODEL,
 };
+use tokio::sync::Mutex;
 
 static CODEX_AUTH_TEST_GUARD: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -345,7 +346,7 @@ async fn test_codex_auth_import_status_and_logout_roundtrip() {
         return;
     }
 
-    let _guard = CODEX_AUTH_TEST_GUARD.lock().unwrap();
+    let _guard = CODEX_AUTH_TEST_GUARD.lock().await;
     let _env = EnvSnapshot::capture(&["OPENAI_CODEX_ACCESS_TOKEN", "OPENAI_CODEX_ACCOUNT_ID"]);
     std::env::remove_var("OPENAI_CODEX_ACCESS_TOKEN");
     std::env::remove_var("OPENAI_CODEX_ACCOUNT_ID");
@@ -407,7 +408,7 @@ async fn test_codex_auth_import_enables_real_agent_message() {
         return;
     }
 
-    let _guard = CODEX_AUTH_TEST_GUARD.lock().unwrap();
+    let _guard = CODEX_AUTH_TEST_GUARD.lock().await;
     let _env = EnvSnapshot::capture(&["OPENAI_CODEX_ACCESS_TOKEN", "OPENAI_CODEX_ACCOUNT_ID"]);
     std::env::remove_var("OPENAI_CODEX_ACCESS_TOKEN");
     std::env::remove_var("OPENAI_CODEX_ACCOUNT_ID");
@@ -462,7 +463,7 @@ async fn test_sales_brief_autofill_with_codex_auth() {
         return;
     }
 
-    let _guard = CODEX_AUTH_TEST_GUARD.lock().unwrap();
+    let _guard = CODEX_AUTH_TEST_GUARD.lock().await;
     let _env = EnvSnapshot::capture(&["OPENAI_CODEX_ACCESS_TOKEN", "OPENAI_CODEX_ACCOUNT_ID"]);
     std::env::remove_var("OPENAI_CODEX_ACCESS_TOKEN");
     std::env::remove_var("OPENAI_CODEX_ACCOUNT_ID");

@@ -224,8 +224,14 @@
             </div>
           </div>
 
+          <div class="sales-tabbar">
+            <template x-for="tab in tabItems" :key="tab.key">
+              <button class="sales-tab" :class="{ active: activeTab === tab.key }" @click="setTab(tab.key)" x-text="tab.label"></button>
+            </template>
+          </div>
+
           <!-- Stats grid -->
-          <div class="sales-stats-grid">
+          <div class="sales-stats-grid" x-show="activeTab === 'command'">
             <div class="sales-stat-card">
               <div class="sales-stat-label">Toplam run</div>
               <div class="sales-stat-value" x-text="runs.length"></div>
@@ -250,9 +256,90 @@
               <div class="sales-stat-label">Teslimat</div>
               <div class="sales-stat-value" x-text="deliveries.length"></div>
             </div>
+            <div class="sales-stat-card">
+              <div class="sales-stat-label">Aktif job</div>
+              <div class="sales-stat-value" x-text="jobProgress ? (jobProgress.current_stage || jobProgress.status || '-') : '-'"></div>
+            </div>
+            <div class="sales-stat-card">
+              <div class="sales-stat-label">Secili account reply</div>
+              <div class="sales-stat-value" x-text="selectedPositiveReplyRate"></div>
+            </div>
+            <div class="sales-stat-card">
+              <div class="sales-stat-label">Secili account meeting</div>
+              <div class="sales-stat-value" x-text="selectedMeetingRate"></div>
+            </div>
           </div>
 
-          <section class="sales-panel-section">
+          <section class="sales-panel-section" x-show="activeTab === 'command' && jobProgress">
+            <div class="sales-panel-header">
+              <h3>Canli job ilerlemesi</h3>
+              <div class="sales-btn-row">
+                <button class="btn btn-ghost btn-sm" @click="retryJob(false)" x-show="jobProgress && jobProgress.status === 'failed'">Retry</button>
+                <button class="btn btn-ghost btn-sm" @click="retryJob(true)" x-show="jobProgress && jobProgress.status === 'failed'">Fresh retry</button>
+              </div>
+            </div>
+            <div class="sales-form-grid">
+              <div class="form-group">
+                <label>Job</label>
+                <div class="text-sm" x-text="jobProgress && jobProgress.job_id ? jobProgress.job_id : '-'"></div>
+              </div>
+              <div class="form-group">
+                <label>Durum</label>
+                <div class="text-sm"><span class="badge" :class="runBadgeClass(jobProgress)" x-text="jobProgress && jobProgress.status ? jobProgress.status : '-'"></span></div>
+              </div>
+              <div class="form-group">
+                <label>Aktif asama</label>
+                <div class="text-sm" x-text="jobProgress && jobProgress.current_stage ? jobProgress.current_stage : '-'"></div>
+              </div>
+              <div class="form-group">
+                <label>Hata</label>
+                <div class="text-sm" x-text="jobProgress && jobProgress.error_message ? jobProgress.error_message : '-'"></div>
+              </div>
+            </div>
+            <div class="table-wrap" x-show="jobProgress && (jobProgress.stages || []).length > 0">
+              <table>
+                <thead><tr><th>Asama</th><th>Durum</th><th>Basladi</th><th>Bitti</th></tr></thead>
+                <tbody>
+                  <template x-for="stage in (jobProgress ? (jobProgress.stages || []) : [])" :key="stage.name">
+                    <tr>
+                      <td x-text="stage.name"></td>
+                      <td><span class="badge" :class="jobStageBadgeClass(stage)" x-text="stage.status"></span></td>
+                      <td class="text-xs" x-text="formatDateTime(stage.started_at)"></td>
+                      <td class="text-xs" x-text="formatDateTime(stage.completed_at)"></td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="sales-panel-section" x-show="activeTab === 'command'">
+            <div class="sales-panel-header">
+              <h3>Source health</h3>
+              <button class="btn btn-ghost btn-sm" @click="loadSourceHealth()">Yenile</button>
+            </div>
+            <div class="table-wrap" x-show="sourceHealth.length > 0">
+              <table>
+                <thead><tr><th>Kaynak</th><th>Parser</th><th>Freshness</th><th>Son kontrol</th><th>Durum</th></tr></thead>
+                <tbody>
+                  <template x-for="row in sourceHealth" :key="row.id">
+                    <tr>
+                      <td x-text="row.source_type"></td>
+                      <td x-text="row.parser_health"></td>
+                      <td class="text-xs" x-text="row.freshness || '-'"></td>
+                      <td class="text-xs" x-text="formatDateTime(row.last_checked_at)"></td>
+                      <td><span class="badge" :class="sourceHealthBadgeClass(row)" x-text="row.auto_skip ? 'auto_skip' : 'ok'"></span></td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+            <div class="sales-empty" x-show="sourceHealth.length === 0">
+              <p>Kaynak health verisi henuz yok.</p>
+            </div>
+          </section>
+
+          <section class="sales-panel-section" x-show="activeTab === 'profiles'">
             <div class="sales-panel-header">
               <h3>Run gecmisi</h3>
               <button class="btn btn-ghost btn-sm" @click="loadRuns()">Yenile</button>
@@ -285,7 +372,7 @@
             </div>
           </section>
 
-          <section class="sales-panel-section">
+          <section class="sales-panel-section" x-show="activeTab === 'profiles'">
             <div class="sales-panel-header">
               <h3>Aday musteri profilleri</h3>
               <button class="btn btn-ghost btn-sm" @click="loadProspects()">Yenile</button>
@@ -320,7 +407,7 @@
             </div>
           </section>
 
-          <section class="sales-panel-section" x-show="selectedProspectRecord()">
+          <section class="sales-panel-section" x-show="activeTab === 'profiles' && selectedProspectRecord()">
             <template x-if="selectedProspectRecord()">
               <div>
                 <div class="sales-panel-header">
@@ -332,6 +419,69 @@
                 </div>
                 <div>
                   <div class="text-sm" style="margin-bottom:10px" x-text="selectedProspectRecord().summary"></div>
+                  <div class="sales-empty" x-show="dossierLoading">
+                    <p>Dossier yukleniyor...</p>
+                  </div>
+                  <div x-show="selectedDossier && !dossierLoading" class="sales-dossier-grid">
+                    <div class="sales-panel-section sales-panel-section--inner">
+                      <div class="sales-panel-header">
+                        <h3>5-axis score</h3>
+                        <div class="sales-btn-row">
+                          <span class="badge badge-muted" x-text="sendGateLabel()"></span>
+                          <span class="badge badge-success" x-text="selectedAccountLabel"></span>
+                        </div>
+                      </div>
+                      <div class="sales-score-grid">
+                        <template x-for="bar in selectedScoreBars()" :key="bar.key">
+                          <div class="sales-score-card">
+                            <div class="sales-score-meta">
+                              <span x-text="bar.label"></span>
+                              <strong x-text="asPercent(bar.value)"></strong>
+                            </div>
+                            <div class="sales-score-track">
+                              <div class="sales-score-fill" :class="scoreBarClass(bar)" :style="'width:' + scoreBarWidth(bar)"></div>
+                            </div>
+                          </div>
+                        </template>
+                      </div>
+                      <div class="text-xs text-dim" x-show="sendGateReason()" x-text="sendGateReason()"></div>
+                    </div>
+
+                    <div class="sales-panel-section sales-panel-section--inner">
+                      <div class="sales-panel-header">
+                        <h3>Thesis</h3>
+                        <span class="badge badge-muted" x-text="selectedDossier && selectedDossier.thesis ? (selectedDossier.thesis.thesis_status || '-') : '-'"></span>
+                      </div>
+                      <div class="sales-thesis-block" x-show="selectedDossier && selectedDossier.thesis">
+                        <div class="form-group">
+                          <label>Why this account</label>
+                          <div class="text-sm" x-text="selectedDossier.thesis.why_this_account || '-'"></div>
+                        </div>
+                        <div class="form-group">
+                          <label>Why now</label>
+                          <div class="text-sm" x-text="selectedDossier.thesis.why_now || '-'"></div>
+                        </div>
+                        <div class="sales-form-grid">
+                          <div class="form-group">
+                            <label>Recommended channel</label>
+                            <div class="text-sm" x-text="selectedDossier.thesis.recommended_channel || '-'"></div>
+                          </div>
+                          <div class="form-group">
+                            <label>Recommended pain</label>
+                            <div class="text-sm" x-text="selectedDossier.thesis.recommended_pain || '-'"></div>
+                          </div>
+                          <div class="form-group">
+                            <label>Next action</label>
+                            <div class="text-sm" x-text="selectedDossier.next_action || '-'"></div>
+                          </div>
+                          <div class="form-group">
+                            <label>Positive reply / meeting</label>
+                            <div class="text-sm" x-text="selectedPositiveReplyRate + ' / ' + selectedMeetingRate"></div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
                   <div class="sales-form-grid">
                     <div class="form-group">
                       <label>Birincil temas</label>
@@ -373,38 +523,98 @@
                       </div>
                     </div>
                   </div>
+                  <div class="sales-panel-section sales-panel-section--inner" x-show="selectedDossier && selectedDossier.signals && selectedDossier.signals.length > 0">
+                    <div class="sales-panel-header">
+                      <h3>Top signals</h3>
+                      <span class="badge badge-muted" x-text="selectedDossier.source || '-'"></span>
+                    </div>
+                    <div class="sales-signal-list">
+                      <template x-for="signal in selectedDossier.signals" :key="signal.id || signal.text">
+                        <div class="sales-signal-item">
+                          <div class="sales-signal-top">
+                            <strong x-text="signal.signal_type || 'signal'"></strong>
+                            <span class="badge badge-muted" x-text="signal.effect_horizon || '-'"></span>
+                          </div>
+                          <div class="text-sm" x-text="signal.text"></div>
+                          <div class="text-xs text-dim" x-text="signal.why_it_matters || '-'"></div>
+                        </div>
+                      </template>
+                    </div>
+                  </div>
                 </div>
               </div>
             </template>
           </section>
 
           <!-- Approval queue -->
-          <section class="sales-panel-section">
+          <section class="sales-panel-section" x-show="activeTab === 'approvals'">
             <div class="sales-panel-header">
               <h3>Mesaj onay kuyrugu</h3>
-              <button class="btn btn-ghost btn-sm" @click="loadApprovals()">Yenile</button>
+              <div class="sales-btn-row">
+                <button class="btn btn-ghost btn-sm" @click="toggleAllPendingApprovals(true)">Tumunu sec</button>
+                <button class="btn btn-ghost btn-sm" @click="toggleAllPendingApprovals(false)">Temizle</button>
+                <button class="btn btn-primary btn-sm" @click="bulkApproveSelected()" :disabled="selectedApprovalCount === 0">Approve all Ready</button>
+                <button class="btn btn-ghost btn-sm" @click="loadApprovals()">Yenile</button>
+              </div>
             </div>
+            <div class="sales-keyhint">Hizli mod: <strong>&rarr;</strong> approve, <strong>&larr;</strong> reject, <strong>&uarr;</strong> rewrite, <strong>&darr;</strong> next</div>
             <div class="table-wrap" x-show="pendingApprovalItems.length > 0">
               <table>
-                <thead><tr><th>Kanal</th><th>Alici</th><th>Taslak</th><th>Durum</th><th>Olusma</th><th>Aksiyon</th></tr></thead>
+                <thead><tr><th></th><th>Kanal</th><th>Alici</th><th>Taslak</th><th>Durum</th><th>Olusma</th><th>Aksiyon</th></tr></thead>
                 <tbody>
                   <template x-for="a in pendingApprovalItems" :key="a.id">
-                    <tr>
+                    <tr :class="approvalRowClass(a)">
+                      <td>
+                        <input type="checkbox" :checked="approvalSelected(a.id)" @change="toggleApprovalSelection(a.id, $event.target.checked)">
+                      </td>
                       <td x-text="a.channel"></td>
-                      <td class="text-xs" x-text="approvalRecipient(a)"></td>
                       <td class="text-xs">
-                        <details class="sales-preview-card">
-                          <summary>
-                            <span class="font-bold" x-text="approvalTitle(a)"></span>
-                          </summary>
+                        <div x-text="approvalRecipient(a)"></div>
+                        <div x-show="approvalHasWarning(a)" class="sales-approval-warning" x-text="approvalWarningLabel(a)"></div>
+                      </td>
+                      <td class="text-xs">
+                        <div class="sales-preview-card">
+                          <div class="font-bold" x-text="approvalTitle(a)"></div>
                           <pre class="sales-preview-body" x-text="approvalBody(a) || '-'"></pre>
-                        </details>
+                          <div class="sales-btn-row" style="margin-top:8px">
+                            <button class="btn btn-ghost btn-sm" @click="startApprovalEdit(a)">Edit</button>
+                            <span class="badge badge-muted" x-show="approvalClassification(a)" x-text="approvalClassification(a)"></span>
+                          </div>
+                          <div class="sales-approval-editor" x-show="approvalEditorId === a.id">
+                            <template x-if="a.channel === 'email'">
+                              <div>
+                                <div class="form-group">
+                                  <label>Icebreaker</label>
+                                  <input class="form-input" x-model="approvalDraft(a).icebreaker" @input="approvalDraft(a).body = approvalDraft(a).icebreaker + (approvalBodyRemainder(a) ? '\n\n' + approvalBodyRemainder(a) : '')">
+                                </div>
+                                <div class="form-group">
+                                  <label>Subject</label>
+                                  <input class="form-input" x-model="approvalDraft(a).subject">
+                                </div>
+                                <div class="form-group">
+                                  <label>Body</label>
+                                  <textarea class="form-textarea" style="min-height:120px" x-model="approvalDraft(a).body"></textarea>
+                                </div>
+                              </div>
+                            </template>
+                            <template x-if="a.channel !== 'email'">
+                              <div class="form-group">
+                                <label>LinkedIn copy</label>
+                                <textarea class="form-textarea" style="min-height:120px" x-model="approvalDraft(a).message"></textarea>
+                              </div>
+                            </template>
+                            <div class="sales-btn-row">
+                              <button class="btn btn-primary btn-sm" @click="saveApprovalEdit(a.id)">Kaydet</button>
+                              <button class="btn btn-ghost btn-sm" @click="cancelApprovalEdit()">Vazgec</button>
+                            </div>
+                          </div>
+                        </div>
                       </td>
                       <td><span class="badge" :class="a.status === 'pending' ? 'badge-warn' : (a.status === 'approved' ? 'badge-success' : 'badge-muted')" x-text="a.status"></span></td>
                       <td class="text-xs" x-text="formatDateTime(a.created_at)"></td>
                       <td>
                         <div class="sales-btn-row" x-show="a.status === 'pending'">
-                          <button class="btn btn-success btn-sm" @click="approve(a.id)">Onayla</button>
+                          <button class="btn btn-success btn-sm" @click="approve(a.id)" x-text="a.channel === 'linkedin_assist' ? 'Operator gorevi ac' : 'Onayla'"></button>
                           <button class="btn btn-danger btn-sm" @click="reject(a.id)">Reddet</button>
                         </div>
                       </td>
@@ -419,7 +629,7 @@
           </section>
 
           <!-- Leads list -->
-          <section class="sales-panel-section">
+          <section class="sales-panel-section" x-show="activeTab === 'profiles'">
             <div class="sales-panel-header">
               <h3>Ham contact adaylari</h3>
               <button class="btn btn-ghost btn-sm" @click="loadLeads()">Yenile</button>
@@ -448,7 +658,7 @@
             </div>
           </section>
 
-          <section class="sales-panel-section" x-show="selectedRunId">
+          <section class="sales-panel-section" x-show="activeTab === 'profiles' && selectedRunId">
             <div class="sales-panel-header">
               <h3>Secili run prospect profilleri</h3>
               <button class="btn btn-ghost btn-sm" @click="loadRunProspects(selectedRunId)">Yenile</button>
@@ -476,7 +686,7 @@
           </section>
 
           <!-- Deliveries -->
-          <section class="sales-panel-section">
+          <section class="sales-panel-section" x-show="activeTab === 'deliveries'">
             <div class="sales-panel-header">
               <h3>Teslimatlar</h3>
               <button class="btn btn-ghost btn-sm" @click="loadDeliveries()">Yenile</button>
@@ -489,7 +699,7 @@
                     <tr>
                       <td x-text="d.channel"></td>
                       <td class="text-xs" x-text="d.recipient"></td>
-                      <td><span class="badge" :class="d.status === 'sent' ? 'badge-success' : 'badge-error'" x-text="d.status"></span></td>
+                      <td><span class="badge" :class="deliveryStatusClass(d)" x-text="d.status"></span></td>
                       <td class="text-xs" x-text="formatDateTime(d.sent_at)"></td>
                       <td class="text-xs"><div class="sales-line-clamp" x-text="d.error || '-'"></div></td>
                     </tr>

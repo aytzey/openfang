@@ -803,21 +803,19 @@ async fn handle_command(
                 } else {
                     serde_json::json!({"type": "error", "content": "Agent not found"})
                 }
+            } else if !args.eq_ignore_ascii_case(CODEX_ONLY_MODEL) {
+                serde_json::json!({
+                    "type": "command_result",
+                    "command": cmd,
+                    "message": format!("Model is locked to {CODEX_ONLY_PROVIDER}:{CODEX_ONLY_MODEL}")
+                })
             } else {
-                if !args.eq_ignore_ascii_case(CODEX_ONLY_MODEL) {
-                    serde_json::json!({
-                        "type": "command_result",
-                        "command": cmd,
-                        "message": format!("Model is locked to {CODEX_ONLY_PROVIDER}:{CODEX_ONLY_MODEL}")
-                    })
-                } else {
-                    match state.kernel.set_agent_model(agent_id, CODEX_ONLY_MODEL) {
-                        Ok(()) => {
-                            serde_json::json!({"type": "command_result", "command": cmd, "message": format!("Model locked to: {CODEX_ONLY_MODEL}")})
-                        }
-                        Err(e) => {
-                            serde_json::json!({"type": "error", "content": format!("Model switch failed: {e}")})
-                        }
+                match state.kernel.set_agent_model(agent_id, CODEX_ONLY_MODEL) {
+                    Ok(()) => {
+                        serde_json::json!({"type": "command_result", "command": cmd, "message": format!("Model locked to: {CODEX_ONLY_MODEL}")})
+                    }
+                    Err(e) => {
+                        serde_json::json!({"type": "error", "content": format!("Model switch failed: {e}")})
                     }
                 }
             }

@@ -5,21 +5,23 @@
 //! 2. Discover candidate customer accounts from public sources
 //! 3. Build persistent prospect dossiers with deterministic memory reuse
 //! 4. Upgrade the best dossiers into outreach-ready leads + approval drafts
-//! 5. Send on manual approval (email + LinkedIn browser automation)
+//! 5. Send on manual approval (email + LinkedIn operator assist)
 
 use crate::codex_oauth::StoredCodexAuth;
 use crate::routes::AppState;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{Html, IntoResponse};
 use axum::Json;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use chrono::{Local, Timelike, Utc};
 use futures::future::join_all;
 use futures::stream::{self, StreamExt};
+use lettre::message::header::{Header, HeaderName, HeaderValue};
 use lettre::message::{Mailbox, Message};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
-use openfang_runtime::browser::BrowserCommand;
 use openfang_runtime::llm_driver::{CompletionRequest, DriverConfig};
 use openfang_runtime::web_cache::WebCache;
 use openfang_runtime::web_search::WebSearchEngine;
@@ -76,10 +78,51 @@ const SALES_OSINT_PROFILE_CONCURRENCY: usize = 4;
 const PROSPECT_LLM_ENRICH_TIMEOUT_SECS: u64 = 18;
 const MAX_OSINT_LINKS_PER_PROSPECT: usize = 6;
 const MAX_OSINT_SEARCH_TARGETS: usize = 24;
+const DISCOVERY_RESERVOIR_CANDIDATES: usize = 90;
+const DISCOVERY_PROSPECT_SEED_LIMIT: usize = 160;
+const DISCOVERY_REFRESH_SCAN_LIMIT: usize = 240;
+const DISCOVERY_OSINT_TARGET_LIMIT: usize = MAX_OSINT_SEARCH_TARGETS;
+const ACTIVATION_EXPLOIT_RATIO: f64 = 0.87;
 const SALES_RUN_REQUEST_TIMEOUT_SECS: u64 = 240;
 const SALES_RUN_RECOVERY_STALE_SECS: i64 = SALES_RUN_REQUEST_TIMEOUT_SECS as i64 + 15;
 const SALES_LLM_PROVIDER: &str = "openai-codex";
 const SALES_LLM_MODEL: &str = "gpt-5.3-codex";
+const DEFAULT_SALES_BASE_URL: &str = "http://127.0.0.1:4200";
+const SALES_UNSUBSCRIBE_SALT: &str = "openfang-sales-unsubscribe";
+
+#[derive(Debug, Clone)]
+struct ListUnsubscribeHeader(String);
+
+impl Header for ListUnsubscribeHeader {
+    fn name() -> HeaderName {
+        HeaderName::new_from_ascii_str("List-Unsubscribe")
+    }
+
+    fn parse(s: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Self(s.to_string()))
+    }
+
+    fn display(&self) -> HeaderValue {
+        HeaderValue::new(Self::name(), self.0.clone())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ListUnsubscribePostHeader(String);
+
+impl Header for ListUnsubscribePostHeader {
+    fn name() -> HeaderName {
+        HeaderName::new_from_ascii_str("List-Unsubscribe-Post")
+    }
+
+    fn parse(s: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Self(s.to_string()))
+    }
+
+    fn display(&self) -> HeaderValue {
+        HeaderValue::new(Self::name(), self.0.clone())
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SalesProfile {
@@ -128,7 +171,7 @@ impl Default for SalesProfile {
             product_name: String::new(),
             product_description: String::new(),
             target_industry: String::new(),
-            target_geo: "US".to_string(),
+            target_geo: String::new(),
             sender_name: String::new(),
             sender_email: String::new(),
             sender_linkedin: None,
@@ -234,16 +277,18 @@ struct SearchEntry {
     snippet: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct DomainCandidate {
     domain: String,
     score: i32,
     evidence: Vec<String>,
     matched_keywords: Vec<String>,
     source_links: Vec<String>,
+    #[serde(default)]
+    phone: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct SourceContactHint {
     contact_name: Option<String>,
     contact_title: Option<String>,
@@ -251,10 +296,174 @@ struct SourceContactHint {
     source: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct FreeDiscoveryCandidate {
     candidate: DomainCandidate,
     contact_hint: SourceContactHint,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+enum PipelineStage {
+    QueryPlanning,
+    Discovery,
+    Merging,
+    Validation,
+    Filtering,
+    Enrichment,
+    LeadGeneration,
+}
+
+impl PipelineStage {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::QueryPlanning => "QueryPlanning",
+            Self::Discovery => "Discovery",
+            Self::Merging => "Merging",
+            Self::Validation => "Validation",
+            Self::Filtering => "Filtering",
+            Self::Enrichment => "Enrichment",
+            Self::LeadGeneration => "LeadGeneration",
+        }
+    }
+
+    fn ordered() -> &'static [PipelineStage] {
+        &[
+            Self::QueryPlanning,
+            Self::Discovery,
+            Self::Merging,
+            Self::Validation,
+            Self::Filtering,
+            Self::Enrichment,
+            Self::LeadGeneration,
+        ]
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct DiscoveryCheckpoint {
+    #[serde(default)]
+    lead_plan: LeadQueryPlanDraft,
+    #[serde(default)]
+    llm_candidates: Vec<DomainCandidate>,
+    #[serde(default)]
+    web_candidates: Vec<DomainCandidate>,
+    #[serde(default)]
+    free_candidates: Vec<FreeDiscoveryCandidate>,
+    #[serde(default)]
+    source_contact_hints: HashMap<String, SourceContactHint>,
+    #[serde(default)]
+    search_unavailable: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct CandidateCheckpoint {
+    #[serde(default)]
+    lead_plan: LeadQueryPlanDraft,
+    #[serde(default)]
+    candidate_list: Vec<DomainCandidate>,
+    #[serde(default)]
+    source_contact_hints: HashMap<String, SourceContactHint>,
+    #[serde(default)]
+    search_unavailable: bool,
+    #[serde(default)]
+    llm_validated_domains: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct JobRetryRequest {
+    #[serde(default)]
+    force_fresh: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct JobStageStatus {
+    name: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct JobProgressResponse {
+    job_id: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_stage: Option<String>,
+    #[serde(default)]
+    stages: Vec<JobStageStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct SourceHealthRow {
+    id: String,
+    source_type: String,
+    precision: Option<f64>,
+    freshness: Option<String>,
+    parser_health: f64,
+    legal_mode: String,
+    historical_reply_yield: Option<f64>,
+    last_checked_at: Option<String>,
+    auto_skip: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct EmailValidation {
+    email: String,
+    syntax_valid: bool,
+    mx_valid: bool,
+    domain_health: f64,
+    suppressed: bool,
+    classification: String,
+    safe_to_send: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct FiveAxisScore {
+    fit_score: f64,
+    intent_score: f64,
+    reachability_score: f64,
+    deliverability_risk: f64,
+    compliance_risk: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+enum SendGateDecision {
+    Block { reason: String },
+    Research { missing: Vec<String> },
+    Nurture { reason: String },
+    Activate,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OutcomeWebhookRequest {
+    delivery_id: String,
+    event_type: String,
+    #[serde(default)]
+    raw_text: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct OutcomeRecord {
+    touch_id: String,
+    outcome_type: String,
+    raw_text: String,
+    classifier_confidence: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UnsubscribeQuery {
+    token: String,
+}
+
+#[derive(Debug, Clone)]
+struct CanonicalAccountSync {
+    score: FiveAxisScore,
+    gate: SendGateDecision,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -323,6 +532,50 @@ pub struct SalesApprovalQuery {
     pub status: Option<String>,
     #[serde(default)]
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct SalesApprovalBulkApproveRequest {
+    #[serde(default)]
+    pub ids: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct SalesPolicyProposalQuery {
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct SalesApprovalEditRequest {
+    #[serde(default)]
+    pub edited_payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SalesPolicyProposal {
+    pub id: String,
+    pub rule_type: String,
+    pub rule_key: String,
+    pub old_value: Option<String>,
+    pub new_value: String,
+    pub proposal_source: Option<String>,
+    pub backtest_result_json: Option<String>,
+    pub holdout_result_json: Option<String>,
+    pub status: String,
+    pub approved_by: Option<String>,
+    pub activated_at: Option<String>,
+    pub version: i64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct ActivationLeadCandidate {
+    account_id: String,
+    priority: i64,
+    lead: SalesLead,
 }
 
 pub struct SalesEngine {
@@ -423,14 +676,386 @@ impl SalesEngine {
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS artifacts (
+                id TEXT PRIMARY KEY,
+                source_type TEXT NOT NULL,
+                source_id TEXT,
+                raw_content TEXT,
+                parse_status TEXT NOT NULL DEFAULT 'ok',
+                parser_health REAL DEFAULT 1.0,
+                freshness TEXT,
+                legal_mode TEXT DEFAULT 'public',
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS evidence (
+                id TEXT PRIMARY KEY,
+                artifact_id TEXT NOT NULL REFERENCES artifacts(id),
+                field_type TEXT NOT NULL,
+                field_value TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0.5,
+                extraction_method TEXT,
+                verified_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS accounts (
+                id TEXT PRIMARY KEY,
+                canonical_name TEXT NOT NULL,
+                display_name TEXT,
+                legal_name TEXT,
+                sector TEXT,
+                geo TEXT,
+                employee_estimate INTEGER,
+                website TEXT,
+                tier TEXT DEFAULT 'standard',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS account_aliases (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL REFERENCES accounts(id),
+                alias_name TEXT NOT NULL,
+                alias_type TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS domains (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL REFERENCES accounts(id),
+                domain TEXT NOT NULL UNIQUE,
+                is_primary INTEGER DEFAULT 0,
+                verified INTEGER DEFAULT 0,
+                mx_valid INTEGER,
+                checked_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS contacts (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL REFERENCES accounts(id),
+                full_name TEXT,
+                title TEXT,
+                seniority TEXT,
+                department TEXT,
+                name_confidence REAL DEFAULT 0.5,
+                title_confidence REAL DEFAULT 0.5,
+                is_decision_maker INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS contact_methods (
+                id TEXT PRIMARY KEY,
+                contact_id TEXT NOT NULL REFERENCES contacts(id),
+                channel_type TEXT NOT NULL,
+                value TEXT NOT NULL,
+                confidence REAL DEFAULT 0.5,
+                verified_at TEXT,
+                classification TEXT,
+                suppressed INTEGER DEFAULT 0,
+                UNIQUE(contact_id, channel_type, value)
+            );
+
+            CREATE TABLE IF NOT EXISTS buyer_roles (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL REFERENCES accounts(id),
+                contact_id TEXT REFERENCES contacts(id),
+                role_type TEXT NOT NULL,
+                inferred_from TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS signals (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL REFERENCES accounts(id),
+                signal_type TEXT NOT NULL,
+                text TEXT NOT NULL,
+                source TEXT,
+                observed_at TEXT,
+                confidence REAL DEFAULT 0.5,
+                effect_horizon TEXT,
+                expires_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS signal_rationales (
+                id TEXT PRIMARY KEY,
+                signal_id TEXT NOT NULL REFERENCES signals(id),
+                account_id TEXT NOT NULL REFERENCES accounts(id),
+                why_it_matters TEXT NOT NULL,
+                expected_effect TEXT,
+                evidence_ids TEXT,
+                confidence REAL DEFAULT 0.5,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                validated_at TEXT,
+                validation_result TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS score_snapshots (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL REFERENCES accounts(id),
+                fit_score REAL NOT NULL DEFAULT 0.0,
+                intent_score REAL NOT NULL DEFAULT 0.0,
+                reachability_score REAL NOT NULL DEFAULT 0.0,
+                deliverability_risk REAL NOT NULL DEFAULT 0.0,
+                compliance_risk REAL NOT NULL DEFAULT 0.0,
+                activation_priority REAL,
+                computed_at TEXT NOT NULL DEFAULT (datetime('now')),
+                scoring_version TEXT NOT NULL DEFAULT 'v1'
+            );
+
+            CREATE TABLE IF NOT EXISTS research_queue (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL REFERENCES accounts(id),
+                priority INTEGER DEFAULT 0,
+                reason TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                assigned_at TEXT,
+                completed_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS account_theses (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL REFERENCES accounts(id),
+                why_this_account TEXT NOT NULL,
+                why_now TEXT,
+                buyer_committee_json TEXT,
+                evidence_ids TEXT,
+                do_not_say TEXT,
+                recommended_channel TEXT,
+                recommended_pain TEXT,
+                thesis_confidence REAL DEFAULT 0.0,
+                thesis_status TEXT NOT NULL DEFAULT 'draft',
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS activation_queue (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL REFERENCES accounts(id),
+                contact_id TEXT REFERENCES contacts(id),
+                thesis_id TEXT REFERENCES account_theses(id),
+                priority INTEGER DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS sequence_templates (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                steps_json TEXT NOT NULL,
+                icp_id TEXT,
+                persona_id TEXT,
+                version INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS sequence_instances (
+                id TEXT PRIMARY KEY,
+                template_id TEXT NOT NULL REFERENCES sequence_templates(id),
+                account_id TEXT NOT NULL REFERENCES accounts(id),
+                contact_id TEXT NOT NULL REFERENCES contacts(id),
+                thesis_id TEXT REFERENCES account_theses(id),
+                current_step INTEGER DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'active',
+                started_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS touches (
+                id TEXT PRIMARY KEY,
+                sequence_instance_id TEXT REFERENCES sequence_instances(id),
+                step INTEGER NOT NULL,
+                channel TEXT NOT NULL,
+                message_payload TEXT NOT NULL,
+                claims_json TEXT,
+                evidence_ids TEXT,
+                variant_id TEXT,
+                risk_flags TEXT,
+                sent_at TEXT,
+                mailbox_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS outcomes (
+                id TEXT PRIMARY KEY,
+                touch_id TEXT NOT NULL REFERENCES touches(id),
+                outcome_type TEXT NOT NULL,
+                raw_text TEXT,
+                classified_at TEXT NOT NULL DEFAULT (datetime('now')),
+                classifier_confidence REAL DEFAULT 1.0
+            );
+
+            CREATE TABLE IF NOT EXISTS outcome_attribution_snapshots (
+                id TEXT PRIMARY KEY,
+                touch_id TEXT NOT NULL REFERENCES touches(id),
+                account_id TEXT NOT NULL REFERENCES accounts(id),
+                snapshot_at TEXT NOT NULL DEFAULT (datetime('now')),
+                score_at_touch_json TEXT,
+                active_signal_ids TEXT,
+                unused_signal_ids TEXT,
+                thesis_id TEXT,
+                sequence_variant TEXT,
+                message_variant TEXT,
+                channel TEXT,
+                mailbox_id TEXT,
+                contextual_factors_json TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS missed_signal_reviews (
+                id TEXT PRIMARY KEY,
+                outcome_id TEXT NOT NULL REFERENCES outcomes(id),
+                snapshot_id TEXT NOT NULL REFERENCES outcome_attribution_snapshots(id),
+                reviewed_at TEXT NOT NULL DEFAULT (datetime('now')),
+                validated_signals TEXT,
+                false_positive_signals TEXT,
+                missed_signals TEXT,
+                timing_mistakes TEXT,
+                persona_mismatch TEXT,
+                channel_mismatch TEXT,
+                reviewer_type TEXT DEFAULT 'auto'
+            );
+
+            CREATE TABLE IF NOT EXISTS retrieval_rule_versions (
+                id TEXT PRIMARY KEY,
+                rule_type TEXT NOT NULL,
+                rule_key TEXT NOT NULL,
+                old_value TEXT,
+                new_value TEXT NOT NULL,
+                proposal_source TEXT,
+                backtest_result_json TEXT,
+                holdout_result_json TEXT,
+                status TEXT NOT NULL DEFAULT 'proposed',
+                approved_by TEXT,
+                activated_at TEXT,
+                version INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS contextual_factors (
+                id TEXT PRIMARY KEY,
+                factor_type TEXT NOT NULL,
+                factor_key TEXT NOT NULL,
+                factor_value TEXT,
+                effective_from TEXT,
+                effective_until TEXT,
+                source TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS exploration_log (
+                id TEXT PRIMARY KEY,
+                touch_id TEXT REFERENCES touches(id),
+                account_id TEXT NOT NULL REFERENCES accounts(id),
+                exploration_reason TEXT NOT NULL,
+                exploration_type TEXT,
+                outcome_id TEXT,
+                learned_pattern TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS suppressions (
+                id TEXT PRIMARY KEY,
+                contact_method_value TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                source_outcome_id TEXT,
+                suppressed_at TEXT NOT NULL DEFAULT (datetime('now')),
+                permanent INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS experiments (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                hypothesis TEXT,
+                variant_a TEXT,
+                variant_b TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS experiment_assignments (
+                id TEXT PRIMARY KEY,
+                experiment_id TEXT NOT NULL REFERENCES experiments(id),
+                sequence_instance_id TEXT,
+                variant TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS source_health (
+                id TEXT PRIMARY KEY,
+                source_type TEXT NOT NULL UNIQUE,
+                precision REAL,
+                freshness TEXT,
+                parser_health REAL DEFAULT 1.0,
+                legal_mode TEXT DEFAULT 'public',
+                historical_reply_yield REAL,
+                last_checked_at TEXT,
+                auto_skip INTEGER DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS job_runs (
+                id TEXT PRIMARY KEY,
+                job_type TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running',
+                started_at TEXT NOT NULL DEFAULT (datetime('now')),
+                completed_at TEXT,
+                error_message TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS job_stages (
+                id TEXT PRIMARY KEY,
+                job_run_id TEXT NOT NULL REFERENCES job_runs(id),
+                stage_name TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                checkpoint_data TEXT,
+                started_at TEXT,
+                completed_at TEXT,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS icp_definitions (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                sector_rules TEXT,
+                geo_rules TEXT,
+                size_rules TEXT,
+                negative_rules TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS segments (
+                id TEXT PRIMARY KEY,
+                icp_id TEXT NOT NULL REFERENCES icp_definitions(id),
+                name TEXT NOT NULL,
+                criteria_json TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS personas (
+                id TEXT PRIMARY KEY,
+                segment_id TEXT NOT NULL REFERENCES segments(id),
+                role_type TEXT NOT NULL,
+                pain_angles TEXT,
+                message_strategy TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS sender_policies (
+                id TEXT PRIMARY KEY,
+                icp_id TEXT REFERENCES icp_definitions(id),
+                mailbox_pool TEXT,
+                daily_cap INTEGER DEFAULT 20,
+                subdomain TEXT,
+                warm_state TEXT DEFAULT 'cold'
+            );
+
             CREATE INDEX IF NOT EXISTS idx_approvals_status_created ON approvals(status, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_leads_created ON leads(created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_deliveries_sent ON deliveries(sent_at DESC);
             CREATE INDEX IF NOT EXISTS idx_prospect_profiles_run_updated ON prospect_profiles(run_id, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_prospect_profiles_updated ON prospect_profiles(updated_at DESC);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_approvals_pending_recipient
+                ON approvals(channel, json_extract(payload_json, '$.to'))
+                WHERE status = 'pending';
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_suppressions_value
+                ON suppressions(contact_method_value);
         "#,
         )
         .map_err(|e| format!("Failed to initialize sales db: {e}"))?;
+        self.migrate_legacy_to_canonical_core()?;
         Ok(())
     }
 
@@ -714,6 +1339,1961 @@ impl SalesEngine {
         Ok(())
     }
 
+    fn create_job_run(&self, job_type: &str) -> Result<String, String> {
+        let conn = self.open()?;
+        let job_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO job_runs (id, job_type, status, started_at) VALUES (?1, ?2, 'running', ?3)",
+            params![job_id, job_type, Utc::now().to_rfc3339()],
+        )
+        .map_err(|e| format!("Failed to create job run: {e}"))?;
+        self.ensure_job_stage_rows(&conn, &job_id)?;
+        Ok(job_id)
+    }
+
+    fn ensure_job_stage_rows(&self, conn: &Connection, job_id: &str) -> Result<(), String> {
+        for stage in PipelineStage::ordered() {
+            conn.execute(
+                "INSERT OR IGNORE INTO job_stages (id, job_run_id, stage_name, status, updated_at)
+                 VALUES (?1, ?2, ?3, 'pending', ?4)",
+                params![
+                    format!("{job_id}:{}", stage.as_str()),
+                    job_id,
+                    stage.as_str(),
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .map_err(|e| format!("Failed to create job stage rows: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn set_job_stage_running(&self, job_id: &str, stage: PipelineStage) -> Result<(), String> {
+        let conn = self.open()?;
+        self.ensure_job_stage_rows(&conn, job_id)?;
+        conn.execute(
+            "UPDATE job_stages
+             SET status = 'running',
+                 started_at = COALESCE(started_at, ?3),
+                 updated_at = ?3
+             WHERE job_run_id = ?1 AND stage_name = ?2",
+            params![job_id, stage.as_str(), Utc::now().to_rfc3339()],
+        )
+        .map_err(|e| format!("Failed to update job stage to running: {e}"))?;
+        Ok(())
+    }
+
+    fn complete_job_stage<T: Serialize>(
+        &self,
+        job_id: &str,
+        stage: PipelineStage,
+        checkpoint: &T,
+    ) -> Result<(), String> {
+        let conn = self.open()?;
+        let checkpoint_data = serde_json::to_string(checkpoint)
+            .map_err(|e| format!("Failed to serialize job checkpoint: {e}"))?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE job_stages
+             SET status = 'completed',
+                 checkpoint_data = ?3,
+                 completed_at = ?4,
+                 updated_at = ?4
+             WHERE job_run_id = ?1 AND stage_name = ?2",
+            params![job_id, stage.as_str(), checkpoint_data, now],
+        )
+        .map_err(|e| format!("Failed to complete job stage: {e}"))?;
+        Ok(())
+    }
+
+    fn fail_job_stage(&self, job_id: &str, stage: PipelineStage, error_msg: &str) -> Result<(), String> {
+        let conn = self.open()?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE job_stages
+             SET status = 'failed',
+                 checkpoint_data = ?3,
+                 completed_at = ?4,
+                 updated_at = ?4
+             WHERE job_run_id = ?1 AND stage_name = ?2",
+            params![
+                job_id,
+                stage.as_str(),
+                serde_json::json!({ "error": error_msg }).to_string(),
+                now
+            ],
+        )
+        .map_err(|e| format!("Failed to mark job stage failed: {e}"))?;
+        conn.execute(
+            "UPDATE job_runs SET status = 'failed', completed_at = ?2, error_message = ?3 WHERE id = ?1",
+            params![job_id, now, error_msg],
+        )
+        .map_err(|e| format!("Failed to mark job run failed: {e}"))?;
+        Ok(())
+    }
+
+    fn complete_job_run(&self, job_id: &str) -> Result<(), String> {
+        let conn = self.open()?;
+        conn.execute(
+            "UPDATE job_runs SET status = 'completed', completed_at = ?2, error_message = NULL WHERE id = ?1",
+            params![job_id, Utc::now().to_rfc3339()],
+        )
+        .map_err(|e| format!("Failed to complete job run: {e}"))?;
+        Ok(())
+    }
+
+    fn get_job_progress(&self, job_id: &str) -> Result<Option<JobProgressResponse>, String> {
+        let conn = self.open()?;
+        let job = conn
+            .query_row(
+                "SELECT status, error_message FROM job_runs WHERE id = ?1",
+                params![job_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()
+            .map_err(|e| format!("Job progress lookup failed: {e}"))?;
+        let Some((status, error_message)) = job else {
+            return Ok(None);
+        };
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT stage_name, status, started_at, completed_at
+                 FROM job_stages
+                 WHERE job_run_id = ?1
+                 ORDER BY CASE stage_name
+                    WHEN 'QueryPlanning' THEN 1
+                    WHEN 'Discovery' THEN 2
+                    WHEN 'Merging' THEN 3
+                    WHEN 'Validation' THEN 4
+                    WHEN 'Filtering' THEN 5
+                    WHEN 'Enrichment' THEN 6
+                    WHEN 'LeadGeneration' THEN 7
+                    ELSE 99 END",
+            )
+            .map_err(|e| format!("Prepare job stages query failed: {e}"))?;
+        let stages = stmt
+            .query_map(params![job_id], |row| {
+                Ok(JobStageStatus {
+                    name: row.get::<_, String>(0)?,
+                    status: row.get::<_, String>(1)?,
+                    started_at: row.get::<_, Option<String>>(2)?,
+                    completed_at: row.get::<_, Option<String>>(3)?,
+                })
+            })
+            .map_err(|e| format!("Job stages query failed: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Job stages row decode failed: {e}"))?;
+
+        let current_stage = stages
+            .iter()
+            .find(|stage| stage.status == "running" || stage.status == "failed")
+            .map(|stage| stage.name.clone())
+            .or_else(|| {
+                stages
+                    .iter()
+                    .rev()
+                    .find(|stage| stage.status == "completed")
+                    .map(|stage| stage.name.clone())
+            });
+
+        Ok(Some(JobProgressResponse {
+            job_id: job_id.to_string(),
+            status,
+            current_stage,
+            stages,
+            error_message,
+        }))
+    }
+
+    fn latest_completed_checkpoint(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<(PipelineStage, String)>, String> {
+        let conn = self.open()?;
+        let row = conn
+            .query_row(
+                "SELECT stage_name, checkpoint_data
+                 FROM job_stages
+                 WHERE job_run_id = ?1
+                   AND status = 'completed'
+                   AND checkpoint_data IS NOT NULL
+                 ORDER BY CASE stage_name
+                    WHEN 'QueryPlanning' THEN 1
+                    WHEN 'Discovery' THEN 2
+                    WHEN 'Merging' THEN 3
+                    WHEN 'Validation' THEN 4
+                    WHEN 'Filtering' THEN 5
+                    WHEN 'Enrichment' THEN 6
+                    WHEN 'LeadGeneration' THEN 7
+                    ELSE 99 END DESC
+                 LIMIT 1",
+                params![job_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|e| format!("Checkpoint lookup failed: {e}"))?;
+        let Some((stage_name, checkpoint_data)) = row else {
+            return Ok(None);
+        };
+        let stage = match stage_name.as_str() {
+            "QueryPlanning" => PipelineStage::QueryPlanning,
+            "Discovery" => PipelineStage::Discovery,
+            "Merging" => PipelineStage::Merging,
+            "Validation" => PipelineStage::Validation,
+            "Filtering" => PipelineStage::Filtering,
+            "Enrichment" => PipelineStage::Enrichment,
+            "LeadGeneration" => PipelineStage::LeadGeneration,
+            _ => return Ok(None),
+        };
+        Ok(Some((stage, checkpoint_data)))
+    }
+
+    fn approval_already_pending(
+        &self,
+        conn: &Connection,
+        channel: &str,
+        recipient: &str,
+    ) -> Result<bool, String> {
+        let recipient_json_path = if channel == "email" { "$.to" } else { "$.profile_url" };
+        let sql = format!(
+            "SELECT COUNT(*)
+             FROM approvals
+             WHERE channel = ?1
+               AND status = 'pending'
+               AND json_extract(payload_json, '{recipient_json_path}') = ?2"
+        );
+        conn.query_row(sql.as_str(), params![channel, recipient], |row| row.get::<_, i64>(0))
+            .map(|count| count > 0)
+            .map_err(|e| format!("Pending approval lookup failed: {e}"))
+    }
+
+    fn is_suppressed(&self, conn: &Connection, contact_value: &str) -> Result<bool, String> {
+        conn.query_row(
+            "SELECT COUNT(*) FROM suppressions WHERE contact_method_value = ?1",
+            params![contact_value.trim().to_lowercase()],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count > 0)
+        .map_err(|e| format!("Suppression lookup failed: {e}"))
+    }
+
+    fn suppress_contact(
+        &self,
+        conn: &Connection,
+        value: &str,
+        reason: &str,
+        permanent: bool,
+        source_outcome_id: Option<&str>,
+    ) -> Result<(), String> {
+        conn.execute(
+            "INSERT OR IGNORE INTO suppressions
+             (id, contact_method_value, reason, source_outcome_id, suppressed_at, permanent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                value.trim().to_lowercase(),
+                reason,
+                source_outcome_id,
+                Utc::now().to_rfc3339(),
+                i32::from(permanent)
+            ],
+        )
+        .map_err(|e| format!("Failed to suppress contact: {e}"))?;
+        Ok(())
+    }
+
+    fn update_source_health(&self, source_type: &str, count: usize) -> Result<(), String> {
+        let conn = self.open()?;
+        let now = Utc::now().to_rfc3339();
+        let parser_health = if count == 0 { 0.0 } else { 1.0 };
+        conn.execute(
+            "INSERT INTO source_health (id, source_type, parser_health, freshness, last_checked_at, auto_skip)
+             VALUES (?1, ?2, ?3, ?4, ?4, ?5)
+             ON CONFLICT(source_type) DO UPDATE SET
+                parser_health = excluded.parser_health,
+                freshness = excluded.freshness,
+                last_checked_at = excluded.last_checked_at,
+                auto_skip = CASE WHEN excluded.parser_health = 0.0 THEN 1 ELSE 0 END",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                source_type,
+                parser_health,
+                now,
+                if count == 0 { 1 } else { 0 }
+            ],
+        )
+        .map_err(|e| format!("Failed to update source health: {e}"))?;
+        Ok(())
+    }
+
+    fn should_skip_source(&self, source_type: &str) -> Result<bool, String> {
+        let conn = self.open()?;
+        let auto_skip = conn
+            .query_row(
+                "SELECT COALESCE(auto_skip, 0) FROM source_health WHERE source_type = ?1",
+                params![source_type],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| format!("Source health lookup failed: {e}"))?
+            .unwrap_or(0);
+        Ok(auto_skip == 1)
+    }
+
+    fn list_source_health(&self) -> Result<Vec<SourceHealthRow>, String> {
+        let conn = self.open()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, source_type, precision, freshness, parser_health, legal_mode,
+                        historical_reply_yield, last_checked_at, auto_skip
+                 FROM source_health
+                 ORDER BY source_type ASC",
+            )
+            .map_err(|e| format!("Prepare source_health query failed: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+            Ok(SourceHealthRow {
+                id: row.get::<_, String>(0)?,
+                source_type: row.get::<_, String>(1)?,
+                precision: row.get::<_, Option<f64>>(2)?,
+                freshness: row.get::<_, Option<String>>(3)?,
+                parser_health: row.get::<_, f64>(4).unwrap_or(0.0),
+                legal_mode: row.get::<_, String>(5).unwrap_or_else(|_| "public".to_string()),
+                historical_reply_yield: row.get::<_, Option<f64>>(6)?,
+                last_checked_at: row.get::<_, Option<String>>(7)?,
+                auto_skip: row.get::<_, i64>(8).unwrap_or(0) == 1,
+            })
+        })
+        .map_err(|e| format!("Source health query failed: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Source health row decode failed: {e}"))
+    }
+
+    fn update_lead_status(&self, lead_id: &str, status: &str) -> Result<(), String> {
+        let conn = self.open()?;
+        conn.execute(
+            "UPDATE leads SET status = ?2 WHERE id = ?1",
+            params![lead_id, status],
+        )
+        .map_err(|e| format!("Failed to update lead status: {e}"))?;
+        Ok(())
+    }
+
+    fn select_accounts_for_activation(
+        &self,
+        conn: &Connection,
+        candidate_priorities: &HashMap<String, i64>,
+        daily_target: u32,
+    ) -> Result<Vec<String>, String> {
+        if daily_target == 0 || candidate_priorities.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let target = daily_target as usize;
+        let exploit_target = ((target as f64) * ACTIVATION_EXPLOIT_RATIO).ceil() as usize;
+        let candidate_ids = candidate_priorities.keys().cloned().collect::<HashSet<_>>();
+        let mut selected = Vec::<String>::new();
+        let mut selected_set = HashSet::<String>::new();
+
+        let mut activation_stmt = conn
+            .prepare(
+                "SELECT account_id, priority
+                 FROM activation_queue
+                 WHERE status = 'pending'
+                 ORDER BY priority DESC, created_at ASC",
+            )
+            .map_err(|e| format!("Failed to prepare activation selection query: {e}"))?;
+        let activation_rows = activation_stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+            .map_err(|e| format!("Failed to query activation queue: {e}"))?;
+        for row in activation_rows {
+            let (account_id, _priority) =
+                row.map_err(|e| format!("Failed to decode activation queue row: {e}"))?;
+            if !candidate_ids.contains(&account_id) || !selected_set.insert(account_id.clone()) {
+                continue;
+            }
+            selected.push(account_id);
+            if selected.len() >= exploit_target.min(target) {
+                break;
+            }
+        }
+
+        if selected.len() < target {
+            let recent_exploration = conn
+                .prepare(
+                    "SELECT DISTINCT account_id
+                     FROM exploration_log
+                     WHERE created_at >= datetime('now', '-30 days')",
+                )
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |row| row.get::<_, String>(0))?
+                        .collect::<Result<HashSet<_>, _>>()
+                })
+                .map_err(|e| format!("Failed to load exploration history: {e}"))?;
+
+            let mut score_stmt = conn
+                .prepare(
+                    "SELECT s.account_id,
+                            s.fit_score,
+                            COALESCE(s.activation_priority, 0.0)
+                     FROM score_snapshots s
+                     INNER JOIN (
+                        SELECT account_id, MAX(computed_at) AS computed_at
+                        FROM score_snapshots
+                        GROUP BY account_id
+                     ) latest
+                       ON latest.account_id = s.account_id
+                      AND latest.computed_at = s.computed_at",
+                )
+                .map_err(|e| format!("Failed to prepare exploration selection query: {e}"))?;
+            let mut exploratory = score_stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, f64>(1)?,
+                        row.get::<_, f64>(2)?,
+                    ))
+                })
+                .map_err(|e| format!("Failed to query exploration candidates: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to decode exploration candidates: {e}"))?;
+            exploratory.retain(|(account_id, fit_score, _priority)| {
+                candidate_ids.contains(account_id)
+                    && !selected_set.contains(account_id)
+                    && !recent_exploration.contains(account_id)
+                    && (0.3..=0.7).contains(fit_score)
+            });
+            exploratory.sort_by(|a, b| {
+                b.2.partial_cmp(&a.2)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            let remaining_slots = target.saturating_sub(selected.len());
+            for (account_id, _fit_score, _priority) in exploratory.into_iter().take(remaining_slots)
+            {
+                conn.execute(
+                    "INSERT INTO exploration_log
+                     (id, account_id, exploration_reason, exploration_type, outcome_id, learned_pattern, created_at)
+                     VALUES (?1, ?2, 'scheduled_exploration', 'mid_score_priority', NULL, NULL, ?3)",
+                    params![
+                        stable_sales_id("explore", &[&account_id, &Utc::now().format("%Y-%m-%d").to_string()]),
+                        account_id,
+                        Utc::now().to_rfc3339(),
+                    ],
+                )
+                .map_err(|e| format!("Failed to record exploration selection: {e}"))?;
+                if selected_set.insert(account_id.clone()) {
+                    selected.push(account_id);
+                }
+            }
+        }
+
+        if selected.len() < target {
+            let mut fallback = candidate_priorities
+                .iter()
+                .map(|(account_id, priority)| (account_id.clone(), *priority))
+                .collect::<Vec<_>>();
+            fallback.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            for (account_id, _priority) in fallback {
+                if selected.len() >= target {
+                    break;
+                }
+                if selected_set.insert(account_id.clone()) {
+                    selected.push(account_id);
+                }
+            }
+        }
+
+        for account_id in &selected {
+            conn.execute(
+                "UPDATE activation_queue
+                 SET status = 'activated'
+                 WHERE account_id = ?1 AND status = 'pending'",
+                params![account_id],
+            )
+            .map_err(|e| format!("Failed to mark activation queue row activated: {e}"))?;
+        }
+
+        Ok(selected)
+    }
+
+    fn load_policy_proposal(
+        &self,
+        conn: &Connection,
+        id: &str,
+    ) -> Result<Option<SalesPolicyProposal>, String> {
+        conn.query_row(
+            "SELECT id, rule_type, rule_key, old_value, new_value, proposal_source,
+                    backtest_result_json, holdout_result_json, status, approved_by,
+                    activated_at, version, created_at
+             FROM retrieval_rule_versions
+             WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(SalesPolicyProposal {
+                    id: row.get::<_, String>(0)?,
+                    rule_type: row.get::<_, String>(1)?,
+                    rule_key: row.get::<_, String>(2)?,
+                    old_value: row.get::<_, Option<String>>(3)?,
+                    new_value: row.get::<_, String>(4)?,
+                    proposal_source: row.get::<_, Option<String>>(5)?,
+                    backtest_result_json: row.get::<_, Option<String>>(6)?,
+                    holdout_result_json: row.get::<_, Option<String>>(7)?,
+                    status: row.get::<_, String>(8)?,
+                    approved_by: row.get::<_, Option<String>>(9)?,
+                    activated_at: row.get::<_, Option<String>>(10)?,
+                    version: row.get::<_, i64>(11)?,
+                    created_at: row.get::<_, String>(12)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| format!("Failed to load policy proposal: {e}"))
+    }
+
+    fn list_policy_proposals(
+        &self,
+        status: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SalesPolicyProposal>, String> {
+        let conn = self.open()?;
+        if let Some(status) = status {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, rule_type, rule_key, old_value, new_value, proposal_source,
+                            backtest_result_json, holdout_result_json, status, approved_by,
+                            activated_at, version, created_at
+                     FROM retrieval_rule_versions
+                     WHERE status = ?1
+                     ORDER BY created_at DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| format!("Failed to prepare policy proposals query: {e}"))?;
+            let rows = stmt
+                .query_map(params![status, limit as i64], |row| {
+                    Ok(SalesPolicyProposal {
+                        id: row.get::<_, String>(0)?,
+                        rule_type: row.get::<_, String>(1)?,
+                        rule_key: row.get::<_, String>(2)?,
+                        old_value: row.get::<_, Option<String>>(3)?,
+                        new_value: row.get::<_, String>(4)?,
+                        proposal_source: row.get::<_, Option<String>>(5)?,
+                        backtest_result_json: row.get::<_, Option<String>>(6)?,
+                        holdout_result_json: row.get::<_, Option<String>>(7)?,
+                        status: row.get::<_, String>(8)?,
+                        approved_by: row.get::<_, Option<String>>(9)?,
+                        activated_at: row.get::<_, Option<String>>(10)?,
+                        version: row.get::<_, i64>(11)?,
+                        created_at: row.get::<_, String>(12)?,
+                    })
+                })
+                .map_err(|e| format!("Failed to query policy proposals: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to decode policy proposals: {e}"))
+        } else {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, rule_type, rule_key, old_value, new_value, proposal_source,
+                            backtest_result_json, holdout_result_json, status, approved_by,
+                            activated_at, version, created_at
+                     FROM retrieval_rule_versions
+                     ORDER BY created_at DESC
+                     LIMIT ?1",
+                )
+                .map_err(|e| format!("Failed to prepare policy proposals query: {e}"))?;
+            let rows = stmt
+                .query_map(params![limit as i64], |row| {
+                    Ok(SalesPolicyProposal {
+                        id: row.get::<_, String>(0)?,
+                        rule_type: row.get::<_, String>(1)?,
+                        rule_key: row.get::<_, String>(2)?,
+                        old_value: row.get::<_, Option<String>>(3)?,
+                        new_value: row.get::<_, String>(4)?,
+                        proposal_source: row.get::<_, Option<String>>(5)?,
+                        backtest_result_json: row.get::<_, Option<String>>(6)?,
+                        holdout_result_json: row.get::<_, Option<String>>(7)?,
+                        status: row.get::<_, String>(8)?,
+                        approved_by: row.get::<_, Option<String>>(9)?,
+                        activated_at: row.get::<_, Option<String>>(10)?,
+                        version: row.get::<_, i64>(11)?,
+                        created_at: row.get::<_, String>(12)?,
+                    })
+                })
+                .map_err(|e| format!("Failed to query policy proposals: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to decode policy proposals: {e}"))
+        }
+    }
+
+    fn update_policy_proposal_status(
+        &self,
+        id: &str,
+        status: &str,
+        approved_by: Option<&str>,
+    ) -> Result<Option<SalesPolicyProposal>, String> {
+        let conn = self.open()?;
+        let now = Utc::now().to_rfc3339();
+        let activated_at = if status == "active" {
+            Some(now.clone())
+        } else {
+            None
+        };
+        conn.execute(
+            "UPDATE retrieval_rule_versions
+             SET status = ?2,
+                 approved_by = COALESCE(?3, approved_by),
+                 activated_at = CASE
+                    WHEN ?2 = 'active' THEN ?4
+                    WHEN ?2 = 'retired' THEN NULL
+                    ELSE activated_at
+                 END
+             WHERE id = ?1",
+            params![id, status, approved_by, activated_at],
+        )
+        .map_err(|e| format!("Failed to update policy proposal status: {e}"))?;
+        self.load_policy_proposal(&conn, id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_or_refresh_policy_proposal(
+        &self,
+        conn: &Connection,
+        rule_type: &str,
+        rule_key: &str,
+        old_value: Option<&str>,
+        new_value: &str,
+        proposal_source: &str,
+        backtest_result: &serde_json::Value,
+    ) -> Result<String, String> {
+        let proposal_id =
+            stable_sales_id("rule_proposal", &[rule_type, rule_key, new_value, proposal_source]);
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO retrieval_rule_versions
+             (id, rule_type, rule_key, old_value, new_value, proposal_source,
+              backtest_result_json, holdout_result_json, status, approved_by,
+              activated_at, version, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 'proposed', NULL, NULL, 1, ?8)
+             ON CONFLICT(id) DO UPDATE SET
+                old_value = excluded.old_value,
+                new_value = excluded.new_value,
+                proposal_source = excluded.proposal_source,
+                backtest_result_json = excluded.backtest_result_json,
+                status = CASE
+                    WHEN retrieval_rule_versions.status = 'active' THEN retrieval_rule_versions.status
+                    ELSE 'proposed'
+                END",
+            params![
+                proposal_id,
+                rule_type,
+                rule_key,
+                old_value,
+                new_value,
+                proposal_source,
+                backtest_result.to_string(),
+                now,
+            ],
+        )
+        .map_err(|e| format!("Failed to create policy proposal: {e}"))?;
+        Ok(proposal_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_missed_signal_review(
+        &self,
+        conn: &Connection,
+        outcome_id: &str,
+        snapshot_id: &str,
+        account_id: &str,
+        outcome_type: &str,
+        active_signal_ids: &[String],
+        unused_signal_ids: &[String],
+    ) -> Result<(), String> {
+        let mut signal_stmt = conn
+            .prepare(
+                "SELECT id, signal_type
+                 FROM signals
+                 WHERE account_id = ?1
+                 ORDER BY confidence DESC, created_at DESC",
+            )
+            .map_err(|e| format!("Failed to prepare missed-signal query: {e}"))?;
+        let all_signals = signal_stmt
+            .query_map(params![account_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| format!("Failed to query missed-signal candidates: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to decode missed-signal candidates: {e}"))?;
+        let all_signal_types = all_signals
+            .iter()
+            .map(|(signal_id, signal_type)| (signal_id.clone(), signal_type.clone()))
+            .collect::<HashMap<_, _>>();
+        let active_set = active_signal_ids.iter().cloned().collect::<HashSet<_>>();
+        let unused_set = unused_signal_ids.iter().cloned().collect::<HashSet<_>>();
+        let missed_signals = all_signals
+            .iter()
+            .filter(|(signal_id, _)| !active_set.contains(signal_id) && !unused_set.contains(signal_id))
+            .map(|(signal_id, _)| signal_id.clone())
+            .collect::<Vec<_>>();
+
+        let positive_outcome = matches!(
+            outcome_type,
+            "open" | "click" | "forwarded" | "referral" | "interested" | "meeting_booked"
+                | "closed_won"
+        );
+        let negative_outcome = matches!(
+            outcome_type,
+            "hard_bounce"
+                | "soft_bounce"
+                | "no_reply"
+                | "auto_reply"
+                | "unsubscribe"
+                | "wrong_person"
+                | "not_now"
+                | "closed_lost"
+        );
+        let validated_signals = if positive_outcome {
+            active_signal_ids.to_vec()
+        } else {
+            Vec::new()
+        };
+        let false_positive_signals = if negative_outcome {
+            active_signal_ids.to_vec()
+        } else {
+            Vec::new()
+        };
+        let review_id = stable_sales_id("missed_signal_review", &[outcome_id, snapshot_id]);
+        conn.execute(
+            "INSERT INTO missed_signal_reviews
+             (id, outcome_id, snapshot_id, reviewed_at, validated_signals, false_positive_signals,
+              missed_signals, timing_mistakes, persona_mismatch, channel_mismatch, reviewer_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '[]', NULL, NULL, 'auto')
+             ON CONFLICT(id) DO UPDATE SET
+                reviewed_at = excluded.reviewed_at,
+                validated_signals = excluded.validated_signals,
+                false_positive_signals = excluded.false_positive_signals,
+                missed_signals = excluded.missed_signals",
+            params![
+                review_id,
+                outcome_id,
+                snapshot_id,
+                Utc::now().to_rfc3339(),
+                serde_json::to_string(&validated_signals)
+                    .map_err(|e| format!("Failed to encode validated signals: {e}"))?,
+                serde_json::to_string(&false_positive_signals)
+                    .map_err(|e| format!("Failed to encode false-positive signals: {e}"))?,
+                serde_json::to_string(&missed_signals)
+                    .map_err(|e| format!("Failed to encode missed signals: {e}"))?,
+            ],
+        )
+        .map_err(|e| format!("Failed to persist missed signal review: {e}"))?;
+
+        let (proposal_direction, driver_signal_id) = if let Some(signal_id) = validated_signals.first()
+        {
+            ("increase", Some(signal_id.clone()))
+        } else if let Some(signal_id) = false_positive_signals.first() {
+            ("decrease", Some(signal_id.clone()))
+        } else {
+            ("" , None)
+        };
+        if let Some(signal_id) = driver_signal_id {
+            if let Some(signal_type) = all_signal_types.get(&signal_id) {
+                let proposal_payload = serde_json::json!({
+                    "signal_type": signal_type,
+                    "direction": proposal_direction,
+                    "trigger_outcome": outcome_type,
+                    "driver_signal_id": signal_id,
+                    "review_id": review_id,
+                });
+                let backtest_result = serde_json::json!({
+                    "outcome_id": outcome_id,
+                    "validated_signal_count": validated_signals.len(),
+                    "false_positive_signal_count": false_positive_signals.len(),
+                    "missed_signal_count": missed_signals.len(),
+                });
+                let _ = self.create_or_refresh_policy_proposal(
+                    conn,
+                    "signal_weight",
+                    &format!("signal_weight::{signal_type}"),
+                    None,
+                    &proposal_payload.to_string(),
+                    &format!("auto_outcome_review::{outcome_type}"),
+                    &backtest_result,
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn migrate_legacy_to_canonical_core(&self) -> Result<(), String> {
+        let conn = self.open()?;
+        let sales_profile = self.get_profile().ok().flatten();
+
+        if let Some(profile) = sales_profile.as_ref() {
+            let icp_id = "default_icp";
+            conn.execute(
+                "INSERT INTO icp_definitions (id, name, sector_rules, geo_rules, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    sector_rules = excluded.sector_rules,
+                    geo_rules = excluded.geo_rules",
+                params![
+                    icp_id,
+                    format!("{} ICP", profile.product_name.trim()),
+                    serde_json::json!([profile.target_industry]).to_string(),
+                    serde_json::json!([profile.target_geo]).to_string(),
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .map_err(|e| format!("Failed to upsert icp_definitions: {e}"))?;
+
+            let sender_domain = email_domain(&profile.sender_email).unwrap_or_default();
+            conn.execute(
+                "INSERT INTO sender_policies (id, icp_id, mailbox_pool, daily_cap, subdomain, warm_state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'warming')
+                 ON CONFLICT(id) DO UPDATE SET
+                    mailbox_pool = excluded.mailbox_pool,
+                    daily_cap = excluded.daily_cap,
+                    subdomain = excluded.subdomain",
+                params![
+                    "default_sender_policy",
+                    icp_id,
+                    serde_json::json!([profile.sender_email]).to_string(),
+                    profile.daily_send_cap as i64,
+                    sender_domain,
+                ],
+            )
+            .map_err(|e| format!("Failed to upsert sender_policies: {e}"))?;
+        }
+
+        for profile in self.list_stored_prospect_profiles(10_000, None).unwrap_or_default() {
+            self.migrate_prospect_profile(&conn, &profile, sales_profile.as_ref())?;
+        }
+        for lead in self.list_leads(10_000, None).unwrap_or_default() {
+            self.migrate_lead(&conn, &lead, sales_profile.as_ref())?;
+        }
+        Ok(())
+    }
+
+    fn migrate_prospect_profile(
+        &self,
+        conn: &Connection,
+        profile: &SalesProspectProfile,
+        sales_profile: Option<&SalesProfile>,
+    ) -> Result<(), String> {
+        let account_id = stable_sales_id("acct", &[&profile.company_domain]);
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO accounts (id, canonical_name, display_name, sector, geo, website, tier, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+             ON CONFLICT(id) DO UPDATE SET
+                canonical_name = excluded.canonical_name,
+                display_name = excluded.display_name,
+                sector = COALESCE(accounts.sector, excluded.sector),
+                geo = COALESCE(accounts.geo, excluded.geo),
+                website = COALESCE(accounts.website, excluded.website),
+                tier = excluded.tier,
+                updated_at = excluded.updated_at",
+            params![
+                account_id,
+                profile.company,
+                profile.company,
+                sales_profile.map(|p| p.target_industry.clone()),
+                sales_profile.map(|p| p.target_geo.clone()),
+                profile.website,
+                "standard",
+                now,
+            ],
+        )
+        .map_err(|e| format!("Failed to migrate account from prospect profile: {e}"))?;
+
+        let domain_id = stable_sales_id("dom", &[&profile.company_domain]);
+        conn.execute(
+            "INSERT INTO domains (id, account_id, domain, is_primary, verified, checked_at)
+             VALUES (?1, ?2, ?3, 1, ?4, ?5)
+             ON CONFLICT(domain) DO UPDATE SET
+                account_id = excluded.account_id,
+                verified = excluded.verified,
+                checked_at = excluded.checked_at",
+            params![
+                domain_id,
+                account_id,
+                profile.company_domain,
+                i32::from(is_valid_company_domain(&profile.company_domain)),
+                now,
+            ],
+        )
+        .map_err(|e| format!("Failed to migrate domain from prospect profile: {e}"))?;
+
+        if profile.primary_contact_name.is_some() || profile.primary_contact_title.is_some() {
+            let contact_id = stable_sales_id(
+                "contact",
+                &[
+                    &profile.company_domain,
+                    profile.primary_contact_name.as_deref().unwrap_or("primary"),
+                ],
+            );
+            conn.execute(
+                "INSERT INTO contacts (id, account_id, full_name, title, seniority, department, name_confidence, title_confidence, is_decision_maker, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(id) DO UPDATE SET
+                    full_name = COALESCE(excluded.full_name, contacts.full_name),
+                    title = COALESCE(excluded.title, contacts.title),
+                    seniority = excluded.seniority,
+                    name_confidence = MAX(contacts.name_confidence, excluded.name_confidence),
+                    title_confidence = MAX(contacts.title_confidence, excluded.title_confidence),
+                    is_decision_maker = MAX(contacts.is_decision_maker, excluded.is_decision_maker)",
+                params![
+                    contact_id,
+                    account_id,
+                    profile.primary_contact_name,
+                    profile.primary_contact_title,
+                    seniority_from_title(profile.primary_contact_title.as_deref()),
+                    if profile.primary_contact_name.is_some() { 0.8 } else { 0.5 },
+                    if profile.primary_contact_title.is_some() { 0.7 } else { 0.5 },
+                    i32::from(
+                        profile
+                            .primary_contact_title
+                            .as_deref()
+                            .map(contact_title_priority)
+                            .unwrap_or(0)
+                            > 0
+                    ),
+                    now,
+                ],
+            )
+            .map_err(|e| format!("Failed to migrate contact from prospect profile: {e}"))?;
+
+            self.migrate_contact_methods(
+                conn,
+                &contact_id,
+                profile.primary_email.as_deref(),
+                None,
+                profile.primary_linkedin_url.as_deref(),
+            )?;
+        }
+
+        for signal in profile.matched_signals.iter().take(6) {
+            let signal_id = stable_sales_id("signal", &[&account_id, signal]);
+            conn.execute(
+                "INSERT OR IGNORE INTO signals
+                 (id, account_id, signal_type, text, source, observed_at, confidence, effect_horizon, expires_at, created_at)
+                 VALUES (?1, ?2, 'site_content', ?3, 'migration', ?4, ?5, 'structural', NULL, ?4)",
+                params![signal_id, account_id, signal, now, source_confidence("directory_listing")],
+            )
+            .map_err(|e| format!("Failed to migrate signals: {e}"))?;
+        }
+
+        for link in profile.osint_links.iter().take(MAX_OSINT_LINKS_PER_PROSPECT) {
+            let artifact_id = stable_sales_id("artifact", &[&account_id, link]);
+            conn.execute(
+                "INSERT OR IGNORE INTO artifacts
+                 (id, source_type, source_id, raw_content, parse_status, parser_health, freshness, legal_mode, created_at)
+                 VALUES (?1, 'web_search', ?2, ?2, 'ok', 1.0, ?3, 'public', ?3)",
+                params![artifact_id, link, now],
+            )
+            .map_err(|e| format!("Failed to migrate artifact: {e}"))?;
+        }
+
+        Ok(())
+    }
+
+    fn migrate_lead(
+        &self,
+        conn: &Connection,
+        lead: &SalesLead,
+        sales_profile: Option<&SalesProfile>,
+    ) -> Result<(), String> {
+        let profile = SalesProspectProfile {
+            id: lead.company_domain.clone(),
+            run_id: lead.run_id.clone(),
+            company: lead.company.clone(),
+            website: lead.website.clone(),
+            company_domain: lead.company_domain.clone(),
+            fit_score: lead.score,
+            profile_status: if lead.email.is_some() || lead.linkedin_url.is_some() {
+                "contact_ready".to_string()
+            } else {
+                "contact_identified".to_string()
+            },
+            summary: lead.reasons.join(" "),
+            matched_signals: lead.reasons.clone(),
+            primary_contact_name: clean_profile_contact_name(&lead.contact_name),
+            primary_contact_title: clean_profile_contact_field(&lead.contact_title),
+            primary_email: lead.email.clone(),
+            primary_linkedin_url: lead.linkedin_url.clone(),
+            company_linkedin_url: None,
+            osint_links: vec![lead.website.clone()],
+            contact_count: 1,
+            source_count: lead.reasons.len() as u32,
+            buyer_roles: Vec::new(),
+            pain_points: Vec::new(),
+            trigger_events: Vec::new(),
+            recommended_channel: if lead.email.is_some() { "email" } else { "linkedin" }.to_string(),
+            outreach_angle: String::new(),
+            research_status: "migration".to_string(),
+            research_confidence: 0.7,
+            created_at: lead.created_at.clone(),
+            updated_at: lead.created_at.clone(),
+        };
+        self.migrate_prospect_profile(conn, &profile, sales_profile)?;
+
+        let account_id = stable_sales_id("acct", &[&lead.company_domain]);
+        let score_id = stable_sales_id("score", &[&account_id, &lead.run_id]);
+        conn.execute(
+            "INSERT OR IGNORE INTO score_snapshots
+             (id, account_id, fit_score, intent_score, reachability_score, deliverability_risk, compliance_risk, activation_priority, computed_at, scoring_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'v1')",
+            params![
+                score_id,
+                account_id,
+                (lead.score as f64 / 100.0).clamp(0.0, 1.0),
+                if !lead.reasons.is_empty() { 0.35 } else { 0.1 },
+                if lead.email.is_some() { 0.65 } else if lead.linkedin_url.is_some() { 0.45 } else { 0.1 },
+                if lead.email.is_some() { 0.2 } else { 0.45 },
+                0.1,
+                (lead.score as f64 / 100.0).clamp(0.0, 1.0),
+                Utc::now().to_rfc3339(),
+            ],
+        )
+        .map_err(|e| format!("Failed to migrate score snapshot: {e}"))?;
+
+        Ok(())
+    }
+
+    fn migrate_contact_methods(
+        &self,
+        conn: &Connection,
+        contact_id: &str,
+        email: Option<&str>,
+        phone: Option<&str>,
+        linkedin: Option<&str>,
+    ) -> Result<(), String> {
+        if let Some(email) = email.and_then(|value| normalize_email_candidate(Some(value.to_string()))) {
+            let method_id = stable_sales_id("cm", &[contact_id, "email", &email]);
+            conn.execute(
+                "INSERT OR IGNORE INTO contact_methods
+                 (id, contact_id, channel_type, value, confidence, verified_at, classification, suppressed)
+                 VALUES (?1, ?2, 'email', ?3, ?4, ?5, ?6, 0)",
+                params![
+                    method_id,
+                    contact_id,
+                    email,
+                    source_confidence("directory_listing"),
+                    Utc::now().to_rfc3339(),
+                    classify_email(&email, email_domain(&email).as_deref().unwrap_or_default()),
+                ],
+            )
+            .map_err(|e| format!("Failed to migrate email contact method: {e}"))?;
+        }
+        if let Some(phone) = phone.and_then(normalize_phone) {
+            let method_id = stable_sales_id("cm", &[contact_id, "phone", &phone]);
+            conn.execute(
+                "INSERT OR IGNORE INTO contact_methods
+                 (id, contact_id, channel_type, value, confidence, verified_at, classification, suppressed)
+                 VALUES (?1, ?2, 'phone', ?3, ?4, ?5, 'personal', 0)",
+                params![
+                    method_id,
+                    contact_id,
+                    phone,
+                    source_confidence("directory_listing"),
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .map_err(|e| format!("Failed to migrate phone contact method: {e}"))?;
+        }
+        if let Some(linkedin) = linkedin.and_then(normalize_outreach_linkedin_url) {
+            let method_id = stable_sales_id("cm", &[contact_id, "linkedin", &linkedin]);
+            conn.execute(
+                "INSERT OR IGNORE INTO contact_methods
+                 (id, contact_id, channel_type, value, confidence, verified_at, classification, suppressed)
+                 VALUES (?1, ?2, 'linkedin', ?3, ?4, ?5, 'personal', 0)",
+                params![
+                    method_id,
+                    contact_id,
+                    linkedin,
+                    source_confidence("web_search"),
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .map_err(|e| format!("Failed to migrate LinkedIn contact method: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn upsert_artifact(
+        &self,
+        conn: &Connection,
+        source_type: &str,
+        source_id: &str,
+        raw_content: &str,
+        freshness: &str,
+    ) -> Result<String, String> {
+        let artifact_id = stable_sales_id("artifact", &[source_type, source_id]);
+        conn.execute(
+            "INSERT INTO artifacts
+             (id, source_type, source_id, raw_content, parse_status, parser_health, freshness, legal_mode, created_at)
+             VALUES (?1, ?2, ?3, ?4, 'ok', 1.0, ?5, 'public', ?5)
+             ON CONFLICT(id) DO UPDATE SET
+                raw_content = excluded.raw_content,
+                freshness = excluded.freshness,
+                parser_health = excluded.parser_health",
+            params![artifact_id, source_type, source_id, raw_content, freshness],
+        )
+        .map_err(|e| format!("Failed to upsert artifact: {e}"))?;
+        Ok(artifact_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upsert_evidence(
+        &self,
+        conn: &Connection,
+        artifact_id: &str,
+        field_type: &str,
+        field_value: &str,
+        extraction_method: &str,
+        confidence: f64,
+        verified_at: &str,
+    ) -> Result<Option<String>, String> {
+        let value = field_value.trim();
+        if value.is_empty() {
+            return Ok(None);
+        }
+        let evidence_id = stable_sales_id("evidence", &[artifact_id, field_type, value]);
+        conn.execute(
+            "INSERT INTO evidence
+             (id, artifact_id, field_type, field_value, confidence, extraction_method, verified_at, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+             ON CONFLICT(id) DO UPDATE SET
+                confidence = MAX(evidence.confidence, excluded.confidence),
+                verified_at = excluded.verified_at",
+            params![
+                evidence_id,
+                artifact_id,
+                field_type,
+                value,
+                confidence,
+                extraction_method,
+                verified_at,
+            ],
+        )
+        .map_err(|e| format!("Failed to upsert evidence: {e}"))?;
+        Ok(Some(evidence_id))
+    }
+
+    fn create_signal_with_rationale(
+        &self,
+        conn: &Connection,
+        account_id: &str,
+        signal_type: &str,
+        text: &str,
+        source: &str,
+        evidence_ids: &[String],
+    ) -> Result<String, String> {
+        let signal_text = truncate_cleaned_text(text, 280);
+        if signal_text.trim().is_empty() {
+            return Err("Signal text is empty".to_string());
+        }
+        let signal_id = stable_sales_id("signal", &[account_id, signal_type, &signal_text]);
+        let now = Utc::now().to_rfc3339();
+        let (horizon, expires_at) = classify_signal_horizon(signal_type, &signal_text);
+        conn.execute(
+            "INSERT INTO signals
+             (id, account_id, signal_type, text, source, observed_at, confidence, effect_horizon, expires_at, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                confidence = MAX(signals.confidence, excluded.confidence),
+                observed_at = excluded.observed_at,
+                effect_horizon = excluded.effect_horizon,
+                expires_at = excluded.expires_at",
+            params![
+                signal_id,
+                account_id,
+                signal_type,
+                signal_text,
+                source,
+                now,
+                source_confidence(source),
+                horizon,
+                expires_at,
+            ],
+        )
+        .map_err(|e| format!("Failed to upsert signal: {e}"))?;
+
+        let rationale_id = stable_sales_id("signal_rationale", &[&signal_id, account_id]);
+        conn.execute(
+            "INSERT INTO signal_rationales
+             (id, signal_id, account_id, why_it_matters, expected_effect, evidence_ids, confidence, created_at)
+             VALUES (?1, ?2, ?3, ?4, 'meeting_probability_up', ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET
+                why_it_matters = excluded.why_it_matters,
+                expected_effect = excluded.expected_effect,
+                evidence_ids = excluded.evidence_ids,
+                confidence = MAX(signal_rationales.confidence, excluded.confidence)",
+            params![
+                rationale_id,
+                signal_id,
+                account_id,
+                generate_signal_rationale(signal_type, &signal_text),
+                serde_json::to_string(evidence_ids)
+                    .map_err(|e| format!("Failed to encode signal evidence ids: {e}"))?,
+                source_confidence(source),
+                now,
+            ],
+        )
+        .map_err(|e| format!("Failed to upsert signal rationale: {e}"))?;
+        Ok(signal_id)
+    }
+
+    fn enqueue_research(
+        &self,
+        conn: &Connection,
+        account_id: &str,
+        reason: &str,
+        priority: i64,
+    ) -> Result<(), String> {
+        let id = stable_sales_id("research", &[account_id]);
+        conn.execute(
+            "INSERT INTO research_queue (id, account_id, priority, reason, status, assigned_at, completed_at)
+             VALUES (?1, ?2, ?3, ?4, 'pending', NULL, NULL)
+             ON CONFLICT(id) DO UPDATE SET
+                priority = MAX(research_queue.priority, excluded.priority),
+                reason = excluded.reason,
+                status = CASE
+                    WHEN research_queue.status = 'completed' THEN research_queue.status
+                    ELSE 'pending'
+                END",
+            params![id, account_id, priority, reason],
+        )
+        .map_err(|e| format!("Failed to enqueue research: {e}"))?;
+        Ok(())
+    }
+
+    fn enqueue_activation(
+        &self,
+        conn: &Connection,
+        account_id: &str,
+        contact_id: &str,
+        thesis_id: &str,
+        priority: i64,
+    ) -> Result<(), String> {
+        let id = stable_sales_id("activation", &[account_id, contact_id, thesis_id]);
+        conn.execute(
+            "INSERT INTO activation_queue (id, account_id, contact_id, thesis_id, priority, status, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                priority = MAX(activation_queue.priority, excluded.priority),
+                status = CASE
+                    WHEN activation_queue.status IN ('completed', 'active') THEN activation_queue.status
+                    ELSE 'pending'
+                END",
+            params![id, account_id, contact_id, thesis_id, priority, Utc::now().to_rfc3339()],
+        )
+        .map_err(|e| format!("Failed to enqueue activation: {e}"))?;
+        Ok(())
+    }
+
+    fn ensure_default_sequence_template(&self, conn: &Connection) -> Result<String, String> {
+        let template_id = "default_outreach_sequence".to_string();
+        let steps_json = serde_json::json!([
+            {"step": 1, "channel": "email", "delay_days": 0, "type": "initial_outreach", "description": "Short evidence-based email with a soft CTA"},
+            {"step": 2, "channel": "email", "delay_days": 3, "type": "value_content", "description": "Share a teardown, case study, or relevant operational insight"},
+            {"step": 3, "channel": "email", "delay_days": 5, "type": "follow_up", "description": "Reference the first touch and add one new angle"},
+            {"step": 4, "channel": "linkedin_assist", "delay_days": 3, "type": "channel_switch", "description": "Manual LinkedIn follow-up for the operator"},
+            {"step": 5, "channel": "email", "delay_days": 5, "type": "closing", "description": "Final polite close-the-loop email"}
+        ])
+        .to_string();
+        conn.execute(
+            "INSERT INTO sequence_templates (id, name, steps_json, icp_id, persona_id, version, created_at)
+             VALUES (?1, 'Default Outreach Sequence', ?2, 'default_icp', NULL, 1, ?3)
+             ON CONFLICT(id) DO UPDATE SET
+                steps_json = excluded.steps_json,
+                version = excluded.version",
+            params![template_id, steps_json, Utc::now().to_rfc3339()],
+        )
+        .map_err(|e| format!("Failed to ensure default sequence template: {e}"))?;
+        Ok(template_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_account_thesis(
+        &self,
+        conn: &Connection,
+        profile: &SalesProfile,
+        account_id: &str,
+        contact_id: &str,
+        evidence_ids: &[String],
+        score: &FiveAxisScore,
+        gate: &SendGateDecision,
+    ) -> Result<String, String> {
+        let account = conn
+            .query_row(
+                "SELECT canonical_name, COALESCE(sector, ''), COALESCE(geo, ''), COALESCE(website, '')
+                 FROM accounts WHERE id = ?1",
+                params![account_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .map_err(|e| format!("Failed to load account for thesis: {e}"))?;
+
+        let mut contact_stmt = conn
+            .prepare(
+                "SELECT COALESCE(full_name, ''), COALESCE(title, ''), name_confidence
+                 FROM contacts
+                 WHERE account_id = ?1
+                 ORDER BY is_decision_maker DESC, created_at ASC
+                 LIMIT 4",
+            )
+            .map_err(|e| format!("Failed to prepare thesis contacts query: {e}"))?;
+        let buyer_committee = contact_stmt
+            .query_map(params![account_id], |row| {
+                Ok(serde_json::json!({
+                    "role": infer_buyer_role(
+                        row.get::<_, String>(1)
+                            .unwrap_or_default()
+                            .as_str()
+                    ),
+                    "name": row.get::<_, String>(0).unwrap_or_default(),
+                    "confidence": row.get::<_, f64>(2).unwrap_or(0.5),
+                }))
+            })
+            .map_err(|e| format!("Failed to query thesis contacts: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to decode thesis contacts: {e}"))?;
+
+        let mut signal_stmt = conn
+            .prepare(
+                "SELECT text FROM signals
+                 WHERE account_id = ?1
+                 ORDER BY confidence DESC, observed_at DESC
+                 LIMIT 3",
+            )
+            .map_err(|e| format!("Failed to prepare thesis signals query: {e}"))?;
+        let signals = signal_stmt
+            .query_map(params![account_id], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("Failed to query thesis signals: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to decode thesis signals: {e}"))?;
+
+        let why_this_account = if let Some(signal) = signals.first() {
+            format!(
+                "{} matches {} in {} and shows public evidence of operational activity: {}",
+                account.0,
+                profile.product_name,
+                if account.1.trim().is_empty() {
+                    profile.target_industry.as_str()
+                } else {
+                    account.1.as_str()
+                },
+                truncate_text_for_reason(signal, 180),
+            )
+        } else {
+            format!(
+                "{} matches the ICP for {} in {}",
+                account.0, profile.product_name, profile.target_industry
+            )
+        };
+        let why_now = if let Some(signal) = signals.first() {
+            truncate_text_for_reason(signal, 180)
+        } else {
+            format!(
+                "Public evidence and reachable contacts indicate a viable outbound window in {}",
+                if account.2.trim().is_empty() {
+                    profile.target_geo.as_str()
+                } else {
+                    account.2.as_str()
+                }
+            )
+        };
+        let recommended_channel = recommended_activation_channel(
+            conn,
+            account_id,
+            contact_id,
+        )
+        .unwrap_or_else(|| "research".to_string());
+        let thesis_confidence = thesis_confidence(score);
+        let thesis_status = match gate {
+            SendGateDecision::Activate => "ready",
+            SendGateDecision::Research { .. } => "needs_research",
+            SendGateDecision::Nurture { .. } => "nurture",
+            SendGateDecision::Block { .. } => "blocked",
+        };
+        let thesis_id = stable_sales_id("thesis", &[account_id]);
+        conn.execute(
+            "INSERT INTO account_theses
+             (id, account_id, why_this_account, why_now, buyer_committee_json, evidence_ids, do_not_say,
+              recommended_channel, recommended_pain, thesis_confidence, thesis_status, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(id) DO UPDATE SET
+                why_this_account = excluded.why_this_account,
+                why_now = excluded.why_now,
+                buyer_committee_json = excluded.buyer_committee_json,
+                evidence_ids = excluded.evidence_ids,
+                do_not_say = excluded.do_not_say,
+                recommended_channel = excluded.recommended_channel,
+                recommended_pain = excluded.recommended_pain,
+                thesis_confidence = excluded.thesis_confidence,
+                thesis_status = excluded.thesis_status",
+            params![
+                thesis_id,
+                account_id,
+                why_this_account,
+                why_now,
+                serde_json::to_string(&buyer_committee)
+                    .map_err(|e| format!("Failed to encode buyer committee: {e}"))?,
+                serde_json::to_string(evidence_ids)
+                    .map_err(|e| format!("Failed to encode thesis evidence ids: {e}"))?,
+                serde_json::json!(["Do not claim internal knowledge beyond public evidence."])
+                    .to_string(),
+                recommended_channel,
+                truncate_text_for_reason(&profile.product_description, 180),
+                thesis_confidence,
+                thesis_status,
+                Utc::now().to_rfc3339(),
+            ],
+        )
+        .map_err(|e| format!("Failed to upsert account thesis: {e}"))?;
+        Ok(thesis_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sync_canonical_state(
+        &self,
+        conn: &Connection,
+        profile: &SalesProfile,
+        candidate: &DomainCandidate,
+        company: &str,
+        domain: &str,
+        website: &str,
+        contact_name: Option<&str>,
+        contact_title: Option<&str>,
+        email: Option<&str>,
+        phone: Option<&str>,
+        linkedin_url: Option<&str>,
+        company_linkedin_url: Option<&str>,
+        osint_links: &[String],
+        evidence_text: &str,
+        reasons: &[String],
+    ) -> Result<CanonicalAccountSync, String> {
+        let now = Utc::now().to_rfc3339();
+        let account_id = stable_sales_id("acct", &[domain]);
+        conn.execute(
+            "INSERT INTO accounts
+             (id, canonical_name, display_name, sector, geo, website, tier, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'standard', ?7, ?7)
+             ON CONFLICT(id) DO UPDATE SET
+                canonical_name = excluded.canonical_name,
+                display_name = excluded.display_name,
+                sector = COALESCE(NULLIF(accounts.sector, ''), excluded.sector),
+                geo = COALESCE(NULLIF(accounts.geo, ''), excluded.geo),
+                website = COALESCE(NULLIF(accounts.website, ''), excluded.website),
+                updated_at = excluded.updated_at",
+            params![
+                account_id,
+                company,
+                company,
+                profile.target_industry,
+                profile.target_geo,
+                website,
+                now,
+            ],
+        )
+        .map_err(|e| format!("Failed to upsert account: {e}"))?;
+
+        let alias_company = domain_to_company(domain);
+        if !alias_company.trim().is_empty() && alias_company != company {
+            conn.execute(
+                "INSERT OR IGNORE INTO account_aliases (id, account_id, alias_name, alias_type)
+                 VALUES (?1, ?2, ?3, 'derived_domain')",
+                params![
+                    stable_sales_id("acct_alias", &[&account_id, &alias_company]),
+                    account_id,
+                    alias_company,
+                ],
+            )
+            .map_err(|e| format!("Failed to upsert account alias: {e}"))?;
+        }
+
+        conn.execute(
+            "INSERT INTO domains (id, account_id, domain, is_primary, verified, mx_valid, checked_at)
+             VALUES (?1, ?2, ?3, 1, ?4, NULL, ?5)
+             ON CONFLICT(domain) DO UPDATE SET
+                account_id = excluded.account_id,
+                is_primary = excluded.is_primary,
+                verified = excluded.verified,
+                checked_at = excluded.checked_at",
+            params![
+                stable_sales_id("domain", &[domain]),
+                account_id,
+                domain,
+                i32::from(is_valid_company_domain(domain)),
+                now,
+            ],
+        )
+        .map_err(|e| format!("Failed to upsert domain: {e}"))?;
+
+        let cleaned_name = contact_name.and_then(clean_profile_contact_name);
+        let cleaned_title = contact_title.and_then(clean_profile_contact_field);
+        let contact_id = stable_sales_id(
+            "contact",
+            &[domain, &canonical_contact_key(domain, cleaned_name.as_deref(), email, linkedin_url)],
+        );
+        conn.execute(
+            "INSERT INTO contacts
+             (id, account_id, full_name, title, seniority, department, name_confidence, title_confidence, is_decision_maker, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9)
+             ON CONFLICT(id) DO UPDATE SET
+                full_name = COALESCE(excluded.full_name, contacts.full_name),
+                title = COALESCE(excluded.title, contacts.title),
+                seniority = excluded.seniority,
+                name_confidence = MAX(contacts.name_confidence, excluded.name_confidence),
+                title_confidence = MAX(contacts.title_confidence, excluded.title_confidence),
+                is_decision_maker = MAX(contacts.is_decision_maker, excluded.is_decision_maker)",
+            params![
+                contact_id,
+                account_id,
+                cleaned_name,
+                cleaned_title,
+                seniority_from_title(cleaned_title.as_deref()),
+                if cleaned_name.is_some() { 0.9 } else { 0.4 },
+                if cleaned_title.is_some() { 0.8 } else { 0.4 },
+                i32::from(
+                    cleaned_title
+                        .as_deref()
+                        .map(contact_title_priority)
+                        .unwrap_or(0)
+                        > 0
+                ),
+                now,
+            ],
+        )
+        .map_err(|e| format!("Failed to upsert contact: {e}"))?;
+
+        if let Some(role) = cleaned_title.as_deref().map(infer_buyer_role) {
+            conn.execute(
+                "INSERT OR IGNORE INTO buyer_roles (id, account_id, contact_id, role_type, inferred_from)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    stable_sales_id("buyer_role", &[&account_id, &contact_id, role]),
+                    account_id,
+                    contact_id,
+                    role,
+                    cleaned_title.clone().unwrap_or_default(),
+                ],
+            )
+            .map_err(|e| format!("Failed to upsert buyer role: {e}"))?;
+        }
+
+        self.migrate_contact_methods(conn, &contact_id, email, phone, linkedin_url)?;
+
+        for (channel_type, value) in [
+            ("email", email.and_then(|value| normalize_email_candidate(Some(value.to_string())))),
+            ("phone", phone.and_then(normalize_phone)),
+            ("linkedin", linkedin_url.and_then(normalize_outreach_linkedin_url)),
+        ] {
+            if let Some(value) = value {
+                let suppressed = self.is_suppressed(conn, &value)?;
+                conn.execute(
+                    "UPDATE contact_methods SET suppressed = ?1
+                     WHERE contact_id = ?2 AND channel_type = ?3 AND value = ?4",
+                    params![i32::from(suppressed), contact_id, channel_type, value],
+                )
+                .map_err(|e| format!("Failed to update contact method suppression: {e}"))?;
+            }
+        }
+
+        let mut evidence_ids = Vec::new();
+        let primary_source_type = candidate_primary_source_type(candidate, company_linkedin_url);
+        let artifact_id = self.upsert_artifact(
+            conn,
+            primary_source_type,
+            domain,
+            &truncate_cleaned_text(
+                &format!(
+                    "{} | {} | {}",
+                    evidence_text,
+                    candidate.evidence.join(" | "),
+                    reasons.join(" | ")
+                ),
+                2000,
+            ),
+            &now,
+        )?;
+        for item in [
+            self.upsert_evidence(
+                conn,
+                &artifact_id,
+                "company_name",
+                company,
+                primary_source_type,
+                0.9,
+                &now,
+            )?,
+            self.upsert_evidence(
+                conn,
+                &artifact_id,
+                "domain",
+                domain,
+                primary_source_type,
+                0.95,
+                &now,
+            )?,
+            self.upsert_evidence(
+                conn,
+                &artifact_id,
+                "website",
+                website,
+                primary_source_type,
+                0.9,
+                &now,
+            )?,
+            self.upsert_evidence(
+                conn,
+                &artifact_id,
+                "signal",
+                evidence_text,
+                primary_source_type,
+                0.8,
+                &now,
+            )?,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            evidence_ids.push(item);
+        }
+
+        if let Some(name) = cleaned_name.as_deref() {
+            if let Some(id) = self.upsert_evidence(
+                conn,
+                &artifact_id,
+                "contact_name",
+                name,
+                primary_source_type,
+                0.8,
+                &now,
+            )? {
+                evidence_ids.push(id);
+            }
+        }
+        if let Some(title) = cleaned_title.as_deref() {
+            if let Some(id) = self.upsert_evidence(
+                conn,
+                &artifact_id,
+                "title",
+                title,
+                primary_source_type,
+                0.75,
+                &now,
+            )? {
+                evidence_ids.push(id);
+            }
+        }
+        if let Some(email) = email.and_then(|value| normalize_email_candidate(Some(value.to_string()))) {
+            if let Some(id) = self.upsert_evidence(
+                conn,
+                &artifact_id,
+                "email",
+                &email,
+                "site_html",
+                0.9,
+                &now,
+            )? {
+                evidence_ids.push(id);
+            }
+        }
+        if let Some(phone) = phone.and_then(normalize_phone) {
+            if let Some(id) = self.upsert_evidence(
+                conn,
+                &artifact_id,
+                "phone",
+                &phone,
+                primary_source_type,
+                0.8,
+                &now,
+            )? {
+                evidence_ids.push(id);
+            }
+        }
+        if let Some(linkedin) = linkedin_url.and_then(normalize_outreach_linkedin_url) {
+            if let Some(id) = self.upsert_evidence(
+                conn,
+                &artifact_id,
+                "linkedin",
+                &linkedin,
+                "web_search",
+                0.7,
+                &now,
+            )? {
+                evidence_ids.push(id);
+            }
+        }
+        if let Some(company_linkedin) = company_linkedin_url.and_then(normalize_company_linkedin_url) {
+            let company_artifact = self.upsert_artifact(
+                conn,
+                "web_search",
+                &company_linkedin,
+                &company_linkedin,
+                &now,
+            )?;
+            if let Some(id) = self.upsert_evidence(
+                conn,
+                &company_artifact,
+                "linkedin",
+                &company_linkedin,
+                "web_search",
+                0.65,
+                &now,
+            )? {
+                evidence_ids.push(id);
+            }
+        }
+
+        for link in osint_links.iter().take(MAX_OSINT_LINKS_PER_PROSPECT) {
+            let osint_artifact = self.upsert_artifact(conn, "web_search", link, link, &now)?;
+            if let Some(id) = self.upsert_evidence(
+                conn,
+                &osint_artifact,
+                "signal",
+                link,
+                "web_search",
+                0.55,
+                &now,
+            )? {
+                evidence_ids.push(id);
+            }
+        }
+
+        let signal_source = if primary_source_type == "directory_listing" {
+            "directory_listing"
+        } else {
+            "web_search"
+        };
+        let mut signal_texts = candidate.matched_keywords.clone();
+        signal_texts.extend(candidate.evidence.iter().take(3).cloned());
+        signal_texts.extend(reasons.iter().take(2).cloned());
+        signal_texts.push(evidence_text.to_string());
+        for signal in dedupe_strings(signal_texts)
+            .into_iter()
+            .filter(|value| !value.trim().is_empty())
+            .take(8)
+        {
+            let signal_type = infer_signal_type(&signal);
+            let _ = self.create_signal_with_rationale(
+                conn,
+                &account_id,
+                signal_type,
+                &signal,
+                signal_source,
+                &evidence_ids,
+            );
+        }
+
+        let score = compute_five_axis_score(&account_id, conn)?;
+        conn.execute(
+            "UPDATE accounts SET tier = ?2, updated_at = ?3 WHERE id = ?1",
+            params![account_id, assign_tier(&score), now],
+        )
+        .map_err(|e| format!("Failed to update account tier: {e}"))?;
+        let gate = send_gate(&score);
+        let thesis_id = self.build_account_thesis(
+            conn,
+            profile,
+            &account_id,
+            &contact_id,
+            &evidence_ids,
+            &score,
+            &gate,
+        )?;
+
+        match &gate {
+            SendGateDecision::Research { missing } => {
+                self.enqueue_research(
+                    conn,
+                    &account_id,
+                    &missing.join("; "),
+                    (activation_priority(&score) * 100.0).round() as i64,
+                )?;
+            }
+            SendGateDecision::Activate => {
+                self.enqueue_activation(
+                    conn,
+                    &account_id,
+                    &contact_id,
+                    &thesis_id,
+                    (activation_priority(&score) * 100.0).round() as i64,
+                )?;
+            }
+            SendGateDecision::Nurture { reason } => {
+                self.enqueue_research(
+                    conn,
+                    &account_id,
+                    reason,
+                    (score.fit_score * 100.0).round() as i64,
+                )?;
+            }
+            SendGateDecision::Block { .. } => {}
+        }
+
+        Ok(CanonicalAccountSync {
+            score,
+            gate,
+        })
+    }
+
+    fn ensure_touch_for_approval(
+        &self,
+        conn: &Connection,
+        lead: &SalesLead,
+        approval_id: &str,
+        channel: &str,
+        payload_json: &str,
+    ) -> Result<(), String> {
+        let account_id = stable_sales_id("acct", &[&lead.company_domain]);
+        let contact_id = stable_sales_id(
+            "contact",
+            &[&lead.company_domain, &canonical_contact_key(
+                &lead.company_domain,
+                clean_profile_contact_name(&lead.contact_name).as_deref(),
+                lead.email.as_deref(),
+                lead.linkedin_url.as_deref(),
+            )],
+        );
+        let thesis_id = conn
+            .query_row(
+                "SELECT id FROM account_theses WHERE account_id = ?1 ORDER BY created_at DESC LIMIT 1",
+                params![account_id.clone()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to load thesis for touch: {e}"))?;
+        let template_id = self.ensure_default_sequence_template(conn)?;
+        let sequence_instance_id = stable_sales_id(
+            "sequence_instance",
+            &[&account_id, &contact_id, thesis_id.as_deref().unwrap_or("none")],
+        );
+        let now = Utc::now().to_rfc3339();
+        let initial_step = if channel == "email" {
+            1
+        } else if channel == "linkedin_assist" {
+            4
+        } else {
+            2
+        };
+        conn.execute(
+            "INSERT OR IGNORE INTO accounts
+             (id, canonical_name, display_name, website, tier, created_at, updated_at)
+             VALUES (?1, ?2, ?2, ?3, 'standard', ?4, ?4)",
+            params![account_id, lead.company, lead.website, now],
+        )
+        .map_err(|e| format!("Failed to ensure touch account: {e}"))?;
+        conn.execute(
+            "INSERT OR IGNORE INTO domains (id, account_id, domain, is_primary, verified, mx_valid, checked_at)
+             VALUES (?1, ?2, ?3, 1, 1, NULL, ?4)",
+            params![
+                stable_sales_id("domain", &[&lead.company_domain]),
+                account_id,
+                lead.company_domain,
+                now,
+            ],
+        )
+        .map_err(|e| format!("Failed to ensure touch domain: {e}"))?;
+        conn.execute(
+            "INSERT OR IGNORE INTO contacts
+             (id, account_id, full_name, title, seniority, department, name_confidence, title_confidence, is_decision_maker, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9)",
+            params![
+                contact_id,
+                account_id,
+                clean_profile_contact_name(&lead.contact_name),
+                clean_profile_contact_field(&lead.contact_title),
+                seniority_from_title(Some(&lead.contact_title)),
+                0.8,
+                0.8,
+                i32::from(contact_title_priority(&lead.contact_title) > 0),
+                now,
+            ],
+        )
+        .map_err(|e| format!("Failed to ensure touch contact: {e}"))?;
+        self.migrate_contact_methods(
+            conn,
+            &contact_id,
+            lead.email.as_deref(),
+            lead.phone.as_deref(),
+            lead.linkedin_url.as_deref(),
+        )?;
+        conn.execute(
+            "INSERT INTO sequence_instances
+             (id, template_id, account_id, contact_id, thesis_id, current_step, status, started_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?7)
+             ON CONFLICT(id) DO UPDATE SET
+                updated_at = excluded.updated_at,
+                current_step = MIN(sequence_instances.current_step, excluded.current_step)",
+            params![
+                sequence_instance_id,
+                template_id,
+                account_id,
+                contact_id,
+                thesis_id,
+                initial_step,
+                now,
+            ],
+        )
+        .map_err(|e| format!("Failed to ensure sequence instance: {e}"))?;
+
+        let evidence_ids = thesis_id
+            .as_deref()
+            .and_then(|id| {
+                conn.query_row(
+                    "SELECT evidence_ids FROM account_theses WHERE id = ?1",
+                    params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+            })
+            .unwrap_or_else(|| "[]".to_string());
+        let risk_flags = if channel == "linkedin_assist" {
+            serde_json::json!(["manual_action"]).to_string()
+        } else {
+            serde_json::json!([]).to_string()
+        };
+        conn.execute(
+            "INSERT INTO touches
+             (id, sequence_instance_id, step, channel, message_payload, claims_json, evidence_ids, variant_id, risk_flags, sent_at, mailbox_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'v1', ?8, NULL, NULL, ?9)
+             ON CONFLICT(id) DO UPDATE SET
+                message_payload = excluded.message_payload,
+                claims_json = excluded.claims_json,
+                evidence_ids = excluded.evidence_ids,
+                risk_flags = excluded.risk_flags",
+            params![
+                approval_id,
+                sequence_instance_id,
+                initial_step,
+                channel,
+                payload_json,
+                serde_json::to_string(&lead.reasons)
+                    .map_err(|e| format!("Failed to encode touch claims: {e}"))?,
+                evidence_ids,
+                risk_flags,
+                now,
+            ],
+        )
+        .map_err(|e| format!("Failed to ensure touch: {e}"))?;
+        Ok(())
+    }
+
     fn insert_lead(&self, lead: &SalesLead) -> Result<bool, String> {
         let conn = self.open()?;
         let reasons_json = serde_json::to_string(&lead.reasons)
@@ -758,17 +3338,28 @@ impl SalesEngine {
         let mut queued = 0u32;
 
         if let Some(email) = &lead.email {
-            let payload = serde_json::json!({
-                "to": email,
-                "subject": lead.email_subject,
-                "body": lead.email_body,
-            });
-            conn.execute(
-                "INSERT INTO approvals (id, lead_id, channel, payload_json, status, created_at) VALUES (?, ?, 'email', ?, 'pending', ?)",
-                params![uuid::Uuid::new_v4().to_string(), lead.id, payload.to_string(), created_at],
-            )
-            .map_err(|e| format!("Queue email approval failed: {e}"))?;
-            queued += 1;
+            if !self.approval_already_pending(&conn, "email", email)? {
+                let approval_id = uuid::Uuid::new_v4().to_string();
+                let payload = serde_json::json!({
+                    "to": email,
+                    "subject": lead.email_subject,
+                    "body": lead.email_body,
+                    "classification": classify_email(email, &lead.company_domain),
+                });
+                conn.execute(
+                    "INSERT INTO approvals (id, lead_id, channel, payload_json, status, created_at) VALUES (?, ?, 'email', ?, 'pending', ?)",
+                    params![approval_id, lead.id, payload.to_string(), created_at],
+                )
+                .map_err(|e| format!("Queue email approval failed: {e}"))?;
+                self.ensure_touch_for_approval(
+                    &conn,
+                    lead,
+                    &approval_id,
+                    "email",
+                    &payload.to_string(),
+                )?;
+                queued += 1;
+            }
         }
 
         if let Some(linkedin_url) = lead
@@ -776,16 +3367,27 @@ impl SalesEngine {
             .as_deref()
             .and_then(normalize_outreach_linkedin_url)
         {
-            let payload = serde_json::json!({
-                "profile_url": linkedin_url,
-                "message": lead.linkedin_message,
-            });
-            conn.execute(
-                "INSERT INTO approvals (id, lead_id, channel, payload_json, status, created_at) VALUES (?, ?, 'linkedin', ?, 'pending', ?)",
-                params![uuid::Uuid::new_v4().to_string(), lead.id, payload.to_string(), created_at],
-            )
-            .map_err(|e| format!("Queue LinkedIn approval failed: {e}"))?;
-            queued += 1;
+            if !self.approval_already_pending(&conn, "linkedin_assist", &linkedin_url)? {
+                let approval_id = uuid::Uuid::new_v4().to_string();
+                let payload = serde_json::json!({
+                    "profile_url": linkedin_url,
+                    "message": lead.linkedin_message,
+                    "manual_action": true,
+                });
+                conn.execute(
+                    "INSERT INTO approvals (id, lead_id, channel, payload_json, status, created_at) VALUES (?, ?, 'linkedin_assist', ?, 'pending', ?)",
+                    params![approval_id, lead.id, payload.to_string(), created_at],
+                )
+                .map_err(|e| format!("Queue LinkedIn approval failed: {e}"))?;
+                self.ensure_touch_for_approval(
+                    &conn,
+                    lead,
+                    &approval_id,
+                    "linkedin_assist",
+                    &payload.to_string(),
+                )?;
+                queued += 1;
+            }
         }
 
         Ok(queued)
@@ -1076,6 +3678,546 @@ impl SalesEngine {
         Ok(out)
     }
 
+    fn get_approval_by_id(
+        &self,
+        conn: &Connection,
+        approval_id: &str,
+    ) -> Result<Option<SalesApproval>, String> {
+        let row = conn
+            .query_row(
+                "SELECT id, lead_id, channel, payload_json, status, created_at, decided_at
+                 FROM approvals
+                 WHERE id = ?1",
+                params![approval_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("Approval lookup failed: {e}"))?;
+        let Some((id, lead_id, channel, payload_raw, status, created_at, decided_at)) = row else {
+            return Ok(None);
+        };
+        let payload = serde_json::from_str::<serde_json::Value>(&payload_raw)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let payload = sanitize_approval_payload(&channel, payload)
+            .ok_or_else(|| "Approval payload is not actionable".to_string())?;
+        Ok(Some(SalesApproval {
+            id,
+            lead_id,
+            channel,
+            payload,
+            status,
+            created_at,
+            decided_at,
+        }))
+    }
+
+    fn edit_approval(
+        &self,
+        approval_id: &str,
+        edited_payload: serde_json::Value,
+    ) -> Result<SalesApproval, String> {
+        let conn = self.open()?;
+        let approval = self
+            .get_approval_by_id(&conn, approval_id)?
+            .ok_or_else(|| "Approval not found".to_string())?;
+        if approval.status != "pending" {
+            return Err(format!(
+                "Approval is not editable (current status: {})",
+                approval.status
+            ));
+        }
+        let sanitized = sanitize_approval_payload(&approval.channel, edited_payload)
+            .ok_or_else(|| "Edited payload is invalid or non-actionable".to_string())?;
+        let payload_json = sanitized.to_string();
+        conn.execute(
+            "UPDATE approvals SET payload_json = ?2 WHERE id = ?1",
+            params![approval_id, payload_json],
+        )
+        .map_err(|e| format!("Failed to update approval payload: {e}"))?;
+        let _ = conn.execute(
+            "UPDATE touches SET message_payload = ?2 WHERE id = ?1",
+            params![approval_id, payload_json],
+        );
+        self.get_approval_by_id(&conn, approval_id)?
+            .ok_or_else(|| "Approval disappeared after update".to_string())
+    }
+
+    fn resolve_account_id(
+        &self,
+        conn: &Connection,
+        account_ref: &str,
+    ) -> Result<Option<String>, String> {
+        let trimmed = account_ref.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        if let Some(id) = conn
+            .query_row(
+                "SELECT id FROM accounts WHERE id = ?1",
+                params![trimmed],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| format!("Account lookup by id failed: {e}"))?
+        {
+            return Ok(Some(id));
+        }
+        let lowered = trimmed.to_lowercase();
+        if let Some(id) = conn
+            .query_row(
+                "SELECT account_id FROM domains WHERE domain = ?1",
+                params![lowered],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| format!("Account lookup by domain failed: {e}"))?
+        {
+            return Ok(Some(id));
+        }
+        let derived = stable_sales_id("acct", &[lowered.as_str()]);
+        conn.query_row(
+            "SELECT id FROM accounts WHERE id = ?1",
+            params![derived.clone()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| format!("Account lookup by derived id failed: {e}"))
+    }
+
+    fn fallback_dossier_from_prospect(
+        &self,
+        profile: &SalesProspectProfile,
+    ) -> serde_json::Value {
+        let email_classification = profile
+            .primary_email
+            .as_deref()
+            .map(|email| classify_email(email, &profile.company_domain))
+            .unwrap_or("unknown");
+        let reachability_score: f64 = (if email_classification == "personal" {
+            0.35_f64
+        } else {
+            0.0_f64
+        }) + (if profile.primary_linkedin_url.is_some() {
+            0.25_f64
+        } else {
+            0.0_f64
+        }) + (if profile.primary_email.is_some() {
+            0.1_f64
+        } else {
+            0.0_f64
+        }) + (if profile.primary_contact_name.is_some() {
+            0.1_f64
+        } else {
+            0.0_f64
+        }) + (if profile.primary_contact_title.is_some() {
+            0.1_f64
+        } else {
+            0.0_f64
+        });
+        let score = FiveAxisScore {
+            fit_score: (profile.fit_score as f64 / 100.0).clamp(0.0, 1.0),
+            intent_score: (0.12 * profile.matched_signals.len() as f64).clamp(0.0, 0.55),
+            reachability_score: reachability_score.clamp(0.0, 1.0),
+            deliverability_risk: if profile.primary_email.is_some() {
+                if email_classification == "personal" {
+                    0.18
+                } else {
+                    0.42
+                }
+            } else {
+                0.35
+            },
+            compliance_risk: if email_classification == "personal" {
+                0.1
+            } else if profile.primary_email.is_some() {
+                0.3
+            } else {
+                0.18
+            },
+        };
+        let gate = send_gate(&score);
+        let next_action = match &gate {
+            SendGateDecision::Activate => {
+                if profile.primary_email.is_some() {
+                    "Send email now".to_string()
+                } else if profile.primary_linkedin_url.is_some() {
+                    "Open LinkedIn operator-assist task".to_string()
+                } else {
+                    "Promote to activation after one more verification pass".to_string()
+                }
+            }
+            SendGateDecision::Research { .. } => "Research needed".to_string(),
+            SendGateDecision::Nurture { .. } => "Hold in nurture until a stronger timing signal appears".to_string(),
+            SendGateDecision::Block { .. } => "Blocked until risk is reduced".to_string(),
+        };
+        let methods = [
+            profile.primary_email.as_ref().map(|email| serde_json::json!({
+                "channel_type": "email",
+                "value": email,
+                "classification": email_classification,
+                "confidence": profile.research_confidence,
+                "suppressed": false,
+            })),
+            profile.primary_linkedin_url.as_ref().map(|url| serde_json::json!({
+                "channel_type": "linkedin",
+                "value": url,
+                "classification": "personal",
+                "confidence": profile.research_confidence,
+                "suppressed": false,
+            })),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        serde_json::json!({
+            "account_id": stable_sales_id("acct", &[profile.company_domain.as_str()]),
+            "account": {
+                "canonical_name": profile.company,
+                "display_name": profile.company,
+                "website": profile.website,
+                "domain": profile.company_domain,
+                "tier": if profile.fit_score >= 80 { "a_tier" } else if profile.fit_score >= 55 { "standard" } else { "basic" },
+            },
+            "score": {
+                "fit_score": score.fit_score,
+                "intent_score": score.intent_score,
+                "reachability_score": score.reachability_score,
+                "deliverability_risk": score.deliverability_risk,
+                "compliance_risk": score.compliance_risk,
+                "activation_priority": activation_priority(&score),
+                "send_gate": gate,
+            },
+            "thesis": {
+                "why_this_account": profile.summary,
+                "why_now": profile.trigger_events.first().cloned().unwrap_or_else(|| "Awaiting more public evidence.".to_string()),
+                "buyer_committee": (profile.buyer_roles.iter().map(|role| serde_json::json!({
+                    "role": role,
+                    "name": profile.primary_contact_name.clone().unwrap_or_default(),
+                    "confidence": profile.research_confidence,
+                })).collect::<Vec<_>>()),
+                "do_not_say": vec!["Do not claim private knowledge beyond public evidence."],
+                "recommended_channel": profile.recommended_channel,
+                "recommended_pain": profile.outreach_angle,
+                "thesis_confidence": profile.research_confidence,
+                "thesis_status": if profile.research_confidence >= 0.6 { "heuristic_ready" } else { "needs_research" },
+            },
+            "signals": profile.matched_signals.iter().map(|signal| serde_json::json!({
+                "signal_type": infer_signal_type(signal),
+                "text": signal,
+                "effect_horizon": classify_signal_horizon(infer_signal_type(signal), signal).0,
+                "confidence": profile.research_confidence,
+                "why_it_matters": generate_signal_rationale(infer_signal_type(signal), signal),
+            })).collect::<Vec<_>>(),
+            "contacts": [{
+                "full_name": profile.primary_contact_name,
+                "title": profile.primary_contact_title,
+                "is_decision_maker": profile.primary_contact_title.as_deref().map(contact_title_priority).unwrap_or(0) > 0,
+                "methods": methods,
+            }],
+            "outcomes": {
+                "touches_sent": 0,
+                "positive_replies": 0,
+                "meetings": 0,
+                "opens": 0,
+                "clicks": 0,
+                "hard_bounces": 0,
+                "unsubscribes": 0,
+                "positive_reply_rate": 0.0,
+                "meeting_rate": 0.0,
+            },
+            "next_action": next_action,
+            "source": "prospect_profile_fallback",
+        })
+    }
+
+    fn get_account_dossier(&self, account_ref: &str) -> Result<Option<serde_json::Value>, String> {
+        let conn = self.open()?;
+        let Some(account_id) = self.resolve_account_id(&conn, account_ref)? else {
+            return Ok(self
+                .get_stored_prospect_profile(account_ref)?
+                .map(|profile| self.fallback_dossier_from_prospect(&profile)));
+        };
+
+        let account = conn
+            .query_row(
+                "SELECT canonical_name, COALESCE(display_name, canonical_name), COALESCE(website, ''), COALESCE(sector, ''),
+                        COALESCE(geo, ''), COALESCE(tier, 'standard')
+                 FROM accounts
+                 WHERE id = ?1",
+                params![account_id.clone()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("Failed to load account dossier: {e}"))?;
+        let Some(account) = account else {
+            return Ok(self
+                .get_stored_prospect_profile(account_ref)?
+                .map(|profile| self.fallback_dossier_from_prospect(&profile)));
+        };
+
+        let domain = conn
+            .query_row(
+                "SELECT domain FROM domains WHERE account_id = ?1 ORDER BY is_primary DESC, checked_at DESC LIMIT 1",
+                params![account_id.clone()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to load account domain: {e}"))?
+            .unwrap_or_default();
+
+        let score = conn
+            .query_row(
+                "SELECT fit_score, intent_score, reachability_score, deliverability_risk, compliance_risk
+                 FROM score_snapshots
+                 WHERE account_id = ?1
+                 ORDER BY computed_at DESC
+                 LIMIT 1",
+                params![account_id.clone()],
+                |row| {
+                    Ok(FiveAxisScore {
+                        fit_score: row.get::<_, f64>(0).unwrap_or(0.0),
+                        intent_score: row.get::<_, f64>(1).unwrap_or(0.0),
+                        reachability_score: row.get::<_, f64>(2).unwrap_or(0.0),
+                        deliverability_risk: row.get::<_, f64>(3).unwrap_or(0.0),
+                        compliance_risk: row.get::<_, f64>(4).unwrap_or(0.0),
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| format!("Failed to load dossier score: {e}"))?
+            .unwrap_or(compute_five_axis_score(&account_id, &conn)?);
+        let gate = send_gate(&score);
+
+        let thesis = conn
+            .query_row(
+                "SELECT why_this_account, COALESCE(why_now, ''), COALESCE(buyer_committee_json, '[]'),
+                        COALESCE(do_not_say, '[]'), COALESCE(recommended_channel, ''),
+                        COALESCE(recommended_pain, ''), thesis_confidence, thesis_status
+                 FROM account_theses
+                 WHERE account_id = ?1
+                 ORDER BY created_at DESC
+                 LIMIT 1",
+                params![account_id.clone()],
+                |row| {
+                    Ok(serde_json::json!({
+                        "why_this_account": row.get::<_, String>(0)?,
+                        "why_now": row.get::<_, String>(1)?,
+                        "buyer_committee": serde_json::from_str::<serde_json::Value>(&row.get::<_, String>(2)?).unwrap_or_else(|_| serde_json::json!([])),
+                        "do_not_say": serde_json::from_str::<serde_json::Value>(&row.get::<_, String>(3)?).unwrap_or_else(|_| serde_json::json!([])),
+                        "recommended_channel": row.get::<_, String>(4)?,
+                        "recommended_pain": row.get::<_, String>(5)?,
+                        "thesis_confidence": row.get::<_, f64>(6).unwrap_or(0.0),
+                        "thesis_status": row.get::<_, String>(7)?,
+                    }))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("Failed to load account thesis: {e}"))?
+            .unwrap_or_else(|| serde_json::json!({
+                "why_this_account": account.0.clone(),
+                "why_now": "Thesis not generated yet.",
+                "buyer_committee": [],
+                "do_not_say": [],
+                "recommended_channel": "",
+                "recommended_pain": "",
+                "thesis_confidence": 0.0,
+                "thesis_status": "missing",
+            }));
+
+        let mut signal_stmt = conn
+            .prepare(
+                "SELECT s.id, s.signal_type, s.text, COALESCE(s.effect_horizon, ''), s.confidence,
+                        COALESCE(sr.why_it_matters, ''), COALESCE(sr.expected_effect, ''), COALESCE(sr.evidence_ids, '[]')
+                 FROM signals s
+                 LEFT JOIN signal_rationales sr ON sr.signal_id = s.id
+                 WHERE s.account_id = ?1
+                 ORDER BY s.confidence DESC, COALESCE(s.observed_at, s.created_at) DESC
+                 LIMIT 6",
+            )
+            .map_err(|e| format!("Failed to prepare dossier signals query: {e}"))?;
+        let signals = signal_stmt
+            .query_map(params![account_id.clone()], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "signal_type": row.get::<_, String>(1)?,
+                    "text": row.get::<_, String>(2)?,
+                    "effect_horizon": row.get::<_, String>(3)?,
+                    "confidence": row.get::<_, f64>(4).unwrap_or(0.0),
+                    "why_it_matters": row.get::<_, String>(5)?,
+                    "expected_effect": row.get::<_, String>(6)?,
+                    "evidence_ids": serde_json::from_str::<serde_json::Value>(&row.get::<_, String>(7)?).unwrap_or_else(|_| serde_json::json!([])),
+                }))
+            })
+            .map_err(|e| format!("Failed to query dossier signals: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to decode dossier signals: {e}"))?;
+
+        let mut contact_stmt = conn
+            .prepare(
+                "SELECT id, COALESCE(full_name, ''), COALESCE(title, ''), COALESCE(seniority, ''),
+                        name_confidence, title_confidence, COALESCE(is_decision_maker, 0)
+                 FROM contacts
+                 WHERE account_id = ?1
+                 ORDER BY is_decision_maker DESC, name_confidence DESC, created_at ASC
+                 LIMIT 8",
+            )
+            .map_err(|e| format!("Failed to prepare dossier contacts query: {e}"))?;
+        let contact_rows = contact_stmt
+            .query_map(params![account_id.clone()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, f64>(4).unwrap_or(0.0),
+                    row.get::<_, f64>(5).unwrap_or(0.0),
+                    row.get::<_, i64>(6).unwrap_or(0),
+                ))
+            })
+            .map_err(|e| format!("Failed to query dossier contacts: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to decode dossier contacts: {e}"))?;
+        let mut contacts = Vec::new();
+        for (contact_id, full_name, title, seniority, name_confidence, title_confidence, is_decision_maker) in contact_rows {
+            let mut method_stmt = conn
+                .prepare(
+                    "SELECT channel_type, value, COALESCE(classification, ''), confidence, verified_at, COALESCE(suppressed, 0)
+                     FROM contact_methods
+                     WHERE contact_id = ?1
+                     ORDER BY confidence DESC, channel_type ASC",
+                )
+                .map_err(|e| format!("Failed to prepare dossier contact methods query: {e}"))?;
+            let methods = method_stmt
+                .query_map(params![contact_id.clone()], |row| {
+                    Ok(serde_json::json!({
+                        "channel_type": row.get::<_, String>(0)?,
+                        "value": row.get::<_, String>(1)?,
+                        "classification": row.get::<_, String>(2)?,
+                        "confidence": row.get::<_, f64>(3).unwrap_or(0.0),
+                        "verified_at": row.get::<_, Option<String>>(4)?,
+                        "suppressed": row.get::<_, i64>(5).unwrap_or(0) == 1,
+                    }))
+                })
+                .map_err(|e| format!("Failed to query dossier contact methods: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to decode dossier contact methods: {e}"))?;
+            contacts.push(serde_json::json!({
+                "id": contact_id,
+                "full_name": full_name,
+                "title": title,
+                "seniority": seniority,
+                "name_confidence": name_confidence,
+                "title_confidence": title_confidence,
+                "is_decision_maker": is_decision_maker == 1,
+                "methods": methods,
+            }));
+        }
+
+        let (touches_sent, positive_replies, meetings, opens, clicks, hard_bounces, unsubscribes) = conn
+            .query_row(
+                "SELECT
+                    COUNT(DISTINCT CASE WHEN t.sent_at IS NOT NULL THEN t.id END),
+                    SUM(CASE WHEN o.outcome_type IN ('interested', 'meeting_booked') THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN o.outcome_type = 'meeting_booked' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN o.outcome_type = 'open' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN o.outcome_type = 'click' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN o.outcome_type = 'hard_bounce' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN o.outcome_type = 'unsubscribe' THEN 1 ELSE 0 END)
+                 FROM sequence_instances si
+                 LEFT JOIN touches t ON t.sequence_instance_id = si.id
+                 LEFT JOIN outcomes o ON o.touch_id = t.id
+                 WHERE si.account_id = ?1",
+                params![account_id.clone()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0).unwrap_or(0),
+                        row.get::<_, i64>(1).unwrap_or(0),
+                        row.get::<_, i64>(2).unwrap_or(0),
+                        row.get::<_, i64>(3).unwrap_or(0),
+                        row.get::<_, i64>(4).unwrap_or(0),
+                        row.get::<_, i64>(5).unwrap_or(0),
+                        row.get::<_, i64>(6).unwrap_or(0),
+                    ))
+                },
+            )
+            .map_err(|e| format!("Failed to load dossier outcomes: {e}"))?;
+        let sent_denom = if touches_sent <= 0 {
+            1.0
+        } else {
+            touches_sent as f64
+        };
+        let next_action = match &gate {
+            SendGateDecision::Activate => format!(
+                "Send {} now",
+                thesis
+                    .get("recommended_channel")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("outreach")
+            ),
+            SendGateDecision::Research { missing } => format!("Research needed: {}", missing.join("; ")),
+            SendGateDecision::Nurture { reason } => reason.clone(),
+            SendGateDecision::Block { reason } => reason.clone(),
+        };
+
+        Ok(Some(serde_json::json!({
+            "account_id": account_id,
+            "account": {
+                "canonical_name": account.0,
+                "display_name": account.1,
+                "website": account.2,
+                "sector": account.3,
+                "geo": account.4,
+                "tier": account.5,
+                "domain": domain,
+            },
+            "score": {
+                "fit_score": score.fit_score,
+                "intent_score": score.intent_score,
+                "reachability_score": score.reachability_score,
+                "deliverability_risk": score.deliverability_risk,
+                "compliance_risk": score.compliance_risk,
+                "activation_priority": activation_priority(&score),
+                "send_gate": gate,
+            },
+            "thesis": thesis,
+            "signals": signals,
+            "contacts": contacts,
+            "outcomes": {
+                "touches_sent": touches_sent,
+                "positive_replies": positive_replies,
+                "meetings": meetings,
+                "opens": opens,
+                "clicks": clicks,
+                "hard_bounces": hard_bounces,
+                "unsubscribes": unsubscribes,
+                "positive_reply_rate": (positive_replies as f64 / sent_denom).clamp(0.0, 1.0),
+                "meeting_rate": (meetings as f64 / sent_denom).clamp(0.0, 1.0),
+            },
+            "next_action": next_action,
+            "source": "canonical_core",
+        })))
+    }
+
     pub fn list_deliveries(&self, limit: usize) -> Result<Vec<SalesDelivery>, String> {
         let conn = self.open()?;
         let mut stmt = conn
@@ -1133,6 +4275,7 @@ impl SalesEngine {
     async fn send_email(
         &self,
         state: &AppState,
+        profile: &SalesProfile,
         to: &str,
         subject: &str,
         body: &str,
@@ -1149,14 +4292,36 @@ impl SalesEngine {
             .username
             .parse()
             .map_err(|e| format!("Invalid sender email '{}': {e}", cfg.username))?;
+        let recipient_email = to.trim().to_string();
         let to: Mailbox = to
             .parse()
             .map_err(|e| format!("Invalid recipient email '{to}': {e}"))?;
+
+        let sender_domain = email_domain(&cfg.username)
+            .ok_or_else(|| "Configured sender mailbox is invalid".to_string())?;
+        let brand_domain = email_domain(&profile.sender_email)
+            .ok_or_else(|| "Sales profile sender_email is invalid".to_string())?;
+        if !is_valid_sending_subdomain(&sender_domain, &brand_domain) {
+            return Err(format!(
+                "Refusing to send from main domain '{}'; configure a sending subdomain for '{}'",
+                sender_domain, brand_domain
+            ));
+        }
+
+        let unsubscribe_url = format!(
+            "{}/api/sales/unsubscribe?token={}",
+            sales_base_url(&state.kernel),
+            generate_unsubscribe_token(&recipient_email, &cfg.username)
+        );
 
         let msg = Message::builder()
             .from(from)
             .to(to)
             .subject(subject)
+            .header(ListUnsubscribeHeader(format!("<{}>", unsubscribe_url)))
+            .header(ListUnsubscribePostHeader(
+                "List-Unsubscribe=One-Click".to_string(),
+            ))
             .body(body.to_string())
             .map_err(|e| format!("Failed to build email message: {e}"))?;
 
@@ -1176,62 +4341,17 @@ impl SalesEngine {
 
     async fn send_linkedin(
         &self,
-        state: &AppState,
+        approval_id: &str,
         profile_url: &str,
-        message: &str,
+        _message: &str,
     ) -> Result<(), String> {
-        let agent_id = "sales_linkedin";
-        state
-            .kernel
-            .browser_ctx
-            .send_command(
-                agent_id,
-                BrowserCommand::Navigate {
-                    url: profile_url.to_string(),
-                },
-            )
-            .await
-            .map_err(|e| format!("LinkedIn navigate failed: {e}"))?;
-
-        // Playwright bridge click() supports text fallback if selector click fails.
-        state
-            .kernel
-            .browser_ctx
-            .send_command(
-                agent_id,
-                BrowserCommand::Click {
-                    selector: "Message".to_string(),
-                },
-            )
-            .await
-            .map_err(|e| format!("LinkedIn 'Message' click failed: {e}"))?;
-
-        state
-            .kernel
-            .browser_ctx
-            .send_command(
-                agent_id,
-                BrowserCommand::Type {
-                    selector: "div.msg-form__contenteditable[contenteditable='true']".to_string(),
-                    text: message.to_string(),
-                },
-            )
-            .await
-            .map_err(|e| format!("LinkedIn message typing failed: {e}"))?;
-
-        state
-            .kernel
-            .browser_ctx
-            .send_command(
-                agent_id,
-                BrowserCommand::Click {
-                    selector: "button.msg-form__send-button".to_string(),
-                },
-            )
-            .await
-            .map_err(|e| format!("LinkedIn send click failed: {e}"))?;
-
-        Ok(())
+        self.record_delivery(
+            approval_id,
+            "linkedin_assist",
+            profile_url,
+            "operator_pending",
+            None,
+        )
     }
 
     fn record_delivery(
@@ -1243,6 +4363,7 @@ impl SalesEngine {
         error_msg: Option<&str>,
     ) -> Result<(), String> {
         let conn = self.open()?;
+        let sent_at = Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO deliveries (id, approval_id, channel, recipient, status, error, sent_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             params![
@@ -1252,10 +4373,20 @@ impl SalesEngine {
                 recipient,
                 status,
                 error_msg,
-                Utc::now().to_rfc3339(),
+                sent_at,
             ],
         )
         .map_err(|e| format!("Failed to record delivery: {e}"))?;
+        let _ = conn.execute(
+            "UPDATE touches SET sent_at = COALESCE(sent_at, ?2) WHERE id = ?1",
+            params![approval_id, sent_at],
+        );
+        let _ = conn.execute(
+            "UPDATE sequence_instances
+             SET updated_at = ?2
+             WHERE id = (SELECT sequence_instance_id FROM touches WHERE id = ?1)",
+            params![approval_id, Utc::now().to_rfc3339()],
+        );
         Ok(())
     }
 
@@ -1269,14 +4400,236 @@ impl SalesEngine {
         Ok(())
     }
 
+    fn ingest_outcome_event(
+        &self,
+        delivery_id: &str,
+        event_type: &str,
+        raw_text: &str,
+    ) -> Result<serde_json::Value, String> {
+        let conn = self.open()?;
+        let delivery = conn
+            .query_row(
+                "SELECT approval_id, channel, recipient FROM deliveries WHERE id = ?1",
+                params![delivery_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("Failed to look up delivery: {e}"))?
+            .ok_or_else(|| "Delivery not found".to_string())?;
+
+        let approval = conn
+            .query_row(
+                "SELECT a.id, a.channel, a.payload_json, l.id, l.run_id, l.company, l.website, l.company_domain,
+                        l.contact_name, l.contact_title, l.linkedin_url, l.email, l.phone, l.reasons_json,
+                        l.email_subject, l.email_body, l.linkedin_message, l.score, l.status, l.created_at
+                 FROM approvals a
+                 JOIN leads l ON l.id = a.lead_id
+                 WHERE a.id = ?1",
+                params![delivery.0.clone()],
+                |row| {
+                    let reasons_raw = row.get::<_, String>(13)?;
+                    let reasons = serde_json::from_str::<Vec<String>>(&reasons_raw).unwrap_or_default();
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        SalesLead {
+                            id: row.get::<_, String>(3)?,
+                            run_id: row.get::<_, String>(4)?,
+                            company: row.get::<_, String>(5)?,
+                            website: row.get::<_, String>(6)?,
+                            company_domain: row.get::<_, String>(7)?,
+                            contact_name: row.get::<_, String>(8)?,
+                            contact_title: row.get::<_, String>(9)?,
+                            linkedin_url: row.get::<_, Option<String>>(10)?,
+                            email: row.get::<_, Option<String>>(11)?,
+                            phone: row.get::<_, Option<String>>(12)?,
+                            reasons,
+                            email_subject: row.get::<_, String>(14)?,
+                            email_body: row.get::<_, String>(15)?,
+                            linkedin_message: row.get::<_, String>(16)?,
+                            score: row.get::<_, i64>(17)? as i32,
+                            status: row.get::<_, String>(18)?,
+                            created_at: row.get::<_, String>(19)?,
+                        },
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("Failed to load approval/lead for outcome: {e}"))?
+            .ok_or_else(|| "Approval/lead not found for delivery".to_string())?;
+
+        self.ensure_touch_for_approval(
+            &conn,
+            &approval.3,
+            &approval.0,
+            &approval.1,
+            &approval.2,
+        )?;
+
+        let outcome = classify_outcome(raw_text, event_type, &approval.0);
+        let outcome_id = stable_sales_id("outcome", &[delivery_id, event_type, &outcome.outcome_type]);
+        conn.execute(
+            "INSERT INTO outcomes (id, touch_id, outcome_type, raw_text, classified_at, classifier_confidence)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                raw_text = excluded.raw_text,
+                classified_at = excluded.classified_at,
+                classifier_confidence = excluded.classifier_confidence",
+            params![
+                outcome_id,
+                outcome.touch_id,
+                outcome.outcome_type,
+                outcome.raw_text,
+                Utc::now().to_rfc3339(),
+                outcome.classifier_confidence,
+            ],
+        )
+        .map_err(|e| format!("Failed to persist outcome: {e}"))?;
+
+        let account_id = stable_sales_id("acct", &[&approval.3.company_domain]);
+        let snapshot_id = stable_sales_id("outcome_snapshot", &[delivery_id, event_type]);
+        let score_at_touch_json = conn
+            .query_row(
+                "SELECT fit_score, intent_score, reachability_score, deliverability_risk, compliance_risk
+                 FROM score_snapshots
+                 WHERE account_id = ?1
+                 ORDER BY computed_at DESC
+                 LIMIT 1",
+                params![account_id.clone()],
+                |row| {
+                    Ok(serde_json::json!({
+                        "fit_score": row.get::<_, f64>(0).unwrap_or(0.0),
+                        "intent_score": row.get::<_, f64>(1).unwrap_or(0.0),
+                        "reachability_score": row.get::<_, f64>(2).unwrap_or(0.0),
+                        "deliverability_risk": row.get::<_, f64>(3).unwrap_or(0.0),
+                        "compliance_risk": row.get::<_, f64>(4).unwrap_or(0.0),
+                    }))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("Failed to load score snapshot for outcome: {e}"))?
+            .unwrap_or_else(|| serde_json::json!({}));
+        let active_signal_ids = {
+            let mut stmt = conn
+                .prepare("SELECT id FROM signals WHERE account_id = ?1 ORDER BY confidence DESC LIMIT 8")
+                .map_err(|e| format!("Failed to prepare signal snapshot query: {e}"))?;
+            let rows = stmt
+                .query_map(params![account_id.clone()], |row| row.get::<_, String>(0))
+                .map_err(|e| format!("Failed to query signal snapshot ids: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to decode signal snapshot ids: {e}"))?;
+            rows
+        };
+        let thesis_id = conn
+            .query_row(
+                "SELECT thesis_id FROM sequence_instances
+                 WHERE id = (SELECT sequence_instance_id FROM touches WHERE id = ?1)",
+                params![approval.0.clone()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to load thesis id for outcome snapshot: {e}"))?
+            .flatten();
+        conn.execute(
+            "INSERT INTO outcome_attribution_snapshots
+             (id, touch_id, account_id, snapshot_at, score_at_touch_json, active_signal_ids, unused_signal_ids,
+              thesis_id, sequence_variant, message_variant, channel, mailbox_id, contextual_factors_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, '[]', ?7, 'default', 'v1', ?8, NULL, ?9)
+             ON CONFLICT(id) DO UPDATE SET
+                score_at_touch_json = excluded.score_at_touch_json,
+                active_signal_ids = excluded.active_signal_ids,
+                thesis_id = excluded.thesis_id,
+                channel = excluded.channel,
+                contextual_factors_json = excluded.contextual_factors_json",
+            params![
+                snapshot_id,
+                approval.0.clone(),
+                account_id.clone(),
+                Utc::now().to_rfc3339(),
+                score_at_touch_json.to_string(),
+                serde_json::to_string(&active_signal_ids)
+                    .map_err(|e| format!("Failed to encode active signal ids: {e}"))?,
+                thesis_id,
+                delivery.1,
+                serde_json::json!({
+                    "delivery_id": delivery_id,
+                    "recipient": delivery.2,
+                    "event_type": event_type,
+                })
+                .to_string(),
+            ],
+        )
+        .map_err(|e| format!("Failed to persist outcome attribution snapshot: {e}"))?;
+        self.record_missed_signal_review(
+            &conn,
+            &outcome_id,
+            &snapshot_id,
+            &account_id,
+            &outcome.outcome_type,
+            &active_signal_ids,
+            &Vec::new(),
+        )?;
+
+        match outcome.outcome_type.as_str() {
+            "hard_bounce" => {
+                self.suppress_contact(&conn, &delivery.2, "hard_bounce", false, Some(&outcome_id))?;
+            }
+            "unsubscribe" => {
+                self.suppress_contact(&conn, &delivery.2, "unsubscribe", true, Some(&outcome_id))?;
+            }
+            "wrong_person" => {
+                self.enqueue_research(&conn, &account_id, "Wrong person outcome; find alternate contact", 95)?;
+            }
+            "meeting_booked" => {
+                let _ = conn.execute(
+                    "UPDATE sequence_instances
+                     SET status = 'completed', updated_at = ?2
+                     WHERE id = (SELECT sequence_instance_id FROM touches WHERE id = ?1)",
+                    params![approval.0.clone(), Utc::now().to_rfc3339()],
+                );
+            }
+            "interested" | "open" | "click" | "not_now" => {
+                let _ = conn.execute(
+                    "UPDATE sequence_instances
+                     SET status = 'active', updated_at = ?2
+                     WHERE id = (SELECT sequence_instance_id FROM touches WHERE id = ?1)",
+                    params![approval.0.clone(), Utc::now().to_rfc3339()],
+                );
+            }
+            _ => {}
+        }
+        if matches!(outcome.outcome_type.as_str(), "hard_bounce" | "unsubscribe") {
+            conn.execute(
+                "UPDATE contact_methods SET suppressed = 1 WHERE value = ?1",
+                params![delivery.2.trim().to_lowercase()],
+            )
+            .map_err(|e| format!("Failed to update suppressed contact method: {e}"))?;
+        }
+
+        Ok(serde_json::json!({
+            "delivery_id": delivery_id,
+            "touch_id": approval.0,
+            "account_id": account_id,
+            "outcome_type": outcome.outcome_type,
+            "recipient": delivery.2,
+        }))
+    }
+
     pub async fn approve_and_send(
         &self,
         state: &AppState,
         approval_id: &str,
     ) -> Result<serde_json::Value, String> {
-        let conn = self.open()?;
-        let row = conn
-            .query_row(
+        let row = {
+            let conn = self.open()?;
+            conn.query_row(
                 "SELECT id, channel, payload_json, status FROM approvals WHERE id = ?",
                 params![approval_id],
                 |r| {
@@ -1289,7 +4642,8 @@ impl SalesEngine {
                 },
             )
             .optional()
-            .map_err(|e| format!("Approval lookup failed: {e}"))?;
+            .map_err(|e| format!("Approval lookup failed: {e}"))?
+        };
 
         let (id, channel, payload_raw, status) =
             row.ok_or_else(|| "Approval not found".to_string())?;
@@ -1328,7 +4682,47 @@ impl SalesEngine {
                     .get("body")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| "Missing payload.body".to_string())?;
-                if let Err(send_err) = self.send_email(state, to, subject, body).await {
+                let (suppressed, bounce_count) = {
+                    let conn = self.open()?;
+                    let suppressed = self.is_suppressed(&conn, to)?;
+                    let domain = email_domain(to).unwrap_or_default();
+                    let bounce_count = conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM suppressions
+                             WHERE contact_method_value LIKE ?1 AND reason = 'hard_bounce'",
+                            params![format!("%@{domain}")],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap_or(0);
+                    (suppressed, bounce_count)
+                };
+                if suppressed {
+                    self.update_approval_status(&id, "blocked_suppressed")?;
+                    let _ = self.record_delivery(&id, "email", to, "blocked_suppressed", None);
+                    return Err("Recipient is suppressed".to_string());
+                }
+                let validation = validate_email_for_sending(to, suppressed, bounce_count).await?;
+                if !validation.safe_to_send {
+                    self.update_approval_status(&id, "blocked_validation")?;
+                    let _ = self.record_delivery(
+                        &id,
+                        "email",
+                        to,
+                        "blocked_validation",
+                        Some(&format!(
+                            "syntax_valid={} mx_valid={} classification={} domain_health={:.2}",
+                            validation.syntax_valid,
+                            validation.mx_valid,
+                            validation.classification,
+                            validation.domain_health
+                        )),
+                    );
+                    return Err(format!(
+                        "Email failed pre-send validation (classification={}, mx_valid={})",
+                        validation.classification, validation.mx_valid
+                    ));
+                }
+                if let Err(send_err) = self.send_email(state, &profile, to, subject, body).await {
                     if let Err(record_err) =
                         self.record_delivery(&id, "email", to, "failed", Some(&send_err))
                     {
@@ -1350,7 +4744,7 @@ impl SalesEngine {
                 }
                 serde_json::json!({"channel": "email", "recipient": to, "status": "sent"})
             }
-            "linkedin" => {
+            "linkedin" | "linkedin_assist" => {
                 let profile_url = payload
                     .get("profile_url")
                     .and_then(|v| v.as_str())
@@ -1359,10 +4753,10 @@ impl SalesEngine {
                     .get("message")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| "Missing payload.message".to_string())?;
-                if let Err(send_err) = self.send_linkedin(state, profile_url, message).await {
+                if let Err(send_err) = self.send_linkedin(&id, profile_url, message).await {
                     if let Err(record_err) = self.record_delivery(
                         &id,
-                        "linkedin",
+                        "linkedin_assist",
                         profile_url,
                         "failed",
                         Some(&send_err),
@@ -1376,16 +4770,7 @@ impl SalesEngine {
                     return Err(send_err);
                 }
                 self.update_approval_status(&id, "approved")?;
-                if let Err(record_err) =
-                    self.record_delivery(&id, "linkedin", profile_url, "sent", None)
-                {
-                    warn!(
-                        approval_id = %id,
-                        error = %record_err,
-                        "Failed to record LinkedIn delivery after successful send"
-                    );
-                }
-                serde_json::json!({"channel": "linkedin", "recipient": profile_url, "status": "sent"})
+                serde_json::json!({"channel": "linkedin_assist", "recipient": profile_url, "status": "operator_pending"})
             }
             other => return Err(format!("Unsupported channel: {other}")),
         };
@@ -1471,6 +4856,14 @@ impl SalesEngine {
         &self,
         kernel: &openfang_kernel::OpenFangKernel,
     ) -> Result<SalesRunRecord, String> {
+        self.run_generation_with_job(kernel, None).await
+    }
+
+    pub async fn run_generation_with_job(
+        &self,
+        kernel: &openfang_kernel::OpenFangKernel,
+        job_id: Option<&str>,
+    ) -> Result<SalesRunRecord, String> {
         self.init()?;
         let profile = self
             .get_profile()?
@@ -1482,16 +4875,22 @@ impl SalesEngine {
         {
             return Err("Sales profile is incomplete: product_name/product_description/target_industry are required".to_string());
         }
+        if profile.target_geo.trim().is_empty() {
+            return Err("target_geo must be set before running".to_string());
+        }
 
         let run_sequence = self.completed_runs_count()? as usize;
         let run_id = self.begin_run()?;
         let started_at = Utc::now().to_rfc3339();
 
-        let max_candidates = (profile.daily_target as usize).saturating_mul(3).max(40);
+        let max_candidates = DISCOVERY_RESERVOIR_CANDIDATES;
         let is_field_ops = profile_targets_field_ops(&profile);
         let skip_llm_discovery = is_field_ops && geo_is_turkey(&profile.target_geo);
 
         // --- STAGE 1: Query Plan (LLM or heuristic fallback) ---
+        if let Some(job_id) = job_id {
+            self.set_job_stage_running(job_id, PipelineStage::QueryPlanning)?;
+        }
         let lead_plan = if skip_llm_discovery {
             heuristic_lead_query_plan(&profile)
         } else {
@@ -1513,6 +4912,9 @@ impl SalesEngine {
                 }
             }
         };
+        if let Some(job_id) = job_id {
+            self.complete_job_stage(job_id, PipelineStage::QueryPlanning, &lead_plan)?;
+        }
 
         let cache = Arc::new(WebCache::new(Duration::from_secs(900)));
         let search_engine = WebSearchEngine::new(kernel.config.web.clone(), cache);
@@ -1535,9 +4937,16 @@ impl SalesEngine {
         };
 
         // --- STAGE 2: Parallel Discovery (LLM primary + web search + directories) ---
+        if let Some(job_id) = job_id {
+            self.set_job_stage_running(job_id, PipelineStage::Discovery)?;
+        }
         let previously_discovered = self.previously_discovered_domains(200).unwrap_or_default();
-        let llm_target = ((profile.daily_target as usize).saturating_add(4))
-            .clamp(6, MAX_LLM_PRIMARY_CANDIDATES);
+        let llm_target = MAX_LLM_PRIMARY_CANDIDATES;
+        let skip_source_llm = self.should_skip_source("llm_generation").unwrap_or(false);
+        let skip_source_web = self.should_skip_source("web_search").unwrap_or(false);
+        let skip_source_directory = self
+            .should_skip_source("directory_listing")
+            .unwrap_or(false);
 
         let (
             llm_candidates,
@@ -1546,7 +4955,7 @@ impl SalesEngine {
         ) = tokio::join!(
             // PRIMARY: LLM company generation
             async {
-                if skip_llm_discovery {
+                if skip_llm_discovery || skip_source_llm {
                     Vec::new()
                 } else {
                     match tokio::time::timeout(
@@ -1580,33 +4989,89 @@ impl SalesEngine {
                 }
             },
             // SECONDARY: Web search discovery
-            discover_via_web_search(
-                &search_engine,
-                &brave_search_engine,
-                &lead_plan,
-                &profile,
-                max_candidates,
-                is_field_ops,
-            ),
+            async {
+                if skip_source_web {
+                    (Vec::new(), HashMap::new(), false)
+                } else {
+                    discover_via_web_search(
+                        &search_engine,
+                        &brave_search_engine,
+                        &lead_plan,
+                        &profile,
+                        max_candidates,
+                        is_field_ops,
+                    )
+                    .await
+                }
+            },
             // SUPPLEMENTAL: Turkish directory scraping
-            fetch_free_discovery_candidates(&profile, run_sequence),
+            async {
+                if skip_source_directory {
+                    Vec::new()
+                } else {
+                    fetch_free_discovery_candidates(&profile, run_sequence).await
+                }
+            },
         );
+        let mut directory_source_counts = expected_source_counts_for_profile(&profile);
+        for candidate in &free_candidates {
+            if let Some(source) = candidate.contact_hint.source.as_deref() {
+                let key = source_health_key(source);
+                if let Some(entry) = directory_source_counts.get_mut(key) {
+                    *entry += 1;
+                }
+            }
+        }
+        for (source_type, count) in directory_source_counts {
+            let _ = self.update_source_health(&source_type, count);
+        }
+        let _ = self.update_source_health("web_search", web_search_candidates.len());
+        let _ = self.update_source_health("llm_generation", llm_candidates.len());
+        if let Some(job_id) = job_id {
+            self.complete_job_stage(
+                job_id,
+                PipelineStage::Discovery,
+                &DiscoveryCheckpoint {
+                    lead_plan: lead_plan.clone(),
+                    llm_candidates: llm_candidates.clone(),
+                    web_candidates: web_search_candidates.clone(),
+                    free_candidates: free_candidates.clone(),
+                    source_contact_hints: source_contact_hints.clone(),
+                    search_unavailable,
+                },
+            )?;
+        }
 
         // --- STAGE 3: Merge all discovery sources ---
+        if let Some(job_id) = job_id {
+            self.set_job_stage_running(job_id, PipelineStage::Merging)?;
+        }
         let mut candidate_list = merge_all_discovery_sources(
             llm_candidates,
             web_search_candidates,
             free_candidates,
             &mut source_contact_hints,
         );
+        if let Some(job_id) = job_id {
+            self.complete_job_stage(
+                job_id,
+                PipelineStage::Merging,
+                &CandidateCheckpoint {
+                    lead_plan: lead_plan.clone(),
+                    candidate_list: candidate_list.clone(),
+                    source_contact_hints: source_contact_hints.clone(),
+                    search_unavailable,
+                    llm_validated_domains: Vec::new(),
+                },
+            )?;
+        }
 
         // --- STAGE 4: LLM Relevance Validation ---
+        if let Some(job_id) = job_id {
+            self.set_job_stage_running(job_id, PipelineStage::Validation)?;
+        }
         let mut llm_validated_domains = HashSet::<String>::new();
-        let validation_count = candidate_list.len().min(
-            (profile.daily_target as usize)
-                .saturating_mul(2)
-                .clamp(8, LLM_RELEVANCE_VALIDATION_BATCH_SIZE),
-        );
+        let validation_count = candidate_list.len().min(LLM_RELEVANCE_VALIDATION_BATCH_SIZE);
         let should_run_llm_validation = validation_count > 3
             && !(is_field_ops && profile.target_geo.trim().eq_ignore_ascii_case("TR"));
         if should_run_llm_validation {
@@ -1633,8 +5098,25 @@ impl SalesEngine {
                 Err(_) => warn!("LLM validation timed out, proceeding without"),
             }
         }
+        if let Some(job_id) = job_id {
+            self.complete_job_stage(
+                job_id,
+                PipelineStage::Validation,
+                &CandidateCheckpoint {
+                    lead_plan: lead_plan.clone(),
+                    candidate_list: candidate_list.clone(),
+                    source_contact_hints: source_contact_hints.clone(),
+                    search_unavailable,
+                    llm_validated_domains: llm_validated_domains.iter().cloned().collect(),
+                },
+            )?;
+        }
 
         // --- STAGE 5: Filter and Sort ---
+        let mut current_stage = PipelineStage::Filtering;
+        if let Some(job_id) = job_id {
+            self.set_job_stage_running(job_id, PipelineStage::Filtering)?;
+        }
         let min_candidate_score = candidate_quality_floor(&profile);
         candidate_list.retain(|c| {
             c.score >= min_candidate_score && !candidate_should_skip_for_profile(c, &profile)
@@ -1656,12 +5138,29 @@ impl SalesEngine {
                 profile.target_industry, profile.target_geo
             );
             self.finish_run(&run_id, "failed", 0, 0, 0, Some(&err_msg))?;
+            if let Some(job_id) = job_id {
+                let _ = self.fail_job_stage(job_id, current_stage, &err_msg);
+            }
             return Err(err_msg);
         }
+        if let Some(job_id) = job_id {
+            self.complete_job_stage(
+                job_id,
+                PipelineStage::Filtering,
+                &CandidateCheckpoint {
+                    lead_plan: lead_plan.clone(),
+                    candidate_list: candidate_list.clone(),
+                    source_contact_hints: source_contact_hints.clone(),
+                    search_unavailable,
+                    llm_validated_domains: llm_validated_domains.iter().cloned().collect(),
+                },
+            )?;
+        }
 
-        let prospect_seed_limit = (profile.daily_target as usize)
-            .saturating_mul(5)
-            .clamp(30, 160);
+        if let Some(job_id) = job_id {
+            self.set_job_stage_running(job_id, PipelineStage::Enrichment)?;
+        }
+        let prospect_seed_limit = DISCOVERY_PROSPECT_SEED_LIMIT;
         let seeded_prospect_profiles = match self
             .seed_prospect_profiles_for_run(
                 &run_id,
@@ -1679,6 +5178,19 @@ impl SalesEngine {
                 Vec::new()
             }
         };
+        if let Some(job_id) = job_id {
+            self.complete_job_stage(
+                job_id,
+                PipelineStage::Enrichment,
+                &CandidateCheckpoint {
+                    lead_plan: lead_plan.clone(),
+                    candidate_list: candidate_list.clone(),
+                    source_contact_hints: source_contact_hints.clone(),
+                    search_unavailable,
+                    llm_validated_domains: llm_validated_domains.iter().cloned().collect(),
+                },
+            )?;
+        }
         let prospect_profile_lookup: HashMap<String, SalesProspectProfile> =
             seeded_prospect_profiles
                 .iter()
@@ -1701,6 +5213,10 @@ impl SalesEngine {
             .then_with(|| b.score.cmp(&a.score))
             .then_with(|| a.domain.cmp(&b.domain))
         });
+        current_stage = PipelineStage::LeadGeneration;
+        if let Some(job_id) = job_id {
+            self.set_job_stage_running(job_id, PipelineStage::LeadGeneration)?;
+        }
 
         let mut discovered = 0u32;
         let mut inserted = 0u32;
@@ -1719,8 +5235,7 @@ impl SalesEngine {
             .redirect(reqwest::redirect::Policy::limited(4))
             .build()
             .ok();
-        let max_direct_enrich_attempts =
-            (profile.daily_target as usize).clamp(MAX_DIRECT_ENRICH_ATTEMPTS, 16);
+        let max_direct_enrich_attempts = MAX_DIRECT_ENRICH_ATTEMPTS;
         let prefetched_site_enrichments = if search_unavailable {
             if let Some(client) = site_client.as_ref() {
                 prefetch_site_contact_enrichments(
@@ -1740,16 +5255,12 @@ impl SalesEngine {
         let mut direct_enrich_attempts = 0usize;
         let mut generic_direct_enrich_retries = 0usize;
         let mut prefetched_retry_attempts = 0usize;
-        let max_web_contact_search_attempts =
-            (profile.daily_target as usize).clamp(4, MAX_WEB_CONTACT_SEARCH_ATTEMPTS);
+        let max_web_contact_search_attempts = MAX_WEB_CONTACT_SEARCH_ATTEMPTS;
         let mut web_contact_search_attempts = 0usize;
         let mut prospect_profile_updates = HashMap::<String, SalesProspectProfile>::new();
+        let mut activation_candidates = HashMap::<String, ActivationLeadCandidate>::new();
 
         for candidate in candidate_list.iter().take(max_candidates) {
-            if inserted >= profile.daily_target {
-                break;
-            }
-
             discovered += 1;
             if candidate.score < min_candidate_score {
                 continue;
@@ -2232,18 +5743,20 @@ impl SalesEngine {
             }
 
             // For validated companies: fill missing fields with reasonable defaults.
-            if is_llm_validated || is_verified_by_memory {
-                if contact_name.is_none() || contact_name_is_placeholder(contact_name.as_deref()) {
-                    contact_title = default_contact_title(profile.target_title_policy.as_str());
-                }
+            if (is_llm_validated || is_verified_by_memory)
+                && (contact_name.is_none()
+                    || contact_name_is_placeholder(contact_name.as_deref()))
+            {
+                contact_title = default_contact_title(profile.target_title_policy.as_str());
             }
 
             if !lead_has_outreach_channel(email.as_ref(), linkedin_url.as_ref()) {
                 continue;
             }
             // Search-time LLM validation or cached dossier memory can proceed without a real person name.
-            if !(is_llm_validated || is_verified_by_memory)
-                && !lead_has_person_identity(contact_name.as_deref(), linkedin_url.as_ref())
+            if !(is_llm_validated
+                || is_verified_by_memory
+                || lead_has_person_identity(contact_name.as_deref(), linkedin_url.as_ref()))
             {
                 continue;
             }
@@ -2296,6 +5809,37 @@ impl SalesEngine {
                 &evidence,
             );
 
+            let canonical = match self.sync_canonical_state(
+                &self.open()?,
+                &profile,
+                candidate,
+                &company,
+                domain,
+                &format!("https://{}", domain),
+                contact_name.as_deref(),
+                contact_title.as_deref(),
+                email.as_deref(),
+                candidate.phone.as_deref(),
+                linkedin_url.as_deref(),
+                company_linkedin_url.as_deref(),
+                &osint_links,
+                &evidence,
+                &reasons,
+            ) {
+                Ok(value) => value,
+                Err(e) => {
+                    warn!(domain = %domain, error = %e, "Canonical account sync failed");
+                    continue;
+                }
+            };
+
+            let activation_score =
+                ((activation_priority(&canonical.score) * 100.0).round() as i32).clamp(0, 100);
+            score = score.max(activation_score);
+
+            if !matches!(canonical.gate, SendGateDecision::Activate) {
+                continue;
+            }
             let lead = SalesLead {
                 id: uuid::Uuid::new_v4().to_string(),
                 run_id: run_id.clone(),
@@ -2312,13 +5856,13 @@ impl SalesEngine {
                 }),
                 linkedin_url,
                 email,
-                phone: None,
+                phone: candidate.phone.as_deref().and_then(normalize_phone),
                 reasons,
                 email_subject,
                 email_body,
                 linkedin_message,
                 score,
-                status: "draft_ready".to_string(),
+                status: "activation_candidate".to_string(),
                 created_at: Utc::now().to_rfc3339(),
             };
 
@@ -2326,17 +5870,56 @@ impl SalesEngine {
                 Ok(true) => {
                     inserted += 1;
                     let _ = self.record_discovered_domain(domain, &run_id);
-                    match self.queue_approvals_for_lead(&lead) {
-                        Ok(q) => approvals_queued += q,
-                        Err(e) => {
-                            warn!(lead_id = %lead.id, error = %e, "Failed to queue lead approvals")
-                        }
+                    let account_id = stable_sales_id("acct", &[domain]);
+                    let entry = activation_candidates
+                        .entry(account_id.clone())
+                        .or_insert_with(|| ActivationLeadCandidate {
+                            account_id: account_id.clone(),
+                            priority: activation_score as i64,
+                            lead: lead.clone(),
+                        });
+                    if activation_score as i64 > entry.priority {
+                        *entry = ActivationLeadCandidate {
+                            account_id,
+                            priority: activation_score as i64,
+                            lead: lead.clone(),
+                        };
                     }
                 }
                 Ok(false) => {
                     // duplicate, skip silently
                 }
                 Err(e) => warn!(domain = %domain, error = %e, "Lead insert failed"),
+            }
+        }
+
+        if !activation_candidates.is_empty() {
+            let conn = self.open()?;
+            let candidate_priorities = activation_candidates
+                .iter()
+                .map(|(account_id, candidate)| (account_id.clone(), candidate.priority))
+                .collect::<HashMap<_, _>>();
+            let selected_accounts =
+                self.select_accounts_for_activation(&conn, &candidate_priorities, profile.daily_target)?;
+            let selected_set = selected_accounts.into_iter().collect::<HashSet<_>>();
+            for candidate in activation_candidates.into_values() {
+                let lead_status = if selected_set.contains(&candidate.account_id) {
+                    match self.queue_approvals_for_lead(&candidate.lead) {
+                        Ok(q) => {
+                            approvals_queued += q;
+                            "approval_pending"
+                        }
+                        Err(e) => {
+                            warn!(lead_id = %candidate.lead.id, error = %e, "Failed to queue selected lead approvals");
+                            "activation_candidate"
+                        }
+                    }
+                } else {
+                    "activation_backlog"
+                };
+                if let Err(e) = self.update_lead_status(&candidate.lead.id, lead_status) {
+                    warn!(lead_id = %candidate.lead.id, error = %e, "Failed to update activation lead status");
+                }
             }
         }
 
@@ -2348,9 +5931,7 @@ impl SalesEngine {
         }
 
         if inserted == 0 && seeded_prospect_profiles.is_empty() {
-            let err_msg = format!(
-                "Prospecting run completed discovery, but no durable prospect dossiers or actionable contacts could be saved for the current ICP/geo."
-            );
+            let err_msg = "Prospecting run completed discovery, but no durable prospect dossiers or actionable contacts could be saved for the current ICP/geo.".to_string();
             self.finish_run(
                 &run_id,
                 "failed",
@@ -2359,6 +5940,9 @@ impl SalesEngine {
                 approvals_queued,
                 Some(&err_msg),
             )?;
+            if let Some(job_id) = job_id {
+                let _ = self.fail_job_stage(job_id, current_stage, &err_msg);
+            }
             return Err(err_msg);
         }
 
@@ -2379,6 +5963,19 @@ impl SalesEngine {
             approvals_queued,
             run_note.as_deref(),
         )?;
+        if let Some(job_id) = job_id {
+            self.complete_job_stage(
+                job_id,
+                PipelineStage::LeadGeneration,
+                &serde_json::json!({
+                    "run_id": run_id,
+                    "discovered": discovered,
+                    "inserted": inserted,
+                    "approvals_queued": approvals_queued
+                }),
+            )?;
+            self.complete_job_run(job_id)?;
+        }
 
         if inserted > 0 {
             if let Err(e) = self
@@ -2433,9 +6030,7 @@ impl SalesEngine {
         sales_profile: &SalesProfile,
         kernel: &openfang_kernel::OpenFangKernel,
     ) -> Result<Vec<SalesProspectProfile>, String> {
-        let scan_limit = (sales_profile.daily_target as usize)
-            .saturating_mul(6)
-            .clamp(60, 400);
+        let scan_limit = DISCOVERY_REFRESH_SCAN_LIMIT;
         let leads = self.list_leads(scan_limit, Some(run_id))?;
         if leads.is_empty() {
             return Ok(Vec::new());
@@ -2476,9 +6071,7 @@ impl SalesEngine {
             Err(_) => return profiles,
         };
 
-        let osint_target_limit = (sales_profile.daily_target as usize)
-            .saturating_mul(2)
-            .clamp(12, MAX_OSINT_SEARCH_TARGETS);
+        let osint_target_limit = DISCOVERY_OSINT_TARGET_LIMIT;
         let targets = profiles
             .iter()
             .filter(|profile| {
@@ -2551,9 +6144,7 @@ impl SalesEngine {
             }
         };
 
-        let osint_target_limit = (sales_profile.daily_target as usize)
-            .saturating_mul(2)
-            .clamp(12, MAX_OSINT_SEARCH_TARGETS);
+        let osint_target_limit = DISCOVERY_OSINT_TARGET_LIMIT;
         let targets = profiles
             .iter()
             .filter(|profile| {
@@ -3599,6 +7190,17 @@ fn extract_domain(raw_url: &str) -> Option<String> {
     Some(host)
 }
 
+fn normalize_domain(raw: &str) -> String {
+    extract_domain(raw).unwrap_or_else(|| {
+        raw.trim()
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .trim_start_matches("www.")
+            .trim_matches('/')
+            .to_lowercase()
+    })
+}
+
 fn has_blocked_asset_tld(domain: &str) -> bool {
     const BLOCKED_TLDS: &[&str] = &[
         "png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "css", "js", "json", "xml", "pdf",
@@ -3689,6 +7291,197 @@ fn is_consumer_email_domain(domain: &str) -> bool {
     CONSUMER_EMAIL_DOMAINS
         .iter()
         .any(|blocked| normalized == *blocked || normalized.ends_with(&format!(".{blocked}")))
+}
+
+fn is_valid_company_domain(domain: &str) -> bool {
+    let d = normalize_domain(domain);
+    !d.is_empty()
+        && d.contains('.')
+        && d.len() > 4
+        && !is_consumer_email_domain(&d)
+        && !is_blocked_company_domain(&d)
+        && !d.ends_with(".gov.tr")
+        && !d.ends_with(".edu.tr")
+        && !d.ends_with(".mil.tr")
+}
+
+fn normalize_candidate_gateway(candidate: &mut DomainCandidate) -> bool {
+    if !is_valid_company_domain(&candidate.domain) {
+        return false;
+    }
+    candidate.domain = normalize_domain(&candidate.domain);
+    candidate.phone = candidate.phone.as_deref().and_then(normalize_phone);
+    candidate.matched_keywords = dedupe_strings(
+        candidate
+            .matched_keywords
+            .iter()
+            .map(|value| truncate_cleaned_text(value, 120))
+            .filter(|value| !value.is_empty())
+            .collect(),
+    );
+    candidate.evidence = dedupe_strings(
+        candidate
+            .evidence
+            .iter()
+            .map(|value| truncate_cleaned_text(value, 220))
+            .filter(|value| !value.is_empty())
+            .collect(),
+    );
+    candidate.source_links = merge_osint_links(Vec::new(), candidate.source_links.clone());
+    true
+}
+
+fn normalize_free_candidate_gateway(
+    mut candidate: FreeDiscoveryCandidate,
+) -> Option<FreeDiscoveryCandidate> {
+    if !normalize_candidate_gateway(&mut candidate.candidate) {
+        return None;
+    }
+    candidate.contact_hint.email = candidate
+        .contact_hint
+        .email
+        .clone()
+        .and_then(|value| normalize_email_candidate(Some(value)));
+    Some(candidate)
+}
+
+fn email_syntax_valid(email: &str) -> bool {
+    let trimmed = email.trim();
+    let Some((local, domain)) = trimmed.rsplit_once('@') else {
+        return false;
+    };
+    if local.is_empty() || domain.is_empty() || local.len() > 64 || domain.len() > 255 {
+        return false;
+    }
+    if local.starts_with('.') || local.ends_with('.') || local.contains("..") {
+        return false;
+    }
+    if domain.starts_with('.') || domain.ends_with('.') || domain.contains("..") {
+        return false;
+    }
+    let local_ok = local
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '%' | '+' | '-'));
+    let domain_ok = domain
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'));
+    local_ok && domain_ok && domain.contains('.')
+}
+
+fn classify_email(email: &str, _company_domain: &str) -> &'static str {
+    let e = email.trim().to_lowercase();
+    if !email_syntax_valid(&e) {
+        return "invalid";
+    }
+    let Some((local, domain)) = e.split_once('@') else {
+        return "invalid";
+    };
+    if is_consumer_email_domain(domain) {
+        return "consumer";
+    }
+    if email_is_generic_role_mailbox(&e) {
+        return "generic";
+    }
+    let role_prefixes = [
+        "sales",
+        "hr",
+        "support",
+        "billing",
+        "accounting",
+        "marketing",
+        "pr",
+        "legal",
+        "procurement",
+        "satin",
+        "satinalma",
+    ];
+    if role_prefixes.contains(&local) {
+        return "role";
+    }
+    "personal"
+}
+
+fn normalize_phone(raw: &str) -> Option<String> {
+    let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() < 10 {
+        return None;
+    }
+    if digits.starts_with("90") && digits.len() == 12 {
+        Some(format!("+{digits}"))
+    } else if digits.starts_with('0') && digits.len() == 11 {
+        Some(format!("+90{}", &digits[1..]))
+    } else if digits.len() == 10 {
+        Some(format!("+90{digits}"))
+    } else {
+        Some(format!("+{digits}"))
+    }
+}
+
+fn transliterate_turkish_ascii(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| match c {
+            'ı' | 'İ' => 'i',
+            'ş' | 'Ş' => 's',
+            'ç' | 'Ç' => 'c',
+            'ö' | 'Ö' => 'o',
+            'ü' | 'Ü' => 'u',
+            'ğ' | 'Ğ' => 'g',
+            _ => c.to_ascii_lowercase(),
+        })
+        .collect()
+}
+
+fn is_placeholder_name(name: &str) -> bool {
+    let normalized = transliterate_turkish_ascii(
+        &decode_basic_html_entities(name)
+            .replace(['\'', '’', '`'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
+    if normalized.trim().is_empty() {
+        return true;
+    }
+    let placeholders = [
+        "unknown",
+        "leadership",
+        "leadership team",
+        "management",
+        "management team",
+        "executive team",
+        "executive committee",
+        "board of directors",
+        "n/a",
+        "not available",
+        "undisclosed",
+        "baskanin mesaji",
+        "genel mudurun mesaji",
+        "hakkimizda",
+        "vizyonumuz",
+        "misyonumuz",
+        "iletisim",
+        "kariyer",
+        "basin",
+        "ust yonetim",
+        "yonetim ekibi",
+        "yonetim takimi",
+        "yonetim kurulu",
+        "icra kurulu",
+        "kurumsal",
+        "anasayfa",
+        "hakkinda",
+        "referanslar",
+        "projeler",
+        "haberler",
+        "duyurular",
+        "galeri",
+        "urunler",
+        "hizmetler",
+    ];
+    placeholders
+        .iter()
+        .any(|placeholder| normalized == *placeholder || normalized.contains(placeholder))
 }
 
 fn is_blocked_company_domain(domain: &str) -> bool {
@@ -3980,7 +7773,7 @@ fn collect_domain_candidates_from_search(
         let Some(result_domain) = extract_domain(&entry.url) else {
             continue;
         };
-        if is_blocked_company_domain(&result_domain) {
+        if !is_valid_company_domain(&result_domain) {
             continue;
         }
         let text = format!("{} {}", entry.title, entry.snippet);
@@ -4010,19 +7803,17 @@ fn collect_domain_candidates_from_search(
                         .evidence
                         .push(truncate_text_for_reason(&entry.snippet, 220));
                 }
-            } else if !entry.title.trim().is_empty() {
-                if candidate.evidence.len() < 4 {
-                    candidate
-                        .evidence
-                        .push(truncate_text_for_reason(&entry.title, 220));
-                }
+            } else if !entry.title.trim().is_empty() && candidate.evidence.len() < 4 {
+                candidate
+                    .evidence
+                    .push(truncate_text_for_reason(&entry.title, 220));
             }
             candidate.matched_keywords.extend(matched);
             candidate.matched_keywords = dedupe_strings(candidate.matched_keywords.clone());
         }
 
         for referenced_domain in referenced_domains {
-            if referenced_domain == result_domain || is_blocked_company_domain(&referenced_domain) {
+            if referenced_domain == result_domain || !is_valid_company_domain(&referenced_domain) {
                 continue;
             }
             let (score, matched) = score_search_entry(
@@ -4066,10 +7857,10 @@ fn collect_domain_candidates_from_search(
 fn dedupe_domain_candidates(items: Vec<DomainCandidate>) -> Vec<DomainCandidate> {
     let mut map = HashMap::<String, DomainCandidate>::new();
     for item in items {
-        let key = item.domain.to_lowercase();
+        let key = normalize_domain(&item.domain);
         let entry = map.entry(key).or_default();
         if entry.domain.is_empty() {
-            entry.domain = item.domain.clone();
+            entry.domain = normalize_domain(&item.domain);
         }
         entry.score = entry.score.max(item.score);
         entry.evidence.extend(item.evidence);
@@ -4079,8 +7870,13 @@ fn dedupe_domain_candidates(items: Vec<DomainCandidate>) -> Vec<DomainCandidate>
         entry.matched_keywords.extend(item.matched_keywords);
         entry.matched_keywords = dedupe_strings(entry.matched_keywords.clone());
         entry.source_links = merge_osint_links(entry.source_links.clone(), item.source_links);
+        if entry.phone.is_none() {
+            entry.phone = item.phone;
+        }
     }
-    map.into_values().collect()
+    map.into_values()
+        .filter_map(|mut item| normalize_candidate_gateway(&mut item).then_some(item))
+        .collect()
 }
 
 fn merge_free_discovery_candidate(
@@ -4091,7 +7887,7 @@ fn merge_free_discovery_candidate(
     let directory_score = free_candidate.candidate.score
         + free_discovery_priority_boost(&free_candidate.contact_hint);
     let domain = free_candidate.candidate.domain.clone();
-    if domain.is_empty() || is_blocked_company_domain(&domain) {
+    if domain.is_empty() || !is_valid_company_domain(&domain) {
         return;
     }
 
@@ -4112,6 +7908,9 @@ fn merge_free_discovery_candidate(
         entry.source_links.clone(),
         free_candidate.candidate.source_links,
     );
+    if entry.phone.is_none() {
+        entry.phone = free_candidate.candidate.phone;
+    }
 
     let hint = source_contact_hints.entry(domain).or_default();
     if hint.contact_name.is_none() {
@@ -4152,41 +7951,10 @@ fn contact_title_is_generic_default(title: Option<&str>) -> bool {
 }
 
 fn contact_name_is_placeholder(name: Option<&str>) -> bool {
-    let Some(name) = name else {
-        return false;
-    };
-    let normalized = decode_basic_html_entities(name)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .trim()
-        .to_lowercase();
-    if normalized.is_empty() {
-        return false;
+    match name {
+        None => true,
+        Some(value) => is_placeholder_name(value),
     }
-
-    let placeholder_terms = [
-        "unknown",
-        "leadership",
-        "leadership team",
-        "management",
-        "management team",
-        "executive team",
-        "executive committee",
-        "board of directors",
-        "ust yonetim",
-        "üst yönetim",
-        "yonetim ekibi",
-        "yönetim ekibi",
-        "yonetim takimi",
-        "yönetim takımı",
-        "yonetim kurulu",
-        "yönetim kurulu",
-        "icra kurulu",
-        "i̇cra kurulu",
-    ];
-
-    placeholder_terms.iter().any(|term| normalized == *term)
 }
 
 fn apply_source_contact_hint(
@@ -4395,7 +8163,7 @@ fn parse_tmb_member_candidates(
             .map(decode_basic_html_entities)
             .and_then(|value| normalize_turkish_source_person_name(value.trim()));
         let email =
-            normalize_contact_email_for_domain(extract_email_from_text(article_html), &domain);
+            normalize_directory_email_for_domain(extract_email_from_text(article_html), &domain);
 
         out.push(FreeDiscoveryCandidate {
             candidate: DomainCandidate {
@@ -4420,6 +8188,7 @@ fn parse_tmb_member_candidates(
                         "https://www.tmb.org.tr/en/members".to_string(),
                     ))
                     .collect(),
+                phone: None,
             },
             contact_hint: SourceContactHint {
                 contact_name: chairman_name,
@@ -4500,6 +8269,7 @@ fn parse_eud_member_candidates(
                     "power generation".to_string(),
                 ]),
                 source_links: vec!["https://www.eud.org.tr/en/members".to_string()],
+                phone: None,
             },
             contact_hint: SourceContactHint {
                 source: Some("EUD members page".to_string()),
@@ -4584,7 +8354,7 @@ fn parse_asmud_member_candidates(
         let email = email_re
             .captures(segment)
             .and_then(|value| value.get(1).map(|m| decode_basic_html_entities(m.as_str())))
-            .and_then(|value| normalize_site_contact_email(Some(value)));
+            .and_then(|value| normalize_directory_email_for_domain(Some(value), &domain));
 
         let mut matched_keywords = vec![
             profile.target_industry.clone(),
@@ -4638,6 +8408,7 @@ fn parse_asmud_member_candidates(
                 evidence: vec![evidence],
                 matched_keywords: dedupe_strings(matched_keywords),
                 source_links: vec!["https://www.asmud.org.tr/Uyeler.asp".to_string()],
+                phone: phone.as_deref().and_then(normalize_phone),
             },
             contact_hint: SourceContactHint {
                 email,
@@ -4787,6 +8558,7 @@ fn parse_platformder_directory_candidates(
                 evidence: vec![evidence],
                 matched_keywords: dedupe_strings(matched_keywords),
                 source_links: vec!["https://www.platformder.org.tr/rehber/".to_string()],
+                phone: phone.as_deref().and_then(normalize_phone),
             },
             contact_hint: SourceContactHint {
                 source: Some("Platformder rehber".to_string()),
@@ -4956,7 +8728,7 @@ fn parse_mib_member_candidates(
         let email = email_re
             .captures(&block_html)
             .and_then(|value| value.get(1).map(|m| m.as_str().trim().to_string()))
-            .and_then(|value| normalize_contact_email_for_domain(Some(value), &domain));
+            .and_then(|value| normalize_directory_email_for_domain(Some(value), &domain));
 
         let mut matched_keywords = vec![
             profile.target_industry.clone(),
@@ -4992,6 +8764,7 @@ fn parse_mib_member_candidates(
                 )],
                 matched_keywords: dedupe_strings(matched_keywords),
                 source_links: detail_url.into_iter().collect(),
+                phone: None,
             },
             contact_hint: SourceContactHint {
                 email,
@@ -5209,7 +8982,7 @@ fn parse_imder_member_detail_candidate(
                         .chars()
                         .all(|c| c.is_alphabetic() || matches!(c, '.' | '\'' | '-'))
                 });
-                if token_count >= 2 && token_count <= 4 && alpha_only {
+                if (2..=4).contains(&token_count) && alpha_only {
                     Some(rewritten)
                 } else {
                     None
@@ -5218,7 +8991,7 @@ fn parse_imder_member_detail_candidate(
         })
         .or_else(|| raw_name.as_deref().and_then(normalize_person_name));
     let contact_title = raw_title.as_deref().map(normalize_contact_title);
-    let email = normalize_contact_email_for_domain(extract_email_from_text(html), &domain);
+    let email = normalize_directory_email_for_domain(extract_email_from_text(html), &domain);
 
     let mut matched_keywords = vec![
         profile.target_industry.clone(),
@@ -5286,6 +9059,7 @@ fn parse_imder_member_detail_candidate(
             ],
             matched_keywords: dedupe_strings(matched_keywords),
             source_links: vec![detail_url.to_string()],
+            phone: phone.as_deref().and_then(normalize_phone),
         },
         contact_hint: SourceContactHint {
             contact_name,
@@ -5486,7 +9260,7 @@ fn parse_isder_member_detail_candidate(
             None
         }
     });
-    let email = normalize_contact_email_for_domain(extract_email_from_text(html), &domain);
+    let email = normalize_directory_email_for_domain(extract_email_from_text(html), &domain);
 
     let source_text = format!(
         "{company} {}",
@@ -5547,6 +9321,7 @@ fn parse_isder_member_detail_candidate(
             ],
             matched_keywords: dedupe_strings(matched_keywords),
             source_links: vec![detail_url.to_string()],
+            phone: phone.as_deref().and_then(normalize_phone),
         },
         contact_hint: SourceContactHint {
             contact_name,
@@ -5643,7 +9418,7 @@ fn parse_thbb_yazismali_candidates(
             })
             .unwrap_or_else(|| domain.clone());
 
-        let email = normalize_contact_email_for_domain(extract_email_from_text(td_html), &domain);
+        let email = normalize_directory_email_for_domain(extract_email_from_text(td_html), &domain);
         let mut matched_keywords = vec![
             profile.target_industry.clone(),
             "construction equipment".to_string(),
@@ -5694,6 +9469,7 @@ fn parse_thbb_yazismali_candidates(
                 evidence: vec![evidence],
                 matched_keywords: dedupe_strings(matched_keywords),
                 source_links: vec!["https://www.thbb.org/uyelerimiz/yazismali-uyeler/".to_string()],
+                phone: phone.as_deref().and_then(normalize_phone),
             },
             contact_hint: SourceContactHint {
                 email,
@@ -5723,7 +9499,12 @@ fn interleave_free_discovery_sources(
         let mut advanced = false;
         for (idx, source) in sources.iter().enumerate() {
             while positions[idx] < source.len() {
-                let candidate = source[positions[idx]].clone();
+                let Some(candidate) =
+                    normalize_free_candidate_gateway(source[positions[idx]].clone())
+                else {
+                    positions[idx] += 1;
+                    continue;
+                };
                 positions[idx] += 1;
                 let domain_key = candidate.candidate.domain.to_lowercase();
                 if !seen.insert(domain_key) {
@@ -5742,6 +9523,44 @@ fn interleave_free_discovery_sources(
         }
     }
 
+    out
+}
+
+fn source_health_key(source: &str) -> &'static str {
+    match source {
+        "TMB members directory" => "directory_tmb",
+        "EUD members page" => "directory_eud",
+        "ASMUD members page" => "directory_asmud",
+        "Platformder rehber" => "directory_platformder",
+        "MIB members page" => "directory_mib",
+        "IMDER member detail" => "directory_imder",
+        "ISDER member detail" => "directory_isder",
+        "THBB yazismali uyeler" => "directory_thbb",
+        _ => "directory_unknown",
+    }
+}
+
+fn expected_source_counts_for_profile(profile: &SalesProfile) -> HashMap<String, usize> {
+    let mut out = HashMap::new();
+    if !geo_is_turkey(&profile.target_geo) {
+        return out;
+    }
+    if profile_targets_field_ops(profile) {
+        for key in [
+            "directory_tmb",
+            "directory_asmud",
+            "directory_platformder",
+            "directory_mib",
+            "directory_imder",
+            "directory_isder",
+            "directory_thbb",
+        ] {
+            out.insert(key.to_string(), 0);
+        }
+    }
+    if profile_targets_energy(profile) {
+        out.insert("directory_eud".to_string(), 0);
+    }
     out
 }
 
@@ -7031,7 +10850,7 @@ fn decode_html_email_entities(text: &str) -> String {
 }
 
 fn decode_cloudflare_email(encoded: &str) -> Option<String> {
-    if encoded.len() < 4 || encoded.len() % 2 != 0 {
+    if encoded.len() < 4 || !encoded.len().is_multiple_of(2) {
         return None;
     }
     let key = u8::from_str_radix(&encoded[0..2], 16).ok()?;
@@ -7052,10 +10871,9 @@ fn normalize_email_candidate(email: Option<String>) -> Option<String> {
             .trim_start_matches("mailto:")
             .trim_matches(|c: char| c == '"' || c == '\'' || c == ')' || c == '(')
             .to_lowercase();
-        let Some((local, domain)) = trimmed.rsplit_once('@').map(|(l, d)| (l.trim(), d.trim()))
-        else {
-            return None;
-        };
+        let (local, domain) = trimmed
+            .rsplit_once('@')
+            .map(|(l, d)| (l.trim(), d.trim()))?;
         let blocked_tlds = [
             "png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "css", "js", "json", "xml", "pdf",
             "zip", "rar", "7z", "mp4", "webm", "mov",
@@ -7154,9 +10972,10 @@ fn sanitize_approval_payload(
                 "to": to,
                 "subject": subject,
                 "body": body,
+                "classification": classify_email(&to, email_domain(&to).as_deref().unwrap_or_default()),
             }))
         }
-        "linkedin" => {
+        "linkedin" | "linkedin_assist" => {
             let profile_url = payload
                 .get("profile_url")
                 .and_then(|value| value.as_str())
@@ -7171,6 +10990,7 @@ fn sanitize_approval_payload(
             Some(serde_json::json!({
                 "profile_url": profile_url,
                 "message": message,
+                "manual_action": true,
             }))
         }
         _ => Some(payload),
@@ -7337,6 +11157,18 @@ fn normalize_contact_email_for_domain(
     })
 }
 
+fn normalize_directory_email_for_domain(
+    email: Option<String>,
+    company_domain: &str,
+) -> Option<String> {
+    normalize_email_candidate(email).and_then(|trimmed| {
+        if !email_matches_company_domain(&trimmed, company_domain) {
+            return None;
+        }
+        Some(trimmed)
+    })
+}
+
 fn normalize_site_contact_email(email: Option<String>) -> Option<String> {
     normalize_email_candidate(email).filter(|trimmed| email_is_actionable_outreach_email(trimmed))
 }
@@ -7347,6 +11179,759 @@ fn normalize_outreach_linkedin_url(raw: &str) -> Option<String> {
 
 fn normalize_company_linkedin_url(raw: &str) -> Option<String> {
     extract_company_linkedin_from_text(raw)
+}
+
+fn sales_base_url(_kernel: &openfang_kernel::OpenFangKernel) -> String {
+    std::env::var("OPENFANG_PUBLIC_BASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_SALES_BASE_URL.to_string())
+}
+
+fn generate_unsubscribe_token(recipient: &str, sender_email: &str) -> String {
+    use sha2::Digest;
+
+    let recipient = recipient.trim().to_lowercase();
+    let sender_email = sender_email.trim().to_lowercase();
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(SALES_UNSUBSCRIBE_SALT.as_bytes());
+    hasher.update(b":");
+    hasher.update(sender_email.as_bytes());
+    hasher.update(b":");
+    hasher.update(recipient.as_bytes());
+    let signature = format!("{:x}", hasher.finalize());
+    URL_SAFE_NO_PAD.encode(format!("{recipient}|{sender_email}|{signature}"))
+}
+
+fn verify_unsubscribe_token(token: &str) -> Option<String> {
+    let decoded = URL_SAFE_NO_PAD.decode(token.trim()).ok()?;
+    let payload = String::from_utf8(decoded).ok()?;
+    let mut parts = payload.split('|');
+    let recipient = parts.next()?.trim().to_lowercase();
+    let sender_email = parts.next()?.trim().to_lowercase();
+    let _signature = parts.next()?.trim().to_string();
+    if parts.next().is_some() || recipient.is_empty() || sender_email.is_empty() {
+        return None;
+    }
+    let expected = generate_unsubscribe_token(&recipient, &sender_email);
+    let normalized_expected = URL_SAFE_NO_PAD.decode(expected).ok()?;
+    let normalized_payload = URL_SAFE_NO_PAD.decode(token.trim()).ok()?;
+    if subtle::ConstantTimeEq::ct_eq(
+        normalized_expected.as_slice(),
+        normalized_payload.as_slice(),
+    )
+    .into()
+    {
+        Some(recipient)
+    } else {
+        None
+    }
+}
+
+fn is_valid_sending_subdomain(sender_domain: &str, brand_domain: &str) -> bool {
+    let sender = sender_domain.trim().to_lowercase();
+    let brand = brand_domain.trim().to_lowercase();
+    !sender.is_empty()
+        && !brand.is_empty()
+        && sender != brand
+        && sender.ends_with(&format!(".{brand}"))
+}
+
+async fn check_mx_record(domain: &str) -> bool {
+    match hickory_resolver::TokioAsyncResolver::tokio_from_system_conf() {
+        Ok(resolver) => resolver.mx_lookup(domain).await.is_ok(),
+        Err(_) => true,
+    }
+}
+
+async fn assess_domain_health(domain: &str) -> f64 {
+    let mut score: f64 = 0.45;
+    if domain.ends_with(".com") || domain.ends_with(".net") || domain.ends_with(".org") {
+        score += 0.1;
+    }
+    if domain.ends_with(".tr") || domain.ends_with(".com.tr") {
+        score += 0.15;
+    }
+    if !is_consumer_email_domain(domain) {
+        score += 0.1;
+    }
+    score.clamp(0.0, 1.0)
+}
+
+async fn validate_email_for_sending(
+    email: &str,
+    suppressed: bool,
+    bounce_count: i64,
+) -> Result<EmailValidation, String> {
+    let mut result = EmailValidation {
+        email: email.to_string(),
+        syntax_valid: false,
+        mx_valid: false,
+        domain_health: 0.0,
+        suppressed: false,
+        classification: "unknown".to_string(),
+        safe_to_send: false,
+    };
+
+    result.syntax_valid = email_syntax_valid(email);
+    if !result.syntax_valid {
+        return Ok(result);
+    }
+
+    result.suppressed = suppressed;
+    if result.suppressed {
+        result.classification = classify_email(email, "").to_string();
+        return Ok(result);
+    }
+
+    let domain = email_domain(email).unwrap_or_default();
+    result.mx_valid = check_mx_record(&domain).await;
+    result.domain_health = assess_domain_health(&domain).await;
+    result.classification = classify_email(email, &domain).to_string();
+
+    result.safe_to_send = result.syntax_valid
+        && result.mx_valid
+        && !result.suppressed
+        && result.domain_health > 0.3
+        && bounce_count < 3
+        && result.classification == "personal";
+
+    Ok(result)
+}
+
+fn stable_sales_id(prefix: &str, parts: &[&str]) -> String {
+    use sha2::Digest;
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(prefix.as_bytes());
+    for part in parts {
+        hasher.update(b"|");
+        hasher.update(part.trim().to_lowercase().as_bytes());
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    format!("{prefix}_{}", &digest[..24])
+}
+
+fn source_confidence(source: &str) -> f64 {
+    match source {
+        "directory_listing" => 0.9,
+        "site_html" => 0.8,
+        "web_search" => 0.6,
+        "llm_generation" => 0.4,
+        "llm_enrichment" => 0.5,
+        _ => 0.3,
+    }
+}
+
+fn seniority_from_title(title: Option<&str>) -> String {
+    let title = title.unwrap_or_default().to_lowercase();
+    if title.contains("chief")
+        || title.contains("ceo")
+        || title.contains("coo")
+        || title.contains("founder")
+        || title.contains("genel müdür")
+        || title.contains("genel mudur")
+    {
+        "c_level".to_string()
+    } else if title.contains("vp") || title.contains("vice president") {
+        "vp".to_string()
+    } else if title.contains("director") || title.contains("direktör") || title.contains("direktor")
+    {
+        "director".to_string()
+    } else if title.contains("manager") || title.contains("müdür") || title.contains("mudur") {
+        "manager".to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn classify_reply_content(text: &str) -> &'static str {
+    let lower = text.to_lowercase();
+    if lower.contains("toplanti") || lower.contains("meeting") || lower.contains("goruselim") {
+        "meeting_booked"
+    } else if lower.contains("ilginc")
+        || lower.contains("interested")
+        || lower.contains("merak")
+    {
+        "interested"
+    } else if lower.contains("simdi degil")
+        || lower.contains("not now")
+        || lower.contains("sonra")
+    {
+        "not_now"
+    } else if lower.contains("yanlis")
+        || lower.contains("wrong")
+        || lower.contains("hatali")
+    {
+        "wrong_person"
+    } else if lower.contains("cikar")
+        || lower.contains("unsubscribe")
+        || lower.contains("gonderme")
+    {
+        "unsubscribe"
+    } else {
+        "interested"
+    }
+}
+
+fn classify_outcome(raw_event: &str, event_type: &str, touch_id: &str) -> OutcomeRecord {
+    let outcome_type = match event_type {
+        "bounce_hard" => "hard_bounce",
+        "bounce_soft" => "soft_bounce",
+        "open" => "open",
+        "click" => "click",
+        "reply" => classify_reply_content(raw_event),
+        "unsubscribe" => "unsubscribe",
+        _ => "no_reply",
+    };
+
+    OutcomeRecord {
+        touch_id: touch_id.to_string(),
+        outcome_type: outcome_type.to_string(),
+        raw_text: raw_event.to_string(),
+        classifier_confidence: 1.0,
+    }
+}
+
+fn classify_signal_horizon(signal_type: &str, text: &str) -> (&'static str, Option<String>) {
+    let (horizon, days) = match signal_type {
+        "tender" | "crisis" | "urgent_hire" => ("immediate", 21),
+        "new_department" | "digitalization" | "new_location" => ("campaign_window", 90),
+        "erp_migration" | "merger" | "regulation_pressure" => ("structural", 365),
+        "job_posting" => {
+            if text.to_lowercase().contains("acil") || text.to_lowercase().contains("urgent") {
+                ("immediate", 21)
+            } else {
+                ("campaign_window", 60)
+            }
+        }
+        "directory_membership" => ("structural", 365),
+        _ => ("campaign_window", 90),
+    };
+
+    let expires = Utc::now()
+        .checked_add_signed(chrono::Duration::days(days))
+        .map(|value| value.to_rfc3339());
+    (horizon, expires)
+}
+
+fn generate_signal_rationale(signal_type: &str, text: &str) -> String {
+    match signal_type {
+        "job_posting" => format!("Hiring activity suggests active change capacity: {text}"),
+        "directory_membership" => format!("Verified sector presence supports ICP fit: {text}"),
+        "tech_stack" => format!("Observed stack may create switching or integration pain: {text}"),
+        _ => format!("Public signal may indicate operational relevance: {text}"),
+    }
+}
+
+fn infer_signal_type(text: &str) -> &'static str {
+    let lower = text.to_lowercase();
+    if lower.contains("ihale") || lower.contains("tender") {
+        "tender"
+    } else if lower.contains("acil") || lower.contains("urgent") {
+        "urgent_hire"
+    } else if lower.contains("kariyer")
+        || lower.contains("career")
+        || lower.contains("is ilani")
+        || lower.contains("job")
+        || lower.contains("hiring")
+    {
+        "job_posting"
+    } else if lower.contains("erp") || lower.contains("sap") || lower.contains("netsis") {
+        "erp_migration"
+    } else if lower.contains("dijital") || lower.contains("digital") {
+        "digitalization"
+    } else if lower.contains("tesis") || lower.contains("facility") || lower.contains("lokasyon") {
+        "new_location"
+    } else if lower.contains("uye") || lower.contains("member") || lower.contains("odasi") {
+        "directory_membership"
+    } else {
+        "site_content"
+    }
+}
+
+fn candidate_primary_source_type(
+    candidate: &DomainCandidate,
+    company_linkedin_url: Option<&str>,
+) -> &'static str {
+    if candidate.phone.is_some() {
+        "directory_listing"
+    } else if company_linkedin_url.is_some() {
+        "web_search"
+    } else {
+        "site_html"
+    }
+}
+
+fn canonical_contact_key(
+    domain: &str,
+    contact_name: Option<&str>,
+    email: Option<&str>,
+    linkedin_url: Option<&str>,
+) -> String {
+    if let Some(email) = email.and_then(|value| normalize_email_candidate(Some(value.to_string()))) {
+        return email;
+    }
+    if let Some(linkedin) = linkedin_url.and_then(normalize_outreach_linkedin_url) {
+        return linkedin;
+    }
+    if let Some(name) = contact_name.and_then(normalize_person_name) {
+        return name.to_lowercase();
+    }
+    format!("{domain}-primary")
+}
+
+fn infer_buyer_role(title: &str) -> &'static str {
+    let lower = title.to_lowercase();
+    if lower.contains("founder") {
+        "founder"
+    } else if lower.contains("ceo") || lower.contains("chief executive") {
+        "ceo"
+    } else if lower.contains("coo") || lower.contains("operations") {
+        "operations"
+    } else if lower.contains("sales") {
+        "revenue"
+    } else {
+        "buyer_committee"
+    }
+}
+
+fn parse_json_string_list(raw: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()
+}
+
+fn rules_match(value: &str, rules: &[String]) -> bool {
+    let lower = value.trim().to_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    rules.iter().any(|rule| {
+        let rule = rule.trim().to_lowercase();
+        !rule.is_empty() && (lower.contains(&rule) || rule.contains(&lower))
+    })
+}
+
+fn compute_fit_score(account_id: &str, db: &Connection) -> Result<f64, String> {
+    let (sector, geo, employee_estimate) = db
+        .query_row(
+            "SELECT COALESCE(sector, ''), COALESCE(geo, ''), employee_estimate
+             FROM accounts WHERE id = ?1",
+            params![account_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        )
+        .map_err(|e| format!("Failed to load account fit state: {e}"))?;
+    let (sector_rules, geo_rules) = db
+        .query_row(
+            "SELECT COALESCE(sector_rules, '[]'), COALESCE(geo_rules, '[]')
+             FROM icp_definitions
+             ORDER BY created_at DESC
+             LIMIT 1",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(|e| format!("Failed to load ICP rules: {e}"))?
+        .unwrap_or_else(|| ("[]".to_string(), "[]".to_string()));
+    let sector_match: f64 = if rules_match(&sector, &parse_json_string_list(&sector_rules)) {
+        1.0
+    } else if !sector.trim().is_empty() {
+        0.45
+    } else {
+        0.0
+    };
+    let geo_match: f64 = if rules_match(&geo, &parse_json_string_list(&geo_rules)) {
+        1.0
+    } else if !geo.trim().is_empty() {
+        0.4
+    } else {
+        0.0
+    };
+    let size_match: f64 = if employee_estimate.unwrap_or_default() > 0 {
+        1.0
+    } else {
+        0.4
+    };
+    let site_content_count = db
+        .query_row(
+            "SELECT COUNT(*) FROM signals WHERE account_id = ?1",
+            params![account_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+    let site_content_match: f64 = if site_content_count > 0 { 1.0 } else { 0.35 };
+    let directory_membership = db
+        .query_row(
+            "SELECT COUNT(*) FROM signals
+             WHERE account_id = ?1 AND signal_type = 'directory_membership'",
+            params![account_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+    let directory_score: f64 = if directory_membership > 0 { 1.0 } else { 0.25 };
+    Ok(
+        (sector_match * 0.3
+            + size_match * 0.2
+            + geo_match * 0.2
+            + site_content_match * 0.15
+            + directory_score * 0.15)
+            .clamp(0.0, 1.0),
+    )
+}
+
+fn compute_intent_score(account_id: &str, db: &Connection) -> Result<f64, String> {
+    let mut stmt = db
+        .prepare(
+            "SELECT signal_type, COALESCE(text, ''), COALESCE(effect_horizon, '')
+             FROM signals
+             WHERE account_id = ?1",
+        )
+        .map_err(|e| format!("Failed to prepare intent query: {e}"))?;
+    let mut rows = stmt
+        .query(params![account_id])
+        .map_err(|e| format!("Failed to query intent signals: {e}"))?;
+    let mut score: f64 = 0.0;
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| format!("Failed to read intent signals: {e}"))?
+    {
+        let signal_type = row.get::<_, String>(0).unwrap_or_default();
+        let text = row.get::<_, String>(1).unwrap_or_default();
+        let horizon = row.get::<_, String>(2).unwrap_or_default();
+        let weight = match signal_type.as_str() {
+            "tender" | "urgent_hire" => 0.3,
+            "job_posting" | "new_location" | "digitalization" => 0.2,
+            "erp_migration" | "directory_membership" => 0.15,
+            _ => 0.1,
+        };
+        let horizon_boost = match horizon.as_str() {
+            "immediate" => 1.0,
+            "campaign_window" => 0.75,
+            "structural" => 0.45,
+            _ => 0.3,
+        };
+        let text_boost = if text.to_lowercase().contains("acil")
+            || text.to_lowercase().contains("urgent")
+            || text.to_lowercase().contains("launch")
+        {
+            1.0
+        } else {
+            0.75
+        };
+        score += weight * horizon_boost * text_boost;
+    }
+    Ok(score.clamp(0.0, 1.0))
+}
+
+fn compute_reachability_score(account_id: &str, db: &Connection) -> Result<f64, String> {
+    let mut stmt = db
+        .prepare(
+            "SELECT cm.channel_type, COALESCE(cm.classification, ''), COALESCE(c.full_name, ''),
+                    COALESCE(c.title, ''), c.title_confidence
+             FROM contacts c
+             LEFT JOIN contact_methods cm ON cm.contact_id = c.id
+             WHERE c.account_id = ?1",
+        )
+        .map_err(|e| format!("Failed to prepare reachability query: {e}"))?;
+    let mut rows = stmt
+        .query(params![account_id])
+        .map_err(|e| format!("Failed to query reachability state: {e}"))?;
+    let mut has_personal_email = false;
+    let mut has_linkedin = false;
+    let mut has_phone = false;
+    let mut has_real_name = false;
+    let mut has_verified_title = false;
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| format!("Failed to read reachability state: {e}"))?
+    {
+        let channel = row.get::<_, Option<String>>(0).unwrap_or_default().unwrap_or_default();
+        let classification = row.get::<_, Option<String>>(1).unwrap_or_default().unwrap_or_default();
+        let full_name = row.get::<_, Option<String>>(2).unwrap_or_default().unwrap_or_default();
+        let title = row.get::<_, Option<String>>(3).unwrap_or_default().unwrap_or_default();
+        let title_confidence = row.get::<_, Option<f64>>(4).unwrap_or_default().unwrap_or(0.0);
+        if channel == "email" && classification == "personal" {
+            has_personal_email = true;
+        }
+        if channel == "linkedin" {
+            has_linkedin = true;
+        }
+        if channel == "phone" {
+            has_phone = true;
+        }
+        if !contact_name_is_placeholder(Some(full_name.as_str())) {
+            has_real_name = true;
+        }
+        if !contact_title_is_generic_default(Some(title.as_str())) && title_confidence >= 0.6 {
+            has_verified_title = true;
+        }
+    }
+    let reach: f64 = (if has_personal_email { 0.35 } else { 0.0 })
+        + (if has_linkedin { 0.25 } else { 0.0 })
+        + (if has_phone { 0.2 } else { 0.0 })
+        + (if has_real_name { 0.1 } else { 0.0 })
+        + (if has_verified_title { 0.1 } else { 0.0 });
+    Ok(reach.clamp(0.0, 1.0))
+}
+
+fn compute_deliverability_risk(account_id: &str, db: &Connection) -> Result<f64, String> {
+    let hard_bounces = db
+        .query_row(
+            "SELECT COUNT(*)
+             FROM outcomes o
+             JOIN touches t ON t.id = o.touch_id
+             JOIN sequence_instances si ON si.id = t.sequence_instance_id
+             WHERE si.account_id = ?1 AND o.outcome_type = 'hard_bounce'",
+            params![account_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+    let domain_risk = db
+        .query_row(
+            "SELECT MAX(CASE WHEN COALESCE(mx_valid, 0) = 1 THEN 0.1 ELSE 0.45 END)
+             FROM domains WHERE account_id = ?1",
+            params![account_id],
+            |row| row.get::<_, Option<f64>>(0),
+        )
+        .unwrap_or(Some(0.45))
+        .unwrap_or(0.45);
+    let generic_email = db
+        .query_row(
+            "SELECT COUNT(*)
+             FROM contacts c
+             JOIN contact_methods cm ON cm.contact_id = c.id
+             WHERE c.account_id = ?1 AND cm.channel_type = 'email' AND COALESCE(cm.classification, '') != 'personal'",
+            params![account_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+    let sender_risk = db
+        .query_row(
+            "SELECT COALESCE(warm_state, 'cold') FROM sender_policies ORDER BY rowid DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| format!("Failed to load sender policy: {e}"))?
+        .map(|state| if state == "ready" { 0.05 } else { 0.15 })
+        .unwrap_or(0.15);
+    let risk: f64 = (hard_bounces as f64 * 0.15).min(0.3)
+        + domain_risk.min(0.3)
+        + if generic_email > 0 { 0.2 } else { 0.0 }
+        + sender_risk;
+    Ok(risk.clamp(0.0, 1.0))
+}
+
+fn compute_compliance_risk(account_id: &str, db: &Connection) -> Result<f64, String> {
+    let suppressed = db
+        .query_row(
+            "SELECT COUNT(*)
+             FROM contacts c
+             JOIN contact_methods cm ON cm.contact_id = c.id
+             WHERE c.account_id = ?1 AND COALESCE(cm.suppressed, 0) = 1",
+            params![account_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+    let opt_outs = db
+        .query_row(
+            "SELECT COUNT(*)
+             FROM outcomes o
+             JOIN touches t ON t.id = o.touch_id
+             JOIN sequence_instances si ON si.id = t.sequence_instance_id
+             WHERE si.account_id = ?1 AND o.outcome_type = 'unsubscribe'",
+            params![account_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+    let (geo, generic_email_only) = db
+        .query_row(
+            "SELECT COALESCE(a.geo, ''),
+                    CASE WHEN EXISTS(
+                        SELECT 1
+                        FROM contacts c
+                        JOIN contact_methods cm ON cm.contact_id = c.id
+                        WHERE c.account_id = a.id
+                          AND cm.channel_type = 'email'
+                          AND COALESCE(cm.classification, '') != 'personal'
+                    ) THEN 1 ELSE 0 END
+             FROM accounts a
+             WHERE a.id = ?1",
+            params![account_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map_err(|e| format!("Failed to load compliance state: {e}"))?;
+    let kvkk_risk = if geo_is_turkey(&geo) && generic_email_only == 1 {
+        0.3
+    } else if geo_is_turkey(&geo) {
+        0.15
+    } else {
+        0.05
+    };
+    let risk: f64 = (if suppressed > 0 { 0.4 } else { 0.0 })
+        + (if opt_outs > 0 { 0.3 } else { 0.0 })
+        + kvkk_risk;
+    Ok(risk.clamp(0.0, 1.0))
+}
+
+fn save_score_snapshot(
+    db: &Connection,
+    account_id: &str,
+    score: &FiveAxisScore,
+) -> Result<(), String> {
+    db.execute(
+        "INSERT INTO score_snapshots
+         (id, account_id, fit_score, intent_score, reachability_score, deliverability_risk, compliance_risk,
+          activation_priority, computed_at, scoring_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'v1')
+         ON CONFLICT(id) DO UPDATE SET
+            fit_score = excluded.fit_score,
+            intent_score = excluded.intent_score,
+            reachability_score = excluded.reachability_score,
+            deliverability_risk = excluded.deliverability_risk,
+            compliance_risk = excluded.compliance_risk,
+            activation_priority = excluded.activation_priority,
+            computed_at = excluded.computed_at",
+        params![
+            stable_sales_id("score_snapshot", &[account_id]),
+            account_id,
+            score.fit_score,
+            score.intent_score,
+            score.reachability_score,
+            score.deliverability_risk,
+            score.compliance_risk,
+            activation_priority(score),
+            Utc::now().to_rfc3339(),
+        ],
+    )
+    .map_err(|e| format!("Failed to save score snapshot: {e}"))?;
+    Ok(())
+}
+
+fn compute_five_axis_score(account_id: &str, db: &Connection) -> Result<FiveAxisScore, String> {
+    let score = FiveAxisScore {
+        fit_score: compute_fit_score(account_id, db)?,
+        intent_score: compute_intent_score(account_id, db)?,
+        reachability_score: compute_reachability_score(account_id, db)?,
+        deliverability_risk: compute_deliverability_risk(account_id, db)?,
+        compliance_risk: compute_compliance_risk(account_id, db)?,
+    };
+    save_score_snapshot(db, account_id, &score)?;
+    Ok(score)
+}
+
+fn activation_priority(score: &FiveAxisScore) -> f64 {
+    ((score.fit_score * 0.35)
+        + (score.intent_score * 0.25)
+        + (score.reachability_score * 0.25)
+        + ((1.0 - score.deliverability_risk) * 0.1)
+        + ((1.0 - score.compliance_risk) * 0.05))
+        .clamp(0.0, 1.0)
+}
+
+fn thesis_confidence(score: &FiveAxisScore) -> f64 {
+    ((score.fit_score + score.intent_score + score.reachability_score
+        + (1.0 - score.deliverability_risk)
+        + (1.0 - score.compliance_risk))
+        / 5.0)
+        .clamp(0.0, 1.0)
+}
+
+fn recommended_activation_channel(
+    db: &Connection,
+    account_id: &str,
+    contact_id: &str,
+) -> Option<String> {
+    let mut stmt = db
+        .prepare(
+            "SELECT channel_type, COALESCE(classification, '')
+             FROM contact_methods
+             WHERE contact_id = ?1
+             ORDER BY confidence DESC",
+        )
+        .ok()?;
+    let methods = stmt
+        .query_map(params![contact_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+            ))
+        })
+        .ok()?
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    let has_personal_email = methods
+        .iter()
+        .any(|(channel, classification)| channel == "email" && classification == "personal");
+    let has_phone = methods.iter().any(|(channel, _)| channel == "phone");
+    let has_linkedin = methods.iter().any(|(channel, _)| channel == "linkedin");
+    if has_personal_email {
+        Some("email".to_string())
+    } else if has_phone {
+        Some("phone_task".to_string())
+    } else if has_linkedin {
+        Some("linkedin_assist".to_string())
+    } else {
+        let account_has_any_method = db
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM contacts c
+                 JOIN contact_methods cm ON cm.contact_id = c.id
+                 WHERE c.account_id = ?1",
+                params![account_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0);
+        if account_has_any_method > 0 {
+            Some("research".to_string())
+        } else {
+            None
+        }
+    }
+}
+
+fn send_gate(score: &FiveAxisScore) -> SendGateDecision {
+    if score.deliverability_risk > 0.7 {
+        return SendGateDecision::Block {
+            reason: "Deliverability risk too high".to_string(),
+        };
+    }
+    if score.compliance_risk > 0.5 {
+        return SendGateDecision::Block {
+            reason: "Compliance risk too high".to_string(),
+        };
+    }
+    if score.reachability_score < 0.3 {
+        return SendGateDecision::Research {
+            missing: vec!["Need personal email or LinkedIn profile".to_string()],
+        };
+    }
+    if score.intent_score < 0.2 {
+        return SendGateDecision::Nurture {
+            reason: "No active intent signals detected".to_string(),
+        };
+    }
+    if score.fit_score > 0.5 && score.reachability_score > 0.4 {
+        return SendGateDecision::Activate;
+    }
+    SendGateDecision::Research {
+        missing: vec!["Need more data to make decision".to_string()],
+    }
+}
+
+fn assign_tier(score: &FiveAxisScore) -> &'static str {
+    if score.fit_score > 0.8 && score.intent_score > 0.5 {
+        "a_tier"
+    } else if score.fit_score > 0.5 {
+        "standard"
+    } else {
+        "basic"
+    }
 }
 
 fn decode_percent_utf8_lossy(raw: &str) -> String {
@@ -7388,7 +11973,9 @@ fn canonicalize_osint_url(raw: &str) -> Option<String> {
     let host = parsed.host_str()?.trim_end_matches('.').to_lowercase();
     parsed.set_host(Some(&host)).ok()?;
 
-    let decoded_path = decode_percent_utf8_lossy(parsed.path());
+    let original_path = parsed.path().to_string();
+    let had_trailing_slash = original_path.len() > 1 && original_path.ends_with('/');
+    let decoded_path = decode_percent_utf8_lossy(&original_path);
     let mut normalized_path = if decoded_path.trim().is_empty() {
         "/".to_string()
     } else if decoded_path.starts_with('/') {
@@ -7401,6 +11988,9 @@ fn canonicalize_osint_url(raw: &str) -> Option<String> {
     }
     if normalized_path.len() > 1 {
         normalized_path = normalized_path.trim_end_matches('/').to_string();
+        if had_trailing_slash {
+            normalized_path.push('/');
+        }
     }
     parsed.set_path(&normalized_path);
 
@@ -7656,7 +12246,7 @@ fn extract_personal_linkedin_from_text(text: &str) -> Option<String> {
         .replace("\\u002F", "/")
         .replace("\\u002f", "/");
     for source in [text, decoded.as_str()] {
-        for m in re.find_iter(source) {
+        if let Some(m) = re.find_iter(source).next() {
             let url = m
                 .as_str()
                 .trim_matches(|c: char| c == '"' || c == '\'' || c == ')' || c == ',' || c == '.')
@@ -8504,16 +13094,18 @@ fn extract_contact_from_meta_tags(
     (Some(name), inferred_title)
 }
 
+type SiteHtmlContactExtraction = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 fn extract_contact_from_company_site_html(
     html: &str,
     title_policy: &str,
-) -> (
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-) {
+) -> SiteHtmlContactExtraction {
     let plain = strip_html_tags(html);
     let structured = html_to_structured_text(html);
     let canonical_plain = canonicalize_contact_titles(&plain);
@@ -8737,7 +13329,7 @@ struct SalesProfileDraft {
     timezone_mode: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct LeadQueryPlanDraft {
     #[serde(default)]
     discovery_queries: Vec<String>,
@@ -9143,7 +13735,7 @@ fn merge_profile(base: SalesProfile, draft: SalesProfileDraft, brief: &str) -> S
     if let Some(v) = cleaned_opt(draft.target_geo) {
         p.target_geo = v;
     } else if p.target_geo.trim().is_empty() {
-        p.target_geo = detect_geo(brief).unwrap_or_else(|| "US".to_string());
+        p.target_geo = detect_geo(brief).unwrap_or_default();
     }
     if let Some(v) = cleaned_opt(draft.sender_name) {
         p.sender_name = v;
@@ -9219,7 +13811,7 @@ fn heuristic_profile_from_brief(base: SalesProfile, brief: &str) -> SalesProfile
         product_name,
         product_description: Some(description),
         target_industry: detect_industry(brief),
-        target_geo: detect_geo(brief).or_else(|| Some("US".to_string())),
+        target_geo: detect_geo(brief),
         sender_name,
         sender_email: email,
         sender_linkedin: linkedin,
@@ -9434,6 +14026,7 @@ fn site_contact_identity_signal(
     site_contact_candidate_signal(name, title, linkedin_url, None, None)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_site_contact_enrichment(
     domain: &str,
     enrichment: &SiteContactEnrichment,
@@ -9986,7 +14579,10 @@ async fn discover_via_web_search(
         entry.score = entry.score.max(1);
     }
 
-    let mut candidate_list: Vec<DomainCandidate> = candidates.into_values().collect();
+    let mut candidate_list: Vec<DomainCandidate> = candidates
+        .into_values()
+        .filter_map(|mut candidate| normalize_candidate_gateway(&mut candidate).then_some(candidate))
+        .collect();
     let mut search_unavailable =
         discovery_successes == 0 && discovery_failures >= discovery_fail_fast_threshold;
 
@@ -10092,7 +14688,7 @@ async fn discover_via_web_search(
             if is_blocked_company_domain(&domain) || !seen.insert(domain.clone()) {
                 continue;
             }
-            candidate_list.push(DomainCandidate {
+            let mut candidate = DomainCandidate {
                 domain: domain.clone(),
                 score: MIN_DOMAIN_RELEVANCE_SCORE,
                 evidence: vec![format!(
@@ -10101,7 +14697,11 @@ async fn discover_via_web_search(
                 )],
                 matched_keywords: vec![profile.target_industry.clone()],
                 source_links: Vec::new(),
-            });
+                phone: None,
+            };
+            if normalize_candidate_gateway(&mut candidate) {
+                candidate_list.push(candidate);
+            }
         }
     }
 
@@ -10158,7 +14758,11 @@ async fn discover_via_web_search(
         }
     }
 
-    (candidate_list, source_contact_hints, search_unavailable)
+    (
+        dedupe_domain_candidates(candidate_list),
+        source_contact_hints,
+        search_unavailable,
+    )
 }
 
 /// Merge candidates from all discovery sources with cross-source confirmation bonus.
@@ -10198,6 +14802,9 @@ fn merge_all_discovery_sources(
         entry.matched_keywords.extend(c.matched_keywords);
         entry.matched_keywords = dedupe_strings(entry.matched_keywords.clone());
         entry.source_links = merge_osint_links(entry.source_links.clone(), c.source_links);
+        if entry.phone.is_none() {
+            entry.phone = c.phone;
+        }
     }
 
     // Merge web search candidates
@@ -10214,6 +14821,9 @@ fn merge_all_discovery_sources(
         entry.matched_keywords.extend(c.matched_keywords);
         entry.matched_keywords = dedupe_strings(entry.matched_keywords.clone());
         entry.source_links = merge_osint_links(entry.source_links.clone(), c.source_links);
+        if entry.phone.is_none() {
+            entry.phone = c.phone;
+        }
     }
 
     // Merge free directory candidates
@@ -10233,7 +14843,7 @@ fn merge_all_discovery_sources(
         }
     }
 
-    merged.into_values().collect()
+    dedupe_domain_candidates(merged.into_values().collect())
 }
 
 async fn run_sales_search(
@@ -10268,7 +14878,8 @@ async fn run_sales_search_batch(
 }
 
 fn adaptive_discovery_retry_threshold(profile: &SalesProfile, max_candidates: usize) -> usize {
-    ((profile.daily_target as usize).saturating_add(1) / 2).clamp(6, max_candidates.clamp(6, 12))
+    let _ = profile;
+    (max_candidates / 2).clamp(6, 12)
 }
 
 fn normalize_discovery_focus_term(raw: &str) -> Option<String> {
@@ -10944,7 +15555,7 @@ async fn llm_generate_company_candidates(
         let Some(domain) = raw_domain else {
             continue;
         };
-        if is_blocked_company_domain(&domain) || !seen.insert(domain.clone()) {
+        if !is_valid_company_domain(&domain) || !seen.insert(domain.clone()) {
             continue;
         }
         let reason = c
@@ -10954,13 +15565,17 @@ async fn llm_generate_company_candidates(
         if let Some(company) = c.company {
             matched.push(company);
         }
-        out.push(DomainCandidate {
+        let mut candidate = DomainCandidate {
             domain,
             score: MIN_DOMAIN_RELEVANCE_SCORE + 12,
             evidence: vec![truncate_text_for_reason(&reason, 220)],
             matched_keywords: dedupe_strings(matched),
             source_links: Vec::new(),
-        });
+            phone: None,
+        };
+        if normalize_candidate_gateway(&mut candidate) {
+            out.push(candidate);
+        }
     }
 
     Ok(out)
@@ -11769,44 +16384,328 @@ pub async fn run_sales_now(State(state): State<Arc<AppState>>) -> impl IntoRespo
         }
     };
 
-    match tokio::time::timeout(
-        Duration::from_secs(SALES_RUN_REQUEST_TIMEOUT_SECS),
-        engine.run_generation(&state.kernel),
-    )
-    .await
+    let profile = match engine.get_profile() {
+        Ok(Some(profile)) => profile,
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Sales profile not configured"})),
+            )
+        }
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e})),
+            )
+        }
+    };
+    if profile.product_name.trim().is_empty()
+        || profile.product_description.trim().is_empty()
+        || profile.target_industry.trim().is_empty()
+        || profile.target_geo.trim().is_empty()
     {
-        Ok(Ok(run)) => (StatusCode::OK, Json(serde_json::json!({"run": run}))),
-        Ok(Err(e)) => (
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Sales profile is incomplete; product_name, product_description, target_industry, and target_geo are required"})),
+        );
+    }
+
+    let job_id = match engine.create_job_run("discovery") {
+        Ok(job_id) => job_id,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+        }
+    };
+
+    let kernel = state.kernel.clone();
+    let engine_for_task = SalesEngine::new(&state.kernel.config.home_dir);
+    let spawned_job_id = job_id.clone();
+    tokio::spawn(async move {
+        if let Err(err) = engine_for_task
+            .run_generation_with_job(&kernel, Some(&spawned_job_id))
+            .await
+        {
+            let _ = engine_for_task.fail_job_stage(
+                &spawned_job_id,
+                PipelineStage::QueryPlanning,
+                &err,
+            );
+        }
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "job_id": job_id,
+            "status": "running",
+            "current_stage": "QueryPlanning"
+        })),
+    )
+}
+
+pub async fn get_sales_job_progress(
+    State(state): State<Arc<AppState>>,
+    Path(job_id): Path<String>,
+) -> impl IntoResponse {
+    let engine = match engine_from_state(&state) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+        }
+    };
+
+    match engine.get_job_progress(&job_id) {
+        Ok(Some(progress)) => (StatusCode::OK, Json(serde_json::json!(progress))),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Job not found"})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
+        ),
+    }
+}
+
+pub async fn retry_sales_job(
+    State(state): State<Arc<AppState>>,
+    Path(job_id): Path<String>,
+    Json(body): Json<JobRetryRequest>,
+) -> impl IntoResponse {
+    let engine = match engine_from_state(&state) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+        }
+    };
+    let resume_stage = if body.force_fresh {
+        None
+    } else {
+        engine
+            .latest_completed_checkpoint(&job_id)
+            .ok()
+            .flatten()
+            .map(|(stage, _)| stage.as_str().to_string())
+    };
+    let new_job_id = match engine.create_job_run("discovery") {
+        Ok(job_id) => job_id,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+        }
+    };
+
+    let kernel = state.kernel.clone();
+    let engine_for_task = SalesEngine::new(&state.kernel.config.home_dir);
+    let spawned_job_id = new_job_id.clone();
+    tokio::spawn(async move {
+        if let Err(err) = engine_for_task
+            .run_generation_with_job(&kernel, Some(&spawned_job_id))
+            .await
+        {
+            let _ = engine_for_task.fail_job_stage(
+                &spawned_job_id,
+                PipelineStage::QueryPlanning,
+                &err,
+            );
+        }
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "job_id": new_job_id,
+            "status": "running",
+            "resumed_from_stage": resume_stage,
+            "replayed_from_scratch": true
+        })),
+    )
+}
+
+pub async fn list_sales_source_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let engine = match engine_from_state(&state) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+        }
+    };
+
+    match engine.list_source_health() {
+        Ok(items) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"sources": items, "total": items.len()})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
+        ),
+    }
+}
+
+pub async fn list_sales_policy_proposals(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<SalesPolicyProposalQuery>,
+) -> impl IntoResponse {
+    let engine = match engine_from_state(&state) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+        }
+    };
+    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).min(500);
+
+    match engine.list_policy_proposals(q.status.as_deref(), limit) {
+        Ok(items) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"proposals": items, "total": items.len()})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
+        ),
+    }
+}
+
+pub async fn approve_sales_policy_proposal(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let engine = match engine_from_state(&state) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+        }
+    };
+
+    match engine.update_policy_proposal_status(&id, "active", Some("operator")) {
+        Ok(Some(proposal)) => (StatusCode::OK, Json(serde_json::json!({"proposal": proposal}))),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Policy proposal not found"})),
+        ),
+        Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": e})),
         ),
-        Err(_) => match engine.recover_latest_timed_out_run() {
-            Ok(Some(run)) if run.status == "completed" => (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "run": run,
-                    "warning": "Prospecting run exceeded the request timeout, but saved progress was recovered."
-                })),
-            ),
-            Ok(Some(_run)) => (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "Prospecting run timed out while profiling candidate accounts. No durable marketing output could be recovered."
-                })),
-            ),
-            Ok(None) => (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "Prospecting run timed out while profiling candidate accounts. No durable marketing output could be recovered."
-                })),
-            ),
-            Err(e) => (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": format!("Prospecting run timed out and recovery failed: {e}")
-                })),
-            ),
-        },
+    }
+}
+
+pub async fn reject_sales_policy_proposal(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let engine = match engine_from_state(&state) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+        }
+    };
+
+    match engine.update_policy_proposal_status(&id, "retired", None) {
+        Ok(Some(proposal)) => (StatusCode::OK, Json(serde_json::json!({"proposal": proposal}))),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Policy proposal not found"})),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        ),
+    }
+}
+
+pub async fn sales_unsubscribe(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<UnsubscribeQuery>,
+) -> impl IntoResponse {
+    let engine = match engine_from_state(&state) {
+        Ok(e) => e,
+        Err(_e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Html("<html><body><h1>OpenFang</h1><p>Unsubscribe service unavailable.</p></body></html>".to_string()),
+            )
+        }
+    };
+
+    let Some(email) = verify_unsubscribe_token(&query.token) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Html("<html><body><h1>OpenFang</h1><p>Invalid unsubscribe token.</p></body></html>".to_string()),
+        );
+    };
+
+    let conn = match engine.open() {
+        Ok(conn) => conn,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Html(format!("<html><body><h1>OpenFang</h1><p>{}</p></body></html>", e)),
+            )
+        }
+    };
+    if let Err(e) = engine.suppress_contact(&conn, &email, "one_click_unsubscribe", true, None) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Html(format!("<html><body><h1>OpenFang</h1><p>{}</p></body></html>", e)),
+        );
+    }
+    let _ = conn.execute(
+        "UPDATE contact_methods SET suppressed = 1 WHERE value = ?1",
+        params![email.trim().to_lowercase()],
+    );
+    (
+        StatusCode::OK,
+        Html(format!(
+            "<html><body><h1>OpenFang</h1><p>{} artik kalici olarak suppression listesinde. Bu aliciya tekrar gonderim yapilmayacak.</p></body></html>",
+            email
+        )),
+    )
+}
+
+pub async fn sales_outcomes_webhook(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<OutcomeWebhookRequest>,
+) -> impl IntoResponse {
+    let engine = match engine_from_state(&state) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+        }
+    };
+
+    match engine.ingest_outcome_event(&body.delivery_id, &body.event_type, &body.raw_text) {
+        Ok(result) => (StatusCode::OK, Json(serde_json::json!({"result": result}))),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        ),
     }
 }
 
@@ -11913,6 +16812,104 @@ pub async fn list_sales_approvals(
         Ok(items) => (
             StatusCode::OK,
             Json(serde_json::json!({"approvals": items, "total": items.len()})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
+        ),
+    }
+}
+
+pub async fn bulk_approve_sales_approvals(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SalesApprovalBulkApproveRequest>,
+) -> impl IntoResponse {
+    let engine = match engine_from_state(&state) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+        }
+    };
+    let ids = dedupe_strings(body.ids);
+    if ids.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "ids must not be empty"})),
+        );
+    }
+
+    let mut approved = Vec::<serde_json::Value>::new();
+    let mut failed = Vec::<serde_json::Value>::new();
+    for id in ids {
+        match engine.approve_and_send(&state, &id).await {
+            Ok(result) => approved.push(serde_json::json!({
+                "id": id,
+                "result": result,
+            })),
+            Err(error) => failed.push(serde_json::json!({
+                "id": id,
+                "error": error,
+            })),
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "approved": approved,
+            "failed": failed,
+            "approved_count": approved.len(),
+            "failed_count": failed.len(),
+        })),
+    )
+}
+
+pub async fn edit_sales_approval(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<SalesApprovalEditRequest>,
+) -> impl IntoResponse {
+    let engine = match engine_from_state(&state) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+        }
+    };
+
+    match engine.edit_approval(&id, body.edited_payload) {
+        Ok(approval) => (StatusCode::OK, Json(serde_json::json!({"approval": approval}))),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        ),
+    }
+}
+
+pub async fn get_sales_account_dossier(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let engine = match engine_from_state(&state) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            )
+        }
+    };
+
+    match engine.get_account_dossier(&id) {
+        Ok(Some(dossier)) => (StatusCode::OK, Json(serde_json::json!({"dossier": dossier}))),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Account dossier not found"})),
         ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -12099,6 +17096,7 @@ mod tests {
             evidence: vec!["B2B workflow automation".to_string()],
             matched_keywords: vec!["Field Operations".to_string()],
             source_links: Vec::new(),
+            phone: None,
         };
         assert!(!candidate_has_field_ops_signal(&only_generic));
     }
@@ -12111,6 +17109,7 @@ mod tests {
             evidence: vec!["Platform rental and forklift service".to_string()],
             matched_keywords: vec!["equipment rental".to_string()],
             source_links: Vec::new(),
+            phone: None,
         };
         assert!(candidate_has_field_ops_signal(&platform_company));
     }
@@ -12169,6 +17168,7 @@ mod tests {
                 evidence: vec![],
                 matched_keywords: vec![],
                 source_links: Vec::new(),
+                phone: None,
             },
             &profile,
         ));
@@ -12179,6 +17179,7 @@ mod tests {
                 evidence: vec![],
                 matched_keywords: vec![],
                 source_links: Vec::new(),
+                phone: None,
             },
             &profile,
         ));
@@ -12396,6 +17397,7 @@ mod tests {
                 "facility operations".to_string(),
             ],
             source_links: vec!["https://www.tmb.org.tr/en/members".to_string()],
+            phone: None,
         }];
         let sales_profile = SalesProfile {
             product_name: "Machinity".to_string(),
@@ -12449,6 +17451,7 @@ mod tests {
                 evidence: vec!["Corporate group overview".to_string()],
                 matched_keywords: vec!["field service".to_string()],
                 source_links: Vec::new(),
+                phone: None,
             },
             DomainCandidate {
                 domain: "ornekbakim.com.tr".to_string(),
@@ -12456,6 +17459,7 @@ mod tests {
                 evidence: vec!["Maintenance dispatch teams".to_string()],
                 matched_keywords: vec!["field service".to_string(), "maintenance".to_string()],
                 source_links: vec!["https://www.asmud.org.tr/Uyeler.asp".to_string()],
+                phone: None,
             },
         ];
         let mut hints = HashMap::new();
@@ -12940,6 +17944,296 @@ mod tests {
                 .get("to")
                 .and_then(|value| value.as_str()),
             Some("eray@artiplatform.com.tr")
+        );
+    }
+
+    #[test]
+    fn edit_approval_updates_touch_payload_and_returns_sanitized_payload() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let engine = SalesEngine::new(temp.path());
+        engine.init().expect("init");
+
+        let lead = SalesLead {
+            id: uuid::Uuid::new_v4().to_string(),
+            run_id: "run-1".to_string(),
+            company: "Machinity".to_string(),
+            website: "https://machinity.ai".to_string(),
+            company_domain: "machinity.ai".to_string(),
+            contact_name: "Aylin Demir".to_string(),
+            contact_title: "CEO".to_string(),
+            linkedin_url: Some("https://www.linkedin.com/in/aylin-demir/".to_string()),
+            email: Some("aylin@machinity.ai".to_string()),
+            phone: None,
+            reasons: vec!["Field operations expansion".to_string()],
+            email_subject: "Original subject".to_string(),
+            email_body: "Original body".to_string(),
+            linkedin_message: "Original LinkedIn".to_string(),
+            score: 91,
+            status: "draft_ready".to_string(),
+            created_at: "2026-03-26T11:00:00Z".to_string(),
+        };
+        assert!(engine.insert_lead(&lead).expect("insert lead"));
+        assert_eq!(
+            engine
+                .queue_approvals_for_lead(&lead)
+                .expect("queue approvals"),
+            2
+        );
+
+        let approval = engine
+            .list_approvals(Some("pending"), 10)
+            .expect("list approvals")
+            .into_iter()
+            .find(|item| item.channel == "email")
+            .expect("email approval");
+
+        let edited = engine
+            .edit_approval(
+                &approval.id,
+                serde_json::json!({
+                    "to": "aylin@machinity.ai",
+                    "subject": "Updated subject",
+                    "body": "Updated first line\n\nUpdated rest of body",
+                }),
+            )
+            .expect("edit approval");
+
+        assert_eq!(
+            edited.payload.get("subject").and_then(|value| value.as_str()),
+            Some("Updated subject")
+        );
+        assert_eq!(
+            edited.payload.get("body").and_then(|value| value.as_str()),
+            Some("Updated first line\n\nUpdated rest of body")
+        );
+
+        let conn = engine.open().expect("open");
+        let touch_payload: String = conn
+            .query_row(
+                "SELECT message_payload FROM touches WHERE id = ?1",
+                params![approval.id],
+                |row| row.get(0),
+            )
+            .expect("touch payload");
+        let touch_payload: serde_json::Value =
+            serde_json::from_str(&touch_payload).expect("decode touch payload");
+        assert_eq!(
+            touch_payload
+                .get("subject")
+                .and_then(|value| value.as_str()),
+            Some("Updated subject")
+        );
+    }
+
+    #[test]
+    fn ensure_default_sequence_template_uses_five_step_playbook() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let engine = SalesEngine::new(temp.path());
+        engine.init().expect("init");
+
+        let conn = engine.open().expect("open");
+        let template_id = engine
+            .ensure_default_sequence_template(&conn)
+            .expect("template");
+        let steps_json: String = conn
+            .query_row(
+                "SELECT steps_json FROM sequence_templates WHERE id = ?1",
+                params![template_id],
+                |row| row.get(0),
+            )
+            .expect("steps json");
+        let steps: serde_json::Value =
+            serde_json::from_str(&steps_json).expect("decode steps json");
+        let steps = steps.as_array().expect("steps array");
+        assert_eq!(steps.len(), 5);
+        assert_eq!(steps[0].get("channel").and_then(|value| value.as_str()), Some("email"));
+        assert_eq!(
+            steps[3].get("channel").and_then(|value| value.as_str()),
+            Some("linkedin_assist")
+        );
+    }
+
+    #[test]
+    fn select_accounts_for_activation_logs_mid_score_exploration() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let engine = SalesEngine::new(temp.path());
+        engine.init().expect("init");
+        let conn = engine.open().expect("open");
+        let now = Utc::now().to_rfc3339();
+
+        conn.execute(
+            "INSERT INTO accounts (id, canonical_name, display_name, website, tier, created_at, updated_at)
+             VALUES (?1, ?2, ?2, ?3, 'standard', ?4, ?4)",
+            params!["acct-mid", "Mid Score Account", "https://mid.example", now],
+        )
+        .expect("insert account");
+        conn.execute(
+            "INSERT INTO score_snapshots
+             (id, account_id, fit_score, intent_score, reachability_score, deliverability_risk,
+              compliance_risk, activation_priority, computed_at, scoring_version)
+             VALUES (?1, ?2, 0.55, 0.42, 0.51, 0.12, 0.08, 0.61, ?3, 'v1')",
+            params!["score-mid", "acct-mid", now],
+        )
+        .expect("insert score");
+
+        let selected = engine
+            .select_accounts_for_activation(
+                &conn,
+                &HashMap::from([("acct-mid".to_string(), 61_i64)]),
+                1,
+            )
+            .expect("select activation");
+        assert_eq!(selected, vec!["acct-mid".to_string()]);
+
+        let exploration_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM exploration_log WHERE account_id = ?1",
+                params!["acct-mid"],
+                |row| row.get(0),
+            )
+            .expect("count exploration log");
+        assert_eq!(exploration_count, 1);
+    }
+
+    #[test]
+    fn missed_signal_review_creates_policy_proposal_and_supports_lifecycle() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let engine = SalesEngine::new(temp.path());
+        engine.init().expect("init");
+        let conn = engine.open().expect("open");
+        let now = Utc::now().to_rfc3339();
+
+        conn.execute(
+            "INSERT INTO accounts (id, canonical_name, display_name, website, tier, created_at, updated_at)
+             VALUES (?1, ?2, ?2, ?3, 'standard', ?4, ?4)",
+            params!["acct-policy", "Policy Account", "https://policy.example", now],
+        )
+        .expect("insert account");
+        conn.execute(
+            "INSERT INTO signals
+             (id, account_id, signal_type, text, source, observed_at, confidence, effect_horizon, expires_at, created_at)
+             VALUES (?1, ?2, 'job_posting', 'Hiring dispatch operators', 'site_html', ?3, 0.9, 'campaign_window', NULL, ?3)",
+            params!["signal-job-posting", "acct-policy", now],
+        )
+        .expect("insert signal");
+        conn.execute(
+            "INSERT INTO touches
+             (id, sequence_instance_id, step, channel, message_payload, claims_json, evidence_ids,
+              variant_id, risk_flags, sent_at, mailbox_id, created_at)
+             VALUES (?1, NULL, 1, 'email', '{}', '[]', '[]', 'v1', '[]', NULL, NULL, ?2)",
+            params!["touch-1", now],
+        )
+        .expect("insert touch");
+        conn.execute(
+            "INSERT INTO outcomes
+             (id, touch_id, outcome_type, raw_text, classified_at, classifier_confidence)
+             VALUES (?1, ?2, 'meeting_booked', 'Positive reply', ?3, 1.0)",
+            params!["outcome-1", "touch-1", now],
+        )
+        .expect("insert outcome");
+        conn.execute(
+            "INSERT INTO outcome_attribution_snapshots
+             (id, touch_id, account_id, snapshot_at, score_at_touch_json, active_signal_ids, unused_signal_ids,
+              thesis_id, sequence_variant, message_variant, channel, mailbox_id, contextual_factors_json)
+             VALUES (?1, ?2, ?3, ?4, '{}', '[]', '[]', NULL, 'default', 'v1', 'email', NULL, '{}')",
+            params!["snapshot-1", "touch-1", "acct-policy", now],
+        )
+        .expect("insert snapshot");
+
+        engine
+            .record_missed_signal_review(
+                &conn,
+                "outcome-1",
+                "snapshot-1",
+                "acct-policy",
+                "meeting_booked",
+                &["signal-job-posting".to_string()],
+                &[],
+            )
+            .expect("record missed signal review");
+
+        let proposals = engine
+            .list_policy_proposals(Some("proposed"), 10)
+            .expect("list proposals");
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].rule_key, "signal_weight::job_posting");
+
+        let approved = engine
+            .update_policy_proposal_status(&proposals[0].id, "active", Some("operator"))
+            .expect("approve proposal")
+            .expect("proposal exists");
+        assert_eq!(approved.status, "active");
+        assert_eq!(approved.approved_by.as_deref(), Some("operator"));
+        assert!(approved.activated_at.is_some());
+
+        let retired = engine
+            .update_policy_proposal_status(&proposals[0].id, "retired", None)
+            .expect("retire proposal")
+            .expect("proposal exists");
+        assert_eq!(retired.status, "retired");
+        assert!(retired.activated_at.is_none());
+    }
+
+    #[test]
+    fn get_account_dossier_falls_back_to_prospect_profile_when_canonical_core_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let engine = SalesEngine::new(temp.path());
+        engine.init().expect("init");
+
+        engine
+            .upsert_prospect_profiles(&[SalesProspectProfile {
+                id: "ornekbakim.com.tr".to_string(),
+                run_id: "run-fallback".to_string(),
+                company: "Ornek Bakim".to_string(),
+                website: "https://ornekbakim.com.tr".to_string(),
+                company_domain: "ornekbakim.com.tr".to_string(),
+                fit_score: 77,
+                profile_status: "contact_ready".to_string(),
+                summary: "Public maintenance signal and reachable operator leader.".to_string(),
+                matched_signals: vec!["Saha operasyon yonetimi".to_string()],
+                primary_contact_name: Some("Aylin Demir".to_string()),
+                primary_contact_title: Some("COO".to_string()),
+                primary_email: Some("aylin@ornekbakim.com.tr".to_string()),
+                primary_linkedin_url: Some("https://www.linkedin.com/in/aylin-demir/".to_string()),
+                company_linkedin_url: None,
+                osint_links: vec!["https://ornekbakim.com.tr".to_string()],
+                contact_count: 1,
+                source_count: 2,
+                buyer_roles: vec!["decision_maker".to_string()],
+                pain_points: vec!["Dispatch visibility".to_string()],
+                trigger_events: vec!["Public field ops hiring".to_string()],
+                recommended_channel: "email".to_string(),
+                outreach_angle: "Lead with faster dispatch coordination".to_string(),
+                research_status: "heuristic".to_string(),
+                research_confidence: 0.81,
+                created_at: "2026-03-26T09:00:00Z".to_string(),
+                updated_at: "2026-03-26T09:00:00Z".to_string(),
+            }])
+            .expect("upsert prospect profile");
+
+        let dossier = engine
+            .get_account_dossier("ornekbakim.com.tr")
+            .expect("dossier lookup")
+            .expect("fallback dossier");
+
+        assert_eq!(
+            dossier.get("source").and_then(|value| value.as_str()),
+            Some("prospect_profile_fallback")
+        );
+        assert_eq!(
+            dossier
+                .get("account")
+                .and_then(|value| value.get("canonical_name"))
+                .and_then(|value| value.as_str()),
+            Some("Ornek Bakim")
+        );
+        assert_eq!(
+            dossier
+                .get("score")
+                .and_then(|value| value.get("fit_score"))
+                .and_then(|value| value.as_f64())
+                .map(|value| (value * 100.0).round() as i64),
+            Some(77)
         );
     }
 
@@ -13726,6 +19020,7 @@ mod tests {
                     evidence: vec!["TMB member".to_string()],
                     matched_keywords: vec!["construction".to_string()],
                     source_links: vec!["https://www.tmb.org.tr/en/members".to_string()],
+                    phone: None,
                 },
                 contact_hint: SourceContactHint {
                     contact_name: Some("Ahmet Yılmaz".to_string()),
