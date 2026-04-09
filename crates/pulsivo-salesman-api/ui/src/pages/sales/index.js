@@ -7,6 +7,7 @@ import { salesProspectMixins } from './prospects.js';
 import { salesB2cMixins } from './b2c.js';
 import { salesApprovalMixins } from './approvals.js';
 import { salesOauthMixins } from './oauth.js';
+import { salesOpsMixins } from './ops.js';
 import { salesFormatterMixins } from './formatters.js';
 
 function applyMixin(target, mixin) {
@@ -24,6 +25,7 @@ export function createSalesPage() {
     salesB2cMixins,
     salesApprovalMixins,
     salesOauthMixins,
+    salesOpsMixins,
     salesFormatterMixins
   ];
 

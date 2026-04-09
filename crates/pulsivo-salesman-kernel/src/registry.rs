@@ -178,7 +178,11 @@ impl AgentRegistry {
     }
 
     /// Update an agent's system prompt (hot-swap, takes effect on next message).
-    pub fn update_system_prompt(&self, id: AgentId, new_prompt: String) -> PulsivoSalesmanResult<()> {
+    pub fn update_system_prompt(
+        &self,
+        id: AgentId,
+        new_prompt: String,
+    ) -> PulsivoSalesmanResult<()> {
         let mut entry = self
             .agents
             .get_mut(&id)

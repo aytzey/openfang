@@ -189,7 +189,10 @@ mod tests {
         b.api_listen = "0.0.0.0:8080".to_string();
         let plan = build_reload_plan(&a, &b);
         assert!(plan.restart_required);
-        assert!(plan.restart_reasons.iter().any(|r| r.contains("api_listen")));
+        assert!(plan
+            .restart_reasons
+            .iter()
+            .any(|r| r.contains("api_listen")));
     }
 
     #[test]

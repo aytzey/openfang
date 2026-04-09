@@ -25,14 +25,18 @@ fn main() -> ExitCode {
         XtaskCommand::TestSmoke => run_group(
             "local smoke",
             &[
-                &["test", "-p", "pulsivo-salesman-api", "--lib", "--", "--nocapture"],
+                &[
+                    "test",
+                    "-p",
+                    "pulsivo-salesman-api",
+                    "--lib",
+                    "--",
+                    "--nocapture",
+                ],
                 &["check", "-p", "pulsivo-salesman-api"],
             ],
         ),
-        XtaskCommand::TestLiveSmoke => run_group(
-            "workspace verification",
-            &[&["check"]],
-        ),
+        XtaskCommand::TestLiveSmoke => run_group("workspace verification", &[&["check"]]),
     };
 
     if let Err(err) = result {

@@ -29,6 +29,56 @@ impl OpenAIDriver {
     }
 }
 
+fn push_user_parts_message(oai_messages: &mut Vec<OaiMessage>, parts: &mut Vec<OaiContentPart>) {
+    if parts.is_empty() {
+        return;
+    }
+
+    oai_messages.push(OaiMessage {
+        role: "user".to_string(),
+        content: Some(OaiMessageContent::Parts(std::mem::take(parts))),
+        tool_calls: None,
+        tool_call_id: None,
+    });
+}
+
+fn append_user_blocks_messages(oai_messages: &mut Vec<OaiMessage>, blocks: &[ContentBlock]) {
+    let mut parts: Vec<OaiContentPart> = Vec::new();
+
+    for block in blocks {
+        match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => {
+                push_user_parts_message(oai_messages, &mut parts);
+                oai_messages.push(OaiMessage {
+                    role: "tool".to_string(),
+                    content: Some(OaiMessageContent::Text(content.clone())),
+                    tool_calls: None,
+                    tool_call_id: Some(tool_use_id.clone()),
+                });
+            }
+            ContentBlock::Text { text } => {
+                parts.push(OaiContentPart::Text { text: text.clone() });
+            }
+            ContentBlock::Image { media_type, data } => {
+                parts.push(OaiContentPart::ImageUrl {
+                    image_url: OaiImageUrl {
+                        url: format!("data:{media_type};base64,{data}"),
+                    },
+                });
+            }
+            ContentBlock::Thinking { .. }
+            | ContentBlock::Unknown
+            | ContentBlock::ToolUse { .. } => {}
+        }
+    }
+
+    push_user_parts_message(oai_messages, &mut parts);
+}
+
 #[derive(Debug, Serialize)]
 struct OaiRequest {
     model: String,
@@ -181,46 +231,7 @@ impl LlmDriver for OpenAIDriver {
                     });
                 }
                 (Role::User, MessageContent::Blocks(blocks)) => {
-                    // Handle tool results and images in user messages
-                    let mut parts: Vec<OaiContentPart> = Vec::new();
-                    let mut has_tool_results = false;
-                    for block in blocks {
-                        match block {
-                            ContentBlock::ToolResult {
-                                tool_use_id,
-                                content,
-                                ..
-                            } => {
-                                has_tool_results = true;
-                                oai_messages.push(OaiMessage {
-                                    role: "tool".to_string(),
-                                    content: Some(OaiMessageContent::Text(content.clone())),
-                                    tool_calls: None,
-                                    tool_call_id: Some(tool_use_id.clone()),
-                                });
-                            }
-                            ContentBlock::Text { text } => {
-                                parts.push(OaiContentPart::Text { text: text.clone() });
-                            }
-                            ContentBlock::Image { media_type, data } => {
-                                parts.push(OaiContentPart::ImageUrl {
-                                    image_url: OaiImageUrl {
-                                        url: format!("data:{media_type};base64,{data}"),
-                                    },
-                                });
-                            }
-                            ContentBlock::Thinking { .. } => {}
-                            _ => {}
-                        }
-                    }
-                    if !parts.is_empty() && !has_tool_results {
-                        oai_messages.push(OaiMessage {
-                            role: "user".to_string(),
-                            content: Some(OaiMessageContent::Parts(parts)),
-                            tool_calls: None,
-                            tool_call_id: None,
-                        });
-                    }
+                    append_user_blocks_messages(&mut oai_messages, blocks);
                 }
                 (Role::Assistant, MessageContent::Blocks(blocks)) => {
                     let mut text_parts = Vec::new();
@@ -492,21 +503,7 @@ impl LlmDriver for OpenAIDriver {
                     });
                 }
                 (Role::User, MessageContent::Blocks(blocks)) => {
-                    for block in blocks {
-                        if let ContentBlock::ToolResult {
-                            tool_use_id,
-                            content,
-                            ..
-                        } = block
-                        {
-                            oai_messages.push(OaiMessage {
-                                role: "tool".to_string(),
-                                content: Some(OaiMessageContent::Text(content.clone())),
-                                tool_calls: None,
-                                tool_call_id: Some(tool_use_id.clone()),
-                            });
-                        }
-                    }
+                    append_user_blocks_messages(&mut oai_messages, blocks);
                 }
                 (Role::Assistant, MessageContent::Blocks(blocks)) => {
                     let mut text_parts = Vec::new();
@@ -970,5 +967,67 @@ mod tests {
         assert!(result.is_some());
         let resp = result.unwrap();
         assert_eq!(resp.tool_calls[0].name, "shell_exec");
+    }
+
+    #[test]
+    fn user_blocks_preserve_tool_results_and_followup_text() {
+        let mut messages = Vec::new();
+        append_user_blocks_messages(
+            &mut messages,
+            &[
+                ContentBlock::ToolResult {
+                    tool_use_id: "call-1".to_string(),
+                    content: "{\"ok\":true}".to_string(),
+                    is_error: false,
+                },
+                ContentBlock::Text {
+                    text: "Continue with the fetched result.".to_string(),
+                },
+            ],
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "tool");
+        assert_eq!(messages[0].tool_call_id.as_deref(), Some("call-1"));
+
+        match messages[1].content.as_ref().expect("content") {
+            OaiMessageContent::Parts(parts) => {
+                assert_eq!(parts.len(), 1);
+                match &parts[0] {
+                    OaiContentPart::Text { text } => {
+                        assert_eq!(text, "Continue with the fetched result.");
+                    }
+                    _ => panic!("expected trailing text part"),
+                }
+            }
+            _ => panic!("expected user parts content"),
+        }
+    }
+
+    #[test]
+    fn user_blocks_preserve_images_in_streaming_conversion() {
+        let mut messages = Vec::new();
+        append_user_blocks_messages(
+            &mut messages,
+            &[
+                ContentBlock::Text {
+                    text: "Inspect this".to_string(),
+                },
+                ContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: "ZmFrZQ==".to_string(),
+                },
+            ],
+        );
+
+        assert_eq!(messages.len(), 1);
+        match messages[0].content.as_ref().expect("content") {
+            OaiMessageContent::Parts(parts) => {
+                assert_eq!(parts.len(), 2);
+                assert!(matches!(parts[0], OaiContentPart::Text { .. }));
+                assert!(matches!(parts[1], OaiContentPart::ImageUrl { .. }));
+            }
+            _ => panic!("expected user parts content"),
+        }
     }
 }

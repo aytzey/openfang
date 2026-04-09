@@ -1,134 +1,62 @@
-# Pulsivo Salesman — Agent Instructions
+# Pulsivo Salesman — Repo Notes
 
 ## Project Overview
-Pulsivo Salesman is an open-source Agent Operating System written in Rust (14 crates).
+Pulsivo Salesman is a Rust sales daemon plus browser cockpit.
+
 - Config: `~/.pulsivo-salesman/config.toml`
 - Default API: `http://127.0.0.1:4200`
-- CLI binary: `target/release/pulsivo-salesman.exe` (or `target/debug/pulsivo-salesman.exe`)
+- Binary: `cargo run -p pulsivo-salesman -- start`
+- Active HTTP surface: health/status/version plus `/api/sales/*`
 
 ## Build & Verify Workflow
-After every feature implementation, run ALL THREE checks:
-```bash
-cargo build --workspace --lib          # Must compile (use --lib if exe is locked)
-cargo test --workspace                 # All tests must pass (currently 1744+)
-cargo clippy --workspace --all-targets -- -D warnings  # Zero warnings
-cargo xtask test-smoke                 # Shared daemon/API + kernel smoke harness
-```
-
-## MANDATORY: Live Integration Testing
-**After implementing any new endpoint, feature, or wiring change, you MUST run live integration tests.** Unit tests alone are not enough — they can pass while the feature is actually dead code. Live tests catch:
-- Missing route registrations in server.rs
-- Config fields not being deserialized from TOML
-- Type mismatches between kernel and API layers
-- Endpoints that compile but return wrong/empty data
-
-### How to Run Live Integration Tests
-
-Prefer the shared live harness before dropping into ad hoc endpoint checks:
+After meaningful changes, prefer these checks:
 
 ```bash
-GROQ_API_KEY=<key> cargo xtask test-live-smoke
+cargo build --bin pulsivo-salesman
+cargo check --workspace
+cargo test --workspace
+cargo xtask test-smoke
 ```
 
-The live harness covers the real HTTP agent-message path plus direct kernel and
-workflow live checks. The manual steps below remain useful for endpoint-by-endpoint
-debugging after the harness has identified a failure.
+Use narrower commands when the changed area is obviously isolated, but do not leave route wiring or launcher changes unverified.
 
-#### Step 1: Stop any running daemon
+## Live Smoke Notes
+
+The daemon entrypoint is now the first-party `pulsivo-salesman` binary:
+
 ```bash
-tasklist | grep -i pulsivo-salesman
-taskkill //PID <pid> //F
-# Wait 2-3 seconds for port to release
-sleep 3
+cargo run -p pulsivo-salesman -- init --quick
+GROQ_API_KEY=<key> cargo run -p pulsivo-salesman -- start
 ```
 
-#### Step 2: Build fresh release binary
+Basic endpoint checks:
+
 ```bash
-cargo build --release -p pulsivo-salesman-cli
+curl -s http://127.0.0.1:4200/api/health
+curl -s http://127.0.0.1:4200/api/status
+curl -s http://127.0.0.1:4200/api/sales/profile?segment=b2c
+curl -s http://127.0.0.1:4200/api/sales/runs?segment=b2c&limit=5
 ```
 
-#### Step 3: Start daemon with required API keys
+Write-path checks:
+
 ```bash
-GROQ_API_KEY=<key> target/release/pulsivo-salesman.exe start &
-sleep 6  # Wait for full boot
-curl -s http://127.0.0.1:4200/api/health  # Verify it's up
+curl -s -X POST 'http://127.0.0.1:4200/api/sales/onboarding/brief?segment=b2c' \
+  -H 'Content-Type: application/json' \
+  -d '{"brief":"Pulsivo helps local service businesses turn buyer signals into outbound sales actions.","persist":true}'
 ```
-The daemon command is `start` (not `daemon`).
-
-#### Step 4: Test every new endpoint
-```bash
-# GET endpoints — verify they return real data, not empty/null
-curl -s http://127.0.0.1:4200/api/<new-endpoint>
-
-# POST/PUT endpoints — send real payloads
-curl -s -X POST http://127.0.0.1:4200/api/<endpoint> \
-  -H "Content-Type: application/json" \
-  -d '{"field": "value"}'
-
-# Verify write endpoints persist — read back after writing
-curl -s -X PUT http://127.0.0.1:4200/api/<endpoint> -d '...'
-curl -s http://127.0.0.1:4200/api/<endpoint>  # Should reflect the update
-```
-
-#### Step 5: Test real LLM integration
-```bash
-# Get an agent ID
-curl -s http://127.0.0.1:4200/api/agents | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['id'])"
-
-# Send a real message (triggers actual LLM call to Groq/OpenAI)
-curl -s -X POST "http://127.0.0.1:4200/api/agents/<id>/message" \
-  -H "Content-Type: application/json" \
-  -d '{"message": "Say hello in 5 words."}'
-```
-
-#### Step 6: Verify side effects
-After an LLM call, verify that any metering/cost/usage tracking updated:
-```bash
-curl -s http://127.0.0.1:4200/api/budget       # Cost should have increased
-curl -s http://127.0.0.1:4200/api/budget/agents  # Per-agent spend should show
-```
-
-#### Step 7: Verify dashboard HTML
-```bash
-# Check that new UI components exist in the served HTML
-curl -s http://127.0.0.1:4200/ | grep -c "newComponentName"
-# Should return > 0
-```
-
-#### Step 8: Cleanup
-```bash
-tasklist | grep -i pulsivo-salesman
-taskkill //PID <pid> //F
-```
-
-### Key API Endpoints for Testing
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/api/health` | GET | Basic health check |
-| `/api/agents` | GET | List all agents |
-| `/api/agents/{id}/message` | POST | Send message (triggers LLM) |
-| `/api/budget` | GET/PUT | Global budget status/update |
-| `/api/budget/agents` | GET | Per-agent cost ranking |
-| `/api/budget/agents/{id}` | GET | Single agent budget detail |
-| `/api/network/status` | GET | OFP network status |
-| `/api/peers` | GET | Connected OFP peers |
-| `/api/a2a/agents` | GET | External A2A agents |
-| `/api/a2a/discover` | POST | Discover A2A agent at URL |
-| `/api/a2a/send` | POST | Send task to external A2A agent |
-| `/api/a2a/tasks/{id}/status` | GET | Check external A2A task status |
 
 ## Architecture Notes
-- **Don't touch `pulsivo-salesman-cli`** — user is actively building the interactive CLI
-- `KernelHandle` trait avoids circular deps between runtime and kernel
-- `AppState` in `server.rs` bridges kernel to API routes
-- New routes must be registered in `server.rs` router AND implemented in `routes.rs`
-- Dashboard is Alpine.js SPA in `static/index_body.html` — new tabs need both HTML and JS data/methods
-- Config fields need: struct field + `#[serde(default)]` + Default impl entry + Serialize/Deserialize derives
+
+- `crates/pulsivo-salesman/src/main.rs` is intentionally thin. Keep bootstrap logic there, not product logic.
+- `crates/pulsivo-salesman-api/src/server.rs` is the route assembly point.
+- `crates/pulsivo-salesman-api/src/sales/http.rs` is the live sales HTTP contract.
+- `crates/pulsivo-salesman-kernel/src/kernel.rs` owns config, memory, registry, and model catalog bootstrap.
+- New routes are only real when they are both implemented and registered in `server.rs`.
+- If config shape changes, update `KernelConfig`, its `Default` impl, and any validation/hot-reload logic together.
 
 ## Common Gotchas
-- `pulsivo-salesman.exe` may be locked if daemon is running — use `--lib` flag or kill daemon first
-- `PeerRegistry` is `Option<PeerRegistry>` on kernel but `Option<Arc<PeerRegistry>>` on `AppState` — wrap with `.as_ref().map(|r| Arc::new(r.clone()))`
-- Config fields added to `KernelConfig` struct MUST also be added to the `Default` impl or build fails
-- `AgentLoopResult` field is `.response` not `.response_text`
-- CLI command to start daemon is `start` not `daemon`
-- On Windows: use `taskkill //PID <pid> //F` (double slashes in MSYS2/Git Bash)
+
+- The repo is sales-only now. Do not reintroduce legacy chat, workflow, or general agent-loop assumptions by accident.
+- The official SDKs are expected to mirror `/api/sales/*`; if you add or remove sales routes, update both SDKs.
+- The WhatsApp gateway is an inbox/outbound bridge now, not an agent chat adapter.

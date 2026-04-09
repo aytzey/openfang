@@ -247,7 +247,10 @@ impl SessionStore {
 
 impl SessionStore {
     /// List all sessions for a specific agent.
-    pub fn list_agent_sessions(&self, agent_id: AgentId) -> PulsivoSalesmanResult<Vec<serde_json::Value>> {
+    pub fn list_agent_sessions(
+        &self,
+        agent_id: AgentId,
+    ) -> PulsivoSalesmanResult<Vec<serde_json::Value>> {
         let conn = self
             .conn
             .lock()
@@ -763,7 +766,9 @@ mod tests {
             .push(pulsivo_salesman_types::message::Message::user("Hello"));
         session
             .messages
-            .push(pulsivo_salesman_types::message::Message::assistant("Hi there!"));
+            .push(pulsivo_salesman_types::message::Message::assistant(
+                "Hi there!",
+            ));
         store.save_session(&session).unwrap();
 
         let dir = tempfile::TempDir::new().unwrap();

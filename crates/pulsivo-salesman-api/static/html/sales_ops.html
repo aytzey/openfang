@@ -1,0 +1,245 @@
+          <section class="sales-panel-section" x-show="activeTab === 'ops' && !isB2C">
+            <div class="sales-panel-header">
+              <h3>Ops Lab</h3>
+              <div class="sales-btn-row">
+                <button class="btn btn-ghost btn-sm" @click="loadOpsData()">Yenile</button>
+                <button class="btn btn-ghost btn-sm" @click="advanceSequences()" :disabled="advancingSequences">
+                  <span x-show="!advancingSequences">Sequence advance</span>
+                  <span x-show="advancingSequences">Calisiyor...</span>
+                </button>
+                <button class="btn btn-primary btn-sm" @click="runCalibration()" :disabled="calibrating">
+                  <span x-show="!calibrating">Calibration calistir</span>
+                  <span x-show="calibrating">Hesaplaniyor...</span>
+                </button>
+              </div>
+            </div>
+
+            <div class="sales-stats-grid sales-stats-grid--ops">
+              <div class="sales-stat-card">
+                <div class="sales-stat-label">Proposed policy</div>
+                <div class="sales-stat-value" :style="proposedPolicyCount > 0 ? 'color:var(--warning)' : ''" x-text="proposedPolicyCount"></div>
+              </div>
+              <div class="sales-stat-card">
+                <div class="sales-stat-label">Context factor</div>
+                <div class="sales-stat-value" x-text="contextFactors.length"></div>
+              </div>
+              <div class="sales-stat-card">
+                <div class="sales-stat-label">Budget quarter</div>
+                <div class="sales-stat-value" style="font-size:18px" x-text="contextSummary.current_budget_quarter || '-'"></div>
+              </div>
+              <div class="sales-stat-card">
+                <div class="sales-stat-label">Timing today</div>
+                <div class="sales-stat-value" :style="contextSummary.bad_timing_today ? 'color:var(--warning)' : 'color:var(--success)'" x-text="contextSummary.bad_timing_today ? 'Bad timing' : 'Clear window'"></div>
+              </div>
+              <div class="sales-stat-card">
+                <div class="sales-stat-label">Active experiment</div>
+                <div class="sales-stat-value" x-text="activeExperimentCount"></div>
+              </div>
+              <div class="sales-stat-card">
+                <div class="sales-stat-label">Experiment leader</div>
+                <div class="sales-stat-value" style="font-size:18px" x-text="experimentLeadLabel()"></div>
+              </div>
+            </div>
+
+            <div class="sales-panel-section sales-panel-section--inner" style="margin-top:14px">
+              <div class="sales-panel-header">
+                <h3>Profile autopilot</h3>
+                <span class="badge badge-info">Brief -> profile</span>
+              </div>
+              <div class="form-group">
+                <label>Kayitli brief</label>
+                <textarea class="form-textarea" x-model="profileBrief" style="min-height:100px" placeholder="Brief girdiginizde profile autofill burada tekrar calistirilabilir."></textarea>
+              </div>
+              <div class="sales-btn-row">
+                <button class="btn btn-primary btn-sm" @click="reAutofillProfile()" :disabled="autofillingProfile || !profileBrief.trim()">
+                  <span x-show="!autofillingProfile">Profili brief'ten yenile</span>
+                  <span x-show="autofillingProfile">Dolduruluyor...</span>
+                </button>
+                <span class="text-xs text-dim">Onboarding tamamlandiktan sonra da brief bazli profil guncellemesini acik tutar.</span>
+              </div>
+            </div>
+          </section>
+
+          <section class="sales-panel-section" x-show="activeTab === 'ops' && !isB2C">
+            <div class="sales-dossier-grid">
+              <div class="sales-panel-section sales-panel-section--inner">
+                <div class="sales-panel-header">
+                  <h3>Policy proposals</h3>
+                  <span class="badge badge-warn" x-text="proposedPolicyCount + ' proposed'"></span>
+                </div>
+                <div class="table-wrap" x-show="policyProposals.length > 0">
+                  <table>
+                    <thead><tr><th>Rule</th><th>Change</th><th>Evidence</th><th>Status</th><th>Zaman</th><th>Aksiyon</th></tr></thead>
+                    <tbody>
+                      <template x-for="proposal in policyProposals" :key="proposal.id">
+                        <tr>
+                          <td class="text-xs">
+                            <div class="font-bold" x-text="proposal.rule_key"></div>
+                            <div class="text-dim" x-text="proposal.proposal_source || '-'"></div>
+                          </td>
+                          <td class="text-xs">
+                            <div class="sales-line-clamp" x-text="policyChangeSummary(proposal)"></div>
+                          </td>
+                          <td class="text-xs">
+                            <div class="sales-line-clamp" x-text="policyEvidenceSummary(proposal)"></div>
+                          </td>
+                          <td><span class="badge" :class="policyStatusClass(proposal.status)" x-text="proposal.status"></span></td>
+                          <td class="text-xs" x-text="formatDateTime(proposal.created_at)"></td>
+                          <td>
+                            <div class="sales-btn-row" x-show="proposal.status === 'proposed'">
+                              <button class="btn btn-primary btn-sm" @click="approvePolicyProposal(proposal.id)">Approve</button>
+                              <button class="btn btn-ghost btn-sm" @click="rejectPolicyProposal(proposal.id)">Reject</button>
+                            </div>
+                            <span class="text-xs text-dim" x-show="proposal.status !== 'proposed'">No action</span>
+                          </td>
+                        </tr>
+                      </template>
+                    </tbody>
+                  </table>
+                </div>
+                <div class="sales-empty" x-show="policyProposals.length === 0">
+                  <p>Henuz policy onerisi yok.</p>
+                </div>
+              </div>
+
+              <div class="sales-panel-section sales-panel-section--inner">
+                <div class="sales-panel-header">
+                  <h3>Context + calibration</h3>
+                  <div class="sales-btn-row">
+                    <span class="badge" :class="contextSummary.bad_timing_today ? 'badge-warn' : 'badge-success'" x-text="contextSummary.bad_timing_today ? 'bad timing' : 'clear'"></span>
+                    <span class="badge badge-info" x-text="contextSummary.current_budget_quarter || '-'"></span>
+                  </div>
+                </div>
+                <div class="table-wrap" x-show="contextFactors.length > 0">
+                  <table>
+                    <thead><tr><th>Type</th><th>Key</th><th>Value</th><th>Source</th><th>Pencere</th></tr></thead>
+                    <tbody>
+                      <template x-for="factor in contextFactors" :key="factor.id">
+                        <tr>
+                          <td><span class="badge" :class="contextFactorClass(factor)" x-text="factor.factor_type"></span></td>
+                          <td class="text-xs" x-text="factor.factor_key"></td>
+                          <td class="text-xs"><div class="sales-line-clamp" x-text="factor.factor_value || '-'"></div></td>
+                          <td class="text-xs" x-text="factor.source || '-'"></td>
+                          <td class="text-xs" x-text="(factor.effective_from || '-') + ' -> ' + (factor.effective_until || '-')"></td>
+                        </tr>
+                      </template>
+                    </tbody>
+                  </table>
+                </div>
+                <div class="sales-empty" x-show="contextFactors.length === 0">
+                  <p>Kayitli context factor yok.</p>
+                </div>
+                <div class="sales-panel-section sales-panel-section--inner" x-show="calibrationProposals.length > 0" style="margin-top:14px">
+                  <div class="sales-panel-header">
+                    <h3>Son calibration ciktisi</h3>
+                    <span class="badge badge-info" x-text="calibrationProposals.length + ' oneri'"></span>
+                  </div>
+                  <div class="sales-signal-list">
+                    <template x-for="item in calibrationProposals" :key="item">
+                      <div class="sales-signal-item">
+                        <div class="text-sm" x-text="item"></div>
+                      </div>
+                    </template>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="sales-panel-section" x-show="activeTab === 'ops' && !isB2C">
+            <div class="sales-panel-header">
+              <h3>Experiment lab</h3>
+              <span class="badge badge-info" x-text="experiments.length + ' toplam experiment'"></span>
+            </div>
+
+            <div class="sales-panel-section sales-panel-section--inner">
+              <div class="sales-panel-header">
+                <h3>Yeni experiment</h3>
+              </div>
+              <div class="sales-form-grid">
+                <div class="form-group">
+                  <label>Experiment name</label>
+                  <input class="form-input" x-model="experimentForm.name" placeholder="Reply hook test / April W15">
+                </div>
+                <div class="form-group">
+                  <label>Hypothesis</label>
+                  <input class="form-input" x-model="experimentForm.hypothesis" placeholder="Neyi test ediyorsunuz?">
+                </div>
+                <div class="form-group">
+                  <label>Variant A</label>
+                  <input class="form-input" x-model="experimentForm.variant_a" placeholder="control">
+                </div>
+                <div class="form-group">
+                  <label>Variant B</label>
+                  <input class="form-input" x-model="experimentForm.variant_b" placeholder="treatment">
+                </div>
+              </div>
+              <button class="btn btn-primary btn-sm" @click="createExperiment()" :disabled="creatingExperiment">
+                <span x-show="!creatingExperiment">Experiment ac</span>
+                <span x-show="creatingExperiment">Olusturuluyor...</span>
+              </button>
+            </div>
+
+            <div class="sales-dossier-grid" style="margin-top:14px">
+              <div class="sales-panel-section sales-panel-section--inner">
+                <div class="sales-panel-header">
+                  <h3>Experiment listesi</h3>
+                </div>
+                <div class="table-wrap" x-show="experiments.length > 0">
+                  <table>
+                    <thead><tr><th>Name</th><th>Status</th><th>Hypothesis</th><th>Created</th><th></th></tr></thead>
+                    <tbody>
+                      <template x-for="exp in experiments" :key="exp.id">
+                        <tr>
+                          <td class="text-xs">
+                            <div class="font-bold" x-text="exp.name"></div>
+                            <div class="text-dim" x-text="(exp.variant_a || 'A') + ' vs ' + (exp.variant_b || 'B')"></div>
+                          </td>
+                          <td><span class="badge" :class="experimentStatusClass(exp.status)" x-text="exp.status"></span></td>
+                          <td class="text-xs"><div class="sales-line-clamp" x-text="exp.hypothesis || '-'"></div></td>
+                          <td class="text-xs" x-text="formatDateTime(exp.created_at)"></td>
+                          <td><button class="btn btn-ghost btn-sm" @click="loadExperimentResults(exp.id)">Results</button></td>
+                        </tr>
+                      </template>
+                    </tbody>
+                  </table>
+                </div>
+                <div class="sales-empty" x-show="experiments.length === 0">
+                  <p>Henuz experiment yok.</p>
+                </div>
+              </div>
+
+              <div class="sales-panel-section sales-panel-section--inner">
+                <div class="sales-panel-header">
+                  <h3>Selected experiment</h3>
+                  <span class="badge badge-muted" x-text="selectedExperimentRecord ? selectedExperimentRecord.name : '-'"></span>
+                </div>
+                <div class="sales-empty" x-show="!selectedExperimentRecord">
+                  <p>Sonuc gormek icin bir experiment secin.</p>
+                </div>
+                <template x-if="selectedExperimentRecord">
+                  <div>
+                    <div class="text-sm" style="margin-bottom:10px" x-text="selectedExperimentRecord.hypothesis || 'Hipotez notu yok.'"></div>
+                    <div class="sales-score-grid" x-show="experimentVariantRows().length > 0">
+                      <template x-for="row in experimentVariantRows()" :key="row.variant">
+                        <div class="sales-score-card">
+                          <div class="sales-score-meta">
+                            <span x-text="'Variant ' + String(row.variant || '-').toUpperCase()"></span>
+                            <strong x-text="asPercent(row.positive_rate || 0)"></strong>
+                          </div>
+                          <div class="sales-score-track">
+                            <div class="sales-score-fill is-good" :style="'width:' + String(Math.round(Number(row.positive_rate || 0) * 100)) + '%'"></div>
+                          </div>
+                          <div class="text-xs text-dim" style="margin-top:8px" x-text="String(row.sequences || 0) + ' sequence / ' + String(row.total_outcomes || 0) + ' outcome'"></div>
+                          <div class="text-xs text-dim" x-text="'Positive ' + String(row.positive_outcomes || 0) + ' | Negative ' + String(row.negative_outcomes || 0)"></div>
+                        </div>
+                      </template>
+                    </div>
+                    <div class="sales-empty" x-show="experimentVariantRows().length === 0">
+                      <p>Bu experiment icin outcome verisi henuz yok.</p>
+                    </div>
+                  </div>
+                </template>
+              </div>
+            </div>
+          </section>

@@ -1,5 +1,14 @@
 'use strict';
 
+function defaultExperimentForm() {
+  return {
+    name: '',
+    hypothesis: '',
+    variant_a: 'control',
+    variant_b: 'treatment'
+  };
+}
+
 export function createSalesState() {
   return {
     loading: true,
@@ -20,6 +29,20 @@ export function createSalesState() {
     approvalDrafts: {},
     approvalEditorId: '',
     approvalCursorId: '',
+    policyProposals: [],
+    contextFactors: [],
+    contextSummary: {
+      bad_timing_today: false,
+      current_budget_quarter: ''
+    },
+    calibrationProposals: [],
+    calibrating: false,
+    advancingSequences: false,
+    experiments: [],
+    selectedExperimentId: '',
+    experimentResults: null,
+    creatingExperiment: false,
+    experimentForm: defaultExperimentForm(),
 
     profileBrief: '',
     profile: {
@@ -154,6 +177,7 @@ export const salesStateMixins = {
       if (!this.isB2C) {
         items.push({ key: 'approvals', label: 'Approval Queue' });
         items.push({ key: 'deliveries', label: 'Delivery' });
+        items.push({ key: 'ops', label: 'Ops Lab' });
       }
       return items;
     },
@@ -287,6 +311,32 @@ export const salesStateMixins = {
       return prospect ? prospect.company : this.selectedEntityLabel;
     },
 
+    get proposedPolicyCount() {
+      var items = this.policyProposals || [];
+      var count = 0;
+      for (var i = 0; i < items.length; i++) {
+        if (items[i] && items[i].status === 'proposed') count += 1;
+      }
+      return count;
+    },
+
+    get activeExperimentCount() {
+      var items = this.experiments || [];
+      var count = 0;
+      for (var i = 0; i < items.length; i++) {
+        if (items[i] && items[i].status === 'active') count += 1;
+      }
+      return count;
+    },
+
+    get selectedExperimentRecord() {
+      var items = this.experiments || [];
+      for (var i = 0; i < items.length; i++) {
+        if (items[i] && items[i].id === this.selectedExperimentId) return items[i];
+      }
+      return items.length ? items[0] : null;
+    },
+
     selectedProspectRecord() {
       var pools = [this.runProspects, this.prospects];
       for (var i = 0; i < pools.length; i++) {
@@ -325,5 +375,9 @@ export const salesStateMixins = {
         schedule_hour_local: Number(src.schedule_hour_local || defaults.schedule_hour_local),
         timezone_mode: src.timezone_mode || defaults.timezone_mode
       };
+    },
+
+    defaultExperimentForm() {
+      return defaultExperimentForm();
     },
 };

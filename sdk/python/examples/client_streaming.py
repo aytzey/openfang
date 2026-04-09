@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Streaming example — stream agent responses token by token.
+Active job polling example — monitor the currently running B2C job.
 
 Usage:
     python client_streaming.py
@@ -12,22 +12,19 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from pulsivo_salesman_client import PulsivoSalesman
 
-client = PulsivoSalesman("http://localhost:3000")
+client = PulsivoSalesman("http://localhost:4200")
 
-# Create an agent
-agent = client.agents.create(template="assistant")
-print(f"Agent: {agent['id']}")
+active = client.sales.get_active_job("b2c")
+job = active.get("job")
+if not job:
+    print("No active B2C job.")
+    raise SystemExit(0)
 
-# Stream the response
-print("\n--- Streaming response ---")
-for event in client.agents.stream(agent["id"], "Tell me a short story about a robot."):
-    event_type = event.get("type", "")
-    if event_type == "text_delta" and event.get("delta"):
-        print(event["delta"], end="", flush=True)
-    elif event_type == "tool_call":
-        print(f"\n[Tool call: {event.get('tool')}]")
-    elif event_type == "done":
-        print("\n--- Done ---")
+job_id = job.get("job_id") or job.get("id")
+print(f"Polling job: {job_id}")
 
-# Clean up
-client.agents.delete(agent["id"])
+for _ in range(10):
+    progress = client.sales.get_job(job_id)
+    print(progress)
+    if progress.get("status") and progress.get("status") != "running":
+        break

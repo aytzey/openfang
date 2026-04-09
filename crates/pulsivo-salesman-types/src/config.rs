@@ -320,7 +320,7 @@ impl Default for KernelConfig {
             home_dir: home_dir.clone(),
             data_dir: home_dir.join("data"),
             log_level: "info".to_string(),
-            api_listen: "127.0.0.1:50051".to_string(),
+            api_listen: "127.0.0.1:4200".to_string(),
             api_key: String::new(),
             default_model: DefaultModelConfig::default(),
             memory: MemoryConfig::default(),
@@ -456,7 +456,7 @@ mod tests {
     fn test_default_config() {
         let config = KernelConfig::default();
         assert_eq!(config.log_level, "info");
-        assert_eq!(config.api_listen, "127.0.0.1:50051");
+        assert_eq!(config.api_listen, "127.0.0.1:4200");
         assert!(config.channels.email.is_none());
     }
 

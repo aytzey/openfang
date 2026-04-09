@@ -1,7 +1,7 @@
 {
   "name": "@pulsivo-salesman/whatsapp-gateway",
   "version": "0.1.0",
-  "description": "WhatsApp Web gateway for Pulsivo Salesman — QR code login, bidirectional messaging via Baileys",
+  "description": "WhatsApp Web gateway for Pulsivo Salesman — QR code login, outbound messaging, and inbound inbox capture via Baileys",
   "bin": {
     "pulsivo-salesman-whatsapp-gateway": "./index.js"
   },

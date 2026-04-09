@@ -31,6 +31,9 @@ export const salesDataMixins = {
           self.runLeads = [];
           self.approvals = [];
           self.deliveries = [];
+          if (typeof self.resetOpsState === 'function') {
+            self.resetOpsState();
+          }
           self.refreshAll();
         }
       });
@@ -62,11 +65,15 @@ export const salesDataMixins = {
           tasks.push(this.loadLeads());
           tasks.push(this.loadApprovals());
           tasks.push(this.loadDeliveries());
+          tasks.push(this.loadOpsData());
         } else {
           this.leads = [];
           this.approvals = [];
           this.deliveries = [];
           this.selectedDossier = null;
+          if (typeof this.resetOpsState === 'function') {
+            this.resetOpsState();
+          }
         }
         await Promise.all(tasks);
         await this.restoreJobProgress();
@@ -305,14 +312,14 @@ export const salesDataMixins = {
     },
 
     async loadApprovals() {
-      var data = await PulsivoSalesmanAPI.get('/api/sales/approvals?limit=200');
+      var data = await PulsivoSalesmanAPI.get(this.buildSalesUrl('/api/sales/approvals', { limit: 200 }));
       this.approvals = data.approvals || [];
       this.pruneApprovalState();
       this.syncApprovalCursor();
     },
 
     async loadDeliveries() {
-      var data = await PulsivoSalesmanAPI.get('/api/sales/deliveries?limit=200');
+      var data = await PulsivoSalesmanAPI.get(this.buildSalesUrl('/api/sales/deliveries', { limit: 200 }));
       this.deliveries = data.deliveries || [];
     },
 
@@ -328,8 +335,8 @@ export const salesDataMixins = {
     syncTabFromHash() {
       var raw = (window.location.hash || '').replace('#', '').trim().toLowerCase();
       var key = raw.split('/')[1] || 'command';
-      if (['command', 'market', 'profiles', 'approvals', 'deliveries'].indexOf(key) >= 0) {
-        if (this.isB2C && (key === 'approvals' || key === 'deliveries')) {
+      if (['command', 'market', 'profiles', 'approvals', 'deliveries', 'ops'].indexOf(key) >= 0) {
+        if (this.isB2C && (key === 'approvals' || key === 'deliveries' || key === 'ops')) {
           this.activeTab = 'profiles';
           return;
         }
@@ -342,8 +349,8 @@ export const salesDataMixins = {
     },
 
     setTab(tab) {
-      if (['command', 'market', 'profiles', 'approvals', 'deliveries'].indexOf(tab) === -1) return;
-      if (this.isB2C && (tab === 'approvals' || tab === 'deliveries')) return;
+      if (['command', 'market', 'profiles', 'approvals', 'deliveries', 'ops'].indexOf(tab) === -1) return;
+      if (this.isB2C && (tab === 'approvals' || tab === 'deliveries' || tab === 'ops')) return;
       if (!this.isB2C && tab === 'market') return;
       this.activeTab = tab;
       if (window.location.hash !== this.tabHash(tab)) {

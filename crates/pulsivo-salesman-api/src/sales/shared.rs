@@ -867,6 +867,8 @@ pub struct SalesApprovalQuery {
     pub status: Option<String>,
     #[serde(default)]
     pub limit: Option<usize>,
+    #[serde(default)]
+    pub segment: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

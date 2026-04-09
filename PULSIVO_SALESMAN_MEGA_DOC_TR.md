@@ -132,7 +132,7 @@ pulsivo-salesman-types           (sifir bagimllik, temel tipler)
     |               |
     |               +-- pulsivo-salesman-api     (HTTP sunucusu, tum route'lar)
     |                       |
-    |                       +-- pulsivo-salesman-cli      (komut satiri araci)
+    |                       +-- pulsivo-salesman          (daemon launcher CLI)
     |                       +-- pulsivo-salesman-desktop  (Tauri 2.0 masaustu uygulama)
     |
     +-- xtask                (derleme otomasyon gorevleri)
@@ -148,7 +148,7 @@ pulsivo-salesman-types           (sifir bagimllik, temel tipler)
 | **pulsivo-salesman-wire** | `crates/pulsivo-salesman-wire/` | OFP mesh ag protokolu: TCP + JSON-RPC + HMAC-SHA256 dogrulama |
 | **pulsivo-salesman-kernel** | `crates/pulsivo-salesman-kernel/` | Cekirdek: agent kayit defteri, zamanlayici, is akisi, olay yolu, onay |
 | **pulsivo-salesman-api** | `crates/pulsivo-salesman-api/` | Axum HTTP sunucusu (150+ endpoint), WebSocket, SSE, Dashboard |
-| **pulsivo-salesman-cli** | `crates/pulsivo-salesman-cli/` | Komut satiri araci + TUI panosu (ratatui) |
+| **pulsivo-salesman** | `crates/pulsivo-salesman/` | Ince daemon launcher CLI (`init`, `start`, `status`) |
 | **pulsivo-salesman-channels** | `crates/pulsivo-salesman-channels/` | 40 mesajlasma platformu adaptoru |
 | **pulsivo-salesman-skills** | `crates/pulsivo-salesman-skills/` | Beceri sistemi: Python/WASM/Node.js/Dahili/PromptOnly |
 | **pulsivo-salesman-hands** | `crates/pulsivo-salesman-hands/` | Otonom alan-uzman agent paketleri |

@@ -405,7 +405,7 @@ pub async fn retry_sales_job(
             )
         }
     };
-    let resume_stage = if body.force_fresh {
+    let previous_checkpoint_stage = if body.force_fresh {
         None
     } else {
         engine
@@ -443,7 +443,8 @@ pub async fn retry_sales_job(
         Json(serde_json::json!({
             "job_id": new_job_id,
             "status": "running",
-            "resumed_from_stage": resume_stage,
+            "resumed_from_stage": serde_json::Value::Null,
+            "previous_checkpoint_stage": previous_checkpoint_stage,
             "replayed_from_scratch": true
         })),
     )
@@ -926,7 +927,7 @@ pub async fn list_sales_leads(
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).min(500);
     let _ = engine.recover_latest_timed_out_run_if_stale(segment, SALES_RUN_RECOVERY_STALE_SECS);
 
-    match engine.list_leads(limit, q.run_id.as_deref()) {
+    match engine.list_leads(segment, limit, q.run_id.as_deref()) {
         Ok(leads) => (
             StatusCode::OK,
             Json(serde_json::json!({"leads": leads, "total": leads.len()})),
@@ -971,6 +972,7 @@ pub async fn list_sales_approvals(
     State(state): State<Arc<AppState>>,
     Query(q): Query<SalesApprovalQuery>,
 ) -> impl IntoResponse {
+    let segment = q.segment.as_deref().map(|value| sales_segment_from_query(Some(value)));
     let engine = match engine_from_state(&state) {
         Ok(e) => e,
         Err(e) => {
@@ -982,7 +984,7 @@ pub async fn list_sales_approvals(
     };
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).min(500);
 
-    match engine.list_approvals(q.status.as_deref(), limit) {
+    match engine.list_approvals(segment, q.status.as_deref(), limit) {
         Ok(items) => (
             StatusCode::OK,
             Json(serde_json::json!({"approvals": items, "total": items.len()})),
@@ -1152,6 +1154,7 @@ pub async fn list_sales_deliveries(
     State(state): State<Arc<AppState>>,
     Query(q): Query<SalesLeadQuery>,
 ) -> impl IntoResponse {
+    let segment = q.segment.as_deref().map(|value| sales_segment_from_query(Some(value)));
     let engine = match engine_from_state(&state) {
         Ok(e) => e,
         Err(e) => {
@@ -1163,7 +1166,7 @@ pub async fn list_sales_deliveries(
     };
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).min(500);
 
-    match engine.list_deliveries(limit) {
+    match engine.list_deliveries(segment, limit) {
         Ok(items) => (
             StatusCode::OK,
             Json(serde_json::json!({"deliveries": items, "total": items.len()})),
@@ -1187,36 +1190,41 @@ pub fn spawn_sales_scheduler(kernel: Arc<pulsivo_salesman_kernel::PulsivoSalesma
                 continue;
             }
 
-            let profile = match engine.get_profile(SalesSegment::B2B) {
-                Ok(Some(p)) => p,
-                Ok(None) => continue,
-                Err(e) => {
-                    warn!(error = %e, "Sales scheduler: profile read failed");
+            for segment in [SalesSegment::B2B, SalesSegment::B2C] {
+                let profile = match engine.get_profile(segment) {
+                    Ok(Some(p)) => p,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        warn!(error = %e, segment = %segment.as_str(), "Sales scheduler: profile read failed");
+                        continue;
+                    }
+                };
+
+                let now = Local::now();
+                if now.hour() as u8 != profile.schedule_hour_local || now.minute() > 10 {
                     continue;
                 }
-            };
 
-            let now = Local::now();
-            if now.hour() as u8 != profile.schedule_hour_local || now.minute() > 10 {
-                continue;
-            }
-
-            match engine.already_ran_today(&profile.timezone_mode) {
-                Ok(true) => continue,
-                Ok(false) => {}
-                Err(e) => {
-                    warn!(error = %e, "Sales scheduler: run-day check failed");
-                    continue;
+                match engine.already_ran_today(segment, &profile.timezone_mode) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(e) => {
+                        warn!(error = %e, segment = %segment.as_str(), "Sales scheduler: run-day check failed");
+                        continue;
+                    }
                 }
-            }
 
-            info!("Sales scheduler: triggering daily run");
-            match tokio::time::timeout(Duration::from_secs(120), engine.run_generation(&kernel))
+                info!(segment = %segment.as_str(), "Sales scheduler: triggering daily run");
+                match tokio::time::timeout(
+                    Duration::from_secs(120),
+                    engine.run_generation_with_job(&kernel, None, segment),
+                )
                 .await
-            {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => error!(error = %e, "Sales scheduler: run failed"),
-                Err(_) => error!("Sales scheduler: run timed out"),
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => error!(error = %e, segment = %segment.as_str(), "Sales scheduler: run failed"),
+                    Err(_) => error!(segment = %segment.as_str(), "Sales scheduler: run timed out"),
+                }
             }
         }
     });

@@ -4,6 +4,7 @@
           <div class="sales-section-header">
             <h2 x-text="modeLabel"></h2>
             <div class="sales-btn-row">
+              <button class="btn btn-ghost btn-sm" @click="setTab('ops')" x-show="!isB2C">Ops Lab</button>
               <button class="btn btn-primary btn-sm" @click="runNow()" :disabled="runningNow">
                 <span x-show="!runningNow" x-text="runActionLabel"></span>
                 <span x-show="runningNow">Calisiyor...</span>
@@ -42,6 +43,18 @@
             <div class="sales-stat-card" x-show="!isB2C">
               <div class="sales-stat-label">Teslimat</div>
               <div class="sales-stat-value" x-text="deliveries.length"></div>
+            </div>
+            <div class="sales-stat-card" x-show="!isB2C">
+              <div class="sales-stat-label">Policy onerisi</div>
+              <div class="sales-stat-value" :style="proposedPolicyCount > 0 ? 'color:var(--warning)' : ''" x-text="proposedPolicyCount"></div>
+            </div>
+            <div class="sales-stat-card" x-show="!isB2C">
+              <div class="sales-stat-label">Aktif experiment</div>
+              <div class="sales-stat-value" x-text="activeExperimentCount"></div>
+            </div>
+            <div class="sales-stat-card" x-show="!isB2C">
+              <div class="sales-stat-label">Timing</div>
+              <div class="sales-stat-value" style="font-size:18px" x-text="contextSummary.bad_timing_today ? 'Caution' : 'Clear'"></div>
             </div>
             <div class="sales-stat-card">
               <div class="sales-stat-label">Aktif job</div>

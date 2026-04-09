@@ -70,7 +70,7 @@ export function createApp() {
 
     async pollStatus() {
       try {
-        await PulsivoSalesmanAPI.get('/api/status');
+        await PulsivoSalesmanAPI.get('/api/health');
         this.connected = true;
         this.lastError = '';
       } catch (e) {

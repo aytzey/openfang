@@ -72,6 +72,7 @@ const WEBCHAT_HTML: &str = concat!(
     include_str!("../static/html/sales_onboarding.html"),
     include_str!("../static/html/sales_command.html"),
     include_str!("../static/html/sales_market_b2c.html"),
+    include_str!("../static/html/sales_ops.html"),
     include_str!("../static/html/sales_runs.html"),
     include_str!("../static/html/sales_profiles_shared.html"),
     include_str!("../static/html/sales_profiles_b2b.html"),

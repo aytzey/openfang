@@ -954,7 +954,7 @@ mod tests {
         .expect("insert valid approval");
 
         let approvals = engine
-            .list_approvals(Some("pending"), 10)
+            .list_approvals(None, Some("pending"), 10)
             .expect("list approvals");
         assert_eq!(approvals.len(), 1);
         assert_eq!(approvals[0].id, "approval-good");
@@ -1001,7 +1001,7 @@ mod tests {
         );
 
         let approval = engine
-            .list_approvals(Some("pending"), 10)
+            .list_approvals(None, Some("pending"), 10)
             .expect("list approvals")
             .into_iter()
             .find(|item| item.channel == "email")
@@ -1045,6 +1045,177 @@ mod tests {
                 .get("subject")
                 .and_then(|value| value.as_str()),
             Some("Updated subject")
+        );
+    }
+
+    #[test]
+    fn list_leads_filters_by_segment() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let engine = SalesEngine::new(temp.path());
+        engine.init().expect("init");
+
+        let b2b_run = engine.begin_run(SalesSegment::B2B).expect("b2b run");
+        let b2c_run = engine.begin_run(SalesSegment::B2C).expect("b2c run");
+
+        let b2b_lead = SalesLead {
+            id: "lead-b2b".to_string(),
+            run_id: b2b_run.clone(),
+            company: "Machinity".to_string(),
+            website: "https://machinity.ai".to_string(),
+            company_domain: "machinity.ai".to_string(),
+            contact_name: "Aylin Demir".to_string(),
+            contact_title: "CEO".to_string(),
+            linkedin_url: None,
+            email: Some("aylin@machinity.ai".to_string()),
+            phone: None,
+            reasons: vec!["b2b".to_string()],
+            email_subject: "Subject".to_string(),
+            email_body: "Body".to_string(),
+            linkedin_message: "LinkedIn".to_string(),
+            score: 90,
+            status: "draft_ready".to_string(),
+            created_at: "2026-03-26T10:00:00Z".to_string(),
+        };
+        let b2c_lead = SalesLead {
+            id: "lead-b2c".to_string(),
+            run_id: b2c_run.clone(),
+            company: "Local Fitness".to_string(),
+            website: "https://localfitness.example".to_string(),
+            company_domain: "localfitness.example".to_string(),
+            contact_name: "Merve Kaya".to_string(),
+            contact_title: "Founder".to_string(),
+            linkedin_url: None,
+            email: Some("merve@localfitness.example".to_string()),
+            phone: None,
+            reasons: vec!["b2c".to_string()],
+            email_subject: "Subject".to_string(),
+            email_body: "Body".to_string(),
+            linkedin_message: "LinkedIn".to_string(),
+            score: 88,
+            status: "draft_ready".to_string(),
+            created_at: "2026-03-26T11:00:00Z".to_string(),
+        };
+        assert!(engine.insert_lead(&b2b_lead).expect("insert b2b lead"));
+        assert!(engine.insert_lead(&b2c_lead).expect("insert b2c lead"));
+
+        let b2b_only = engine
+            .list_leads(SalesSegment::B2B, 10, None)
+            .expect("list b2b leads");
+        let b2c_only = engine
+            .list_leads(SalesSegment::B2C, 10, None)
+            .expect("list b2c leads");
+
+        assert_eq!(b2b_only.len(), 1);
+        assert_eq!(b2b_only[0].id, "lead-b2b");
+        assert_eq!(b2c_only.len(), 1);
+        assert_eq!(b2c_only[0].id, "lead-b2c");
+        assert!(engine
+            .list_leads(SalesSegment::B2B, 10, Some(&b2c_run))
+            .expect("cross-segment run filter")
+            .is_empty());
+    }
+
+    #[test]
+    fn segment_scoped_approvals_and_deliveries_ignore_other_segment() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let engine = SalesEngine::new(temp.path());
+        engine.init().expect("init");
+
+        let b2b_run = engine.begin_run(SalesSegment::B2B).expect("b2b run");
+        let b2c_run = engine.begin_run(SalesSegment::B2C).expect("b2c run");
+
+        let b2b_lead = SalesLead {
+            id: "lead-b2b".to_string(),
+            run_id: b2b_run,
+            company: "Machinity".to_string(),
+            website: "https://machinity.ai".to_string(),
+            company_domain: "machinity.ai".to_string(),
+            contact_name: "Aylin Demir".to_string(),
+            contact_title: "CEO".to_string(),
+            linkedin_url: None,
+            email: Some("aylin@machinity.ai".to_string()),
+            phone: None,
+            reasons: vec!["b2b".to_string()],
+            email_subject: "Subject".to_string(),
+            email_body: "Body".to_string(),
+            linkedin_message: "LinkedIn".to_string(),
+            score: 90,
+            status: "draft_ready".to_string(),
+            created_at: "2026-03-26T10:00:00Z".to_string(),
+        };
+        let b2c_lead = SalesLead {
+            id: "lead-b2c".to_string(),
+            run_id: b2c_run,
+            company: "Local Fitness".to_string(),
+            website: "https://localfitness.example".to_string(),
+            company_domain: "localfitness.example".to_string(),
+            contact_name: "Merve Kaya".to_string(),
+            contact_title: "Founder".to_string(),
+            linkedin_url: None,
+            email: Some("merve@localfitness.example".to_string()),
+            phone: None,
+            reasons: vec!["b2c".to_string()],
+            email_subject: "Subject".to_string(),
+            email_body: "Body".to_string(),
+            linkedin_message: "LinkedIn".to_string(),
+            score: 88,
+            status: "draft_ready".to_string(),
+            created_at: "2026-03-26T11:00:00Z".to_string(),
+        };
+        assert!(engine.insert_lead(&b2b_lead).expect("insert b2b lead"));
+        assert!(engine.insert_lead(&b2c_lead).expect("insert b2c lead"));
+
+        let conn = engine.open().expect("open");
+        conn.execute(
+            "INSERT INTO approvals (id, lead_id, channel, payload_json, status, created_at) VALUES (?1, ?2, 'email', ?3, 'pending', ?4)",
+            params![
+                "approval-b2b",
+                b2b_lead.id,
+                serde_json::json!({"to":"aylin@machinity.ai","subject":"Subject","body":"Body"}).to_string(),
+                Utc::now().to_rfc3339()
+            ],
+        )
+        .expect("insert b2b approval");
+        conn.execute(
+            "INSERT INTO approvals (id, lead_id, channel, payload_json, status, created_at) VALUES (?1, ?2, 'email', ?3, 'pending', ?4)",
+            params![
+                "approval-b2c",
+                b2c_lead.id,
+                serde_json::json!({"to":"merve@localfitness.example","subject":"Subject","body":"Body"}).to_string(),
+                Utc::now().to_rfc3339()
+            ],
+        )
+        .expect("insert b2c approval");
+
+        let b2c_approvals = engine
+            .list_approvals(Some(SalesSegment::B2C), Some("pending"), 10)
+            .expect("list b2c approvals");
+        assert_eq!(b2c_approvals.len(), 1);
+        assert_eq!(b2c_approvals[0].id, "approval-b2c");
+
+        engine
+            .record_delivery("approval-b2b", "email", "aylin@machinity.ai", "sent", None)
+            .expect("record b2b delivery");
+        engine
+            .record_delivery(
+                "approval-b2c",
+                "email",
+                "merve@localfitness.example",
+                "sent",
+                None,
+            )
+            .expect("record b2c delivery");
+
+        let b2c_deliveries = engine
+            .list_deliveries(Some(SalesSegment::B2C), 10)
+            .expect("list b2c deliveries");
+        assert_eq!(b2c_deliveries.len(), 1);
+        assert_eq!(b2c_deliveries[0].approval_id, "approval-b2c");
+        assert_eq!(
+            engine
+                .deliveries_today(SalesSegment::B2C, "utc")
+                .expect("b2c deliveries today"),
+            1
         );
     }
 

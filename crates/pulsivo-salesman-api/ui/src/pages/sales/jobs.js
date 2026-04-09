@@ -32,7 +32,12 @@ export const salesJobMixins = {
               self.loadOnboardingStatus()
             ]);
             if (!self.isB2C) {
-              await Promise.all([self.loadLeads(), self.loadApprovals(), self.loadDeliveries()]);
+              await Promise.all([
+                self.loadLeads(),
+                self.loadApprovals(),
+                self.loadDeliveries(),
+                self.loadOpsData()
+              ]);
             }
             var latestRun = self.runs.length ? self.runs[0] : null;
             if (latestRun && latestRun.id) {
@@ -183,7 +188,8 @@ export const salesJobMixins = {
           stages: []
         };
         this.startJobPolling(jobId);
-        PulsivoSalesmanToast.success('Job retry baslatildi');
+        var checkpoint = data && data.previous_checkpoint_stage ? ('Son checkpoint: ' + data.previous_checkpoint_stage) : '';
+        PulsivoSalesmanToast.success(checkpoint ? ('Job retry baslatildi. ' + checkpoint) : 'Job retry baslatildi');
       } catch (e) {
         PulsivoSalesmanToast.error(e && e.message ? e.message : 'Retry baslatilamadi');
       }

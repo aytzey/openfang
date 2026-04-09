@@ -272,8 +272,10 @@ fn convert_tools(request: &CompletionRequest) -> Vec<GeminiToolConfig> {
         .iter()
         .map(|t| {
             // Normalize schema for Gemini (strips $schema, flattens anyOf)
-            let normalized =
-                pulsivo_salesman_types::tool::normalize_schema_for_provider(&t.input_schema, "gemini");
+            let normalized = pulsivo_salesman_types::tool::normalize_schema_for_provider(
+                &t.input_schema,
+                "gemini",
+            );
             GeminiFunctionDeclaration {
                 name: t.name.clone(),
                 description: t.description.clone(),

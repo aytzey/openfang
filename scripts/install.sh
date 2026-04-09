@@ -31,7 +31,7 @@ detect_platform() {
             echo "    https://github.com/$REPO/releases/latest"
             echo ""
             echo "  Or install via cargo:"
-            echo "    cargo install --git https://github.com/$REPO pulsivo-salesman-cli"
+            echo "    cargo install --git https://github.com/$REPO pulsivo-salesman"
             exit 1
             ;;
         *) echo "  Unsupported OS: $OS"; exit 1 ;;
@@ -58,7 +58,7 @@ install() {
     if [ -z "$VERSION" ]; then
         echo "  Could not determine latest version."
         echo "  Install from source instead:"
-        echo "    cargo install --git https://github.com/$REPO pulsivo-salesman-cli"
+        echo "    cargo install --git https://github.com/$REPO pulsivo-salesman"
         exit 1
     fi
 
@@ -79,7 +79,7 @@ install() {
     if ! curl -fsSL "$URL" -o "$ARCHIVE" 2>/dev/null; then
         echo "  Download failed. The release may not exist for your platform."
         echo "  Install from source instead:"
-        echo "    cargo install --git https://github.com/$REPO pulsivo-salesman-cli"
+        echo "    cargo install --git https://github.com/$REPO pulsivo-salesman"
         exit 1
     fi
 

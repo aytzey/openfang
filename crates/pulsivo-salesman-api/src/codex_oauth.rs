@@ -763,10 +763,32 @@ pub(crate) async fn refresh_auth_if_possible(
     }
 }
 
+fn auth_is_expired_or_expiring_soon(auth: &StoredCodexAuth, window_secs: i64) -> bool {
+    auth.expires_at
+        .map(|exp| exp <= Utc::now() + ChronoDuration::seconds(window_secs))
+        .unwrap_or(false)
+}
+
 async fn ensure_access_token_for_auth(
     auth: &mut StoredCodexAuth,
     fallback_client_id: &str,
 ) -> Result<(), String> {
+    if auth.access_token.trim().is_empty() || auth_is_expired_or_expiring_soon(auth, 60) {
+        let _ = refresh_auth_if_possible(auth, fallback_client_id).await;
+    }
+
+    if auth.access_token.trim().is_empty() {
+        return Err("OAuth access token is missing. Reconnect from Sales > Connect OAuth.".to_string());
+    }
+
+    if auth_is_expired_or_expiring_soon(auth, 0) {
+        return Err(if auth.refresh_token.is_some() {
+            "OAuth access token expired and refresh failed. Reconnect from Sales > Connect OAuth.".to_string()
+        } else {
+            "OAuth access token expired and no refresh token is available. Reconnect from Sales > Connect OAuth.".to_string()
+        });
+    }
+
     if !auth.access_token.trim().is_empty() {
         if auth.chatgpt_account_id.is_none() {
             auth.chatgpt_account_id = auth_account_id(auth);
@@ -781,19 +803,6 @@ async fn ensure_access_token_for_auth(
             if auth.chatgpt_account_id.is_none() {
                 return Err(missing_org_context_error());
             }
-        }
-        return Ok(());
-    }
-
-    if refresh_auth_if_possible(auth, fallback_client_id).await
-        && !auth.access_token.trim().is_empty()
-    {
-        if auth.chatgpt_account_id.is_none() {
-            auth.chatgpt_account_id = auth_account_id(auth);
-        }
-        hydrate_scope_from_tokens(auth);
-        if auth.chatgpt_account_id.is_none() {
-            return Err(missing_org_context_error());
         }
         return Ok(());
     }
@@ -1157,27 +1166,18 @@ pub async fn codex_oauth_paste_code(
 ) -> impl IntoResponse {
     cleanup_stale_pkce();
 
-    let pending = if let Some(ref st) = body.state {
-        PENDING_PKCE
-            .remove(st)
-            .map(|(_, p)| p)
-            .ok_or_else(|| "Unknown or expired state".to_string())
-    } else {
-        let mut latest: Option<(String, PendingPkce)> = None;
-        for e in PENDING_PKCE.iter() {
-            let v = e.value().clone();
-            match latest {
-                Some((_, ref cur)) if cur.created_at >= v.created_at => {}
-                _ => latest = Some((e.key().clone(), v)),
-            }
-        }
-        if let Some((key, pending)) = latest {
-            PENDING_PKCE.remove(&key);
-            Ok(pending)
-        } else {
-            Err("No pending PKCE login found".to_string())
-        }
-    };
+    let pending = body
+        .state
+        .as_deref()
+        .map(str::trim)
+        .filter(|state| !state.is_empty())
+        .ok_or_else(|| "Missing or empty OAuth state. Restart Connect OAuth and retry.".to_string())
+        .and_then(|state| {
+            PENDING_PKCE
+                .remove(state)
+                .map(|(_, pending)| pending)
+                .ok_or_else(|| "Unknown or expired state".to_string())
+        });
 
     let pending = match pending {
         Ok(p) => p,
@@ -1268,59 +1268,33 @@ pub async fn codex_oauth_status(State(state): State<Arc<AppState>>) -> impl Into
     let home = state.kernel.home_dir();
     let fallback_client_id =
         std::env::var("OPENAI_OAUTH_CLIENT_ID").unwrap_or_else(|_| DEFAULT_CLIENT_ID.to_string());
+    let cli_auth_available = has_codex_cli_auth(&home);
+
+    if logout_marker_exists(&home) {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "connected": false,
+                "provider": "openai-codex",
+                "model": "gpt-5.3-codex",
+                "source": "logged_out",
+                "cli_auth_available": cli_auth_available,
+            })),
+        );
+    }
 
     let mut auth = match load_stored_auth(&home) {
         Ok(Some(auth)) => auth,
         Ok(None) => {
-            if logout_marker_exists(&home) {
-                clear_codex_auth_from_runtime(&state);
-                return (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "connected": false,
-                        "provider": "openai-codex",
-                        "model": "gpt-5.3-codex",
-                        "source": "logged_out"
-                    })),
-                );
-            }
-            match import_codex_cli_auth(&home) {
-                Ok(mut auth) => {
-                    if let Err(e) =
-                        ensure_access_token_for_auth(&mut auth, &fallback_client_id).await
-                    {
-                        clear_codex_auth_from_runtime(&state);
-                        return (
-                            StatusCode::OK,
-                            Json(serde_json::json!({
-                                "connected": false,
-                                "provider": "openai-codex",
-                                "model": "gpt-5.3-codex",
-                                "reason": e,
-                                "source": auth.source
-                            })),
-                        );
-                    }
-                    auth.chatgpt_account_id = auth_account_id(&auth);
-                    if auth.client_id.is_none() {
-                        auth.client_id = Some(fallback_client_id.clone());
-                    }
-                    if let Err(_e) = save_stored_auth(&home, &auth) {
-                        clear_codex_auth_from_runtime(&state);
-                    }
-                    auth
-                }
-                Err(_) => {
-                    return (
-                        StatusCode::OK,
-                        Json(serde_json::json!({
-                            "connected": false,
-                            "provider": "openai-codex",
-                            "model": "gpt-5.3-codex"
-                        })),
-                    );
-                }
-            }
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "connected": false,
+                    "provider": "openai-codex",
+                    "model": "gpt-5.3-codex",
+                    "cli_auth_available": cli_auth_available,
+                })),
+            );
         }
         Err(e) => {
             return (
@@ -1330,54 +1304,56 @@ pub async fn codex_oauth_status(State(state): State<Arc<AppState>>) -> impl Into
         }
     };
 
+    let reason = if let Err(e) = ensure_access_token_for_auth(&mut auth, &fallback_client_id).await
+    {
+        clear_codex_auth_from_runtime(&state);
+        Some(e)
+    } else {
+        auth.chatgpt_account_id = auth_account_id(&auth);
+        hydrate_scope_from_tokens(&mut auth);
+        if auth.client_id.is_none() {
+            auth.client_id = Some(fallback_client_id);
+        }
+        if let Err(e) = save_stored_auth(&home, &auth) {
+            warn!("Failed to persist Codex OAuth auth during status check: {e}");
+        }
+        apply_codex_auth_to_runtime(&state, &auth);
+        None
+    };
+
     let now = Utc::now();
-    let should_refresh = auth
-        .expires_at
-        .map(|exp| exp <= now + ChronoDuration::seconds(60))
-        .unwrap_or(false)
-        && auth.refresh_token.is_some();
-
-    if should_refresh {
-        let _ = refresh_auth_if_possible(&mut auth, &fallback_client_id).await;
-    }
-
-    if let Err(e) = ensure_access_token_for_auth(&mut auth, &fallback_client_id).await {
-        clear_codex_auth_from_runtime(&state);
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "connected": false,
-                "provider": "openai-codex",
-                "model": "gpt-5.3-codex",
-                "reason": e,
-                "source": auth.source,
-                "issued_at": auth.issued_at.to_rfc3339(),
-                "expires_at": auth.expires_at.map(|d| d.to_rfc3339()),
-                "has_refresh_token": auth.refresh_token.is_some(),
-            })),
-        );
-    }
-
-    auth.chatgpt_account_id = auth_account_id(&auth);
-    if auth.client_id.is_none() {
-        auth.client_id = Some(fallback_client_id);
-    }
-    if let Err(_e) = save_stored_auth(&home, &auth) {
-        clear_codex_auth_from_runtime(&state);
-    }
-
-    apply_codex_auth_to_runtime(&state, &auth);
+    let has_refresh_token = auth.refresh_token.is_some();
+    let expired = auth.expires_at.map(|exp| exp <= now).unwrap_or(false);
+    let needs_refresh = expired && has_refresh_token;
+    let reason = reason.or_else(|| {
+        if auth.access_token.trim().is_empty() {
+            Some("OAuth access token is missing. Reconnect from Sales > Connect OAuth.".to_string())
+        } else if auth.chatgpt_account_id.is_none() {
+            Some(missing_org_context_error())
+        } else {
+            None
+        }
+    });
+    let reason = if reason.is_none() && auth.chatgpt_account_id.is_none() {
+        Some(missing_org_context_error())
+    } else {
+        reason
+    };
+    let connected = reason.is_none();
 
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "connected": true,
+            "connected": connected,
             "provider": "openai-codex",
             "model": "gpt-5.3-codex",
             "source": auth.source,
+            "reason": reason,
             "issued_at": auth.issued_at.to_rfc3339(),
             "expires_at": auth.expires_at.map(|d| d.to_rfc3339()),
-            "has_refresh_token": auth.refresh_token.is_some(),
+            "has_refresh_token": has_refresh_token,
+            "needs_refresh": needs_refresh,
+            "cli_auth_available": cli_auth_available,
         })),
     )
 }
@@ -1398,4 +1374,184 @@ pub async fn codex_oauth_logout(State(state): State<Arc<AppState>>) -> impl Into
         StatusCode::OK,
         Json(serde_json::json!({"status": "logged_out"})),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use pulsivo_salesman_kernel::PulsivoSalesmanKernel;
+    use pulsivo_salesman_types::config::KernelConfig;
+    use std::sync::{LazyLock, Mutex};
+    use std::time::Instant;
+
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct EnvGuard {
+        token: Option<String>,
+        account: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn capture() -> Self {
+            Self {
+                token: std::env::var("OPENAI_CODEX_ACCESS_TOKEN").ok(),
+                account: std::env::var("OPENAI_CODEX_ACCOUNT_ID").ok(),
+            }
+        }
+
+        fn clear() {
+            std::env::remove_var("OPENAI_CODEX_ACCESS_TOKEN");
+            std::env::remove_var("OPENAI_CODEX_ACCOUNT_ID");
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(token) = self.token.as_ref() {
+                std::env::set_var("OPENAI_CODEX_ACCESS_TOKEN", token);
+            } else {
+                std::env::remove_var("OPENAI_CODEX_ACCESS_TOKEN");
+            }
+
+            if let Some(account) = self.account.as_ref() {
+                std::env::set_var("OPENAI_CODEX_ACCOUNT_ID", account);
+            } else {
+                std::env::remove_var("OPENAI_CODEX_ACCOUNT_ID");
+            }
+        }
+    }
+
+    fn fake_jwt(claims: serde_json::Value) -> String {
+        let header = base64_url_encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload = base64_url_encode(claims.to_string().as_bytes());
+        format!("{header}.{payload}.sig")
+    }
+
+    fn test_state(home_dir: &Path) -> Arc<AppState> {
+        let mut config = KernelConfig::default();
+        config.home_dir = home_dir.to_path_buf();
+        config.data_dir = home_dir.join("data");
+        let kernel =
+            Arc::new(PulsivoSalesmanKernel::boot_with_config(config).expect("kernel boot"));
+        Arc::new(AppState {
+            kernel,
+            started_at: Instant::now(),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        })
+    }
+
+    #[tokio::test]
+    async fn status_does_not_import_cli_auth_or_mutate_runtime_env() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::capture();
+        EnvGuard::clear();
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cli_dir = temp.path().join(".codex");
+        std::fs::create_dir_all(&cli_dir).expect("cli dir");
+        std::fs::write(
+            cli_dir.join("auth.json"),
+            serde_json::json!({
+                "access_token": fake_jwt(serde_json::json!({
+                    "https://api.openai.com/auth.chatgpt_account_id": "acct_test",
+                    "scope": "openid profile email offline_access model.request"
+                }))
+            })
+            .to_string(),
+        )
+        .expect("auth.json");
+
+        let state = test_state(temp.path());
+        let response = codex_oauth_status(State(state)).await.into_response();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["connected"], serde_json::Value::Bool(false));
+        assert_eq!(payload["cli_auth_available"], serde_json::Value::Bool(true));
+        assert!(!auth_file(temp.path()).exists());
+        assert!(std::env::var("OPENAI_CODEX_ACCESS_TOKEN").is_err());
+        assert!(std::env::var("OPENAI_CODEX_ACCOUNT_ID").is_err());
+    }
+
+    #[tokio::test]
+    async fn status_marks_expired_stored_auth_disconnected_without_refresh_token() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::capture();
+        EnvGuard::clear();
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = test_state(temp.path());
+        let expired_at = (Utc::now() - ChronoDuration::minutes(5)).to_rfc3339();
+        std::fs::create_dir_all(temp.path().join("auth")).expect("auth dir");
+
+        std::fs::write(
+            auth_file(temp.path()),
+            serde_json::json!({
+                "access_token": fake_jwt(serde_json::json!({
+                    "https://api.openai.com/auth.chatgpt_account_id": "acct_test",
+                    "scope": "openid profile email model.request"
+                })),
+                "token_type": "Bearer",
+                "scope": "openid profile email model.request",
+                "issued_at": Utc::now().to_rfc3339(),
+                "expires_at": expired_at,
+                "source": "stored_auth"
+            })
+            .to_string(),
+        )
+        .expect("stored auth");
+
+        let response = codex_oauth_status(State(state)).await.into_response();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["connected"], serde_json::Value::Bool(false));
+        assert_eq!(
+            payload["reason"],
+            serde_json::Value::String(
+                "OAuth access token expired and no refresh token is available. Reconnect from Sales > Connect OAuth.".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn paste_code_requires_explicit_state() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::capture();
+        EnvGuard::clear();
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = test_state(temp.path());
+        let response = codex_oauth_paste_code(
+            State(state),
+            Json(PasteCodeRequest {
+                code: "example".to_string(),
+                state: None,
+            }),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            payload["error"],
+            serde_json::Value::String(
+                "Missing or empty OAuth state. Restart Connect OAuth and retry.".to_string()
+            )
+        );
+    }
 }

@@ -1,5 +1,5 @@
 /**
- * Streaming example — stream agent responses token by token.
+ * Active job polling example — monitor the currently running B2C job.
  *
  * Usage:
  *   node streaming.js
@@ -8,26 +8,25 @@
 const { PulsivoSalesman } = require("../index");
 
 async function main() {
-  const client = new PulsivoSalesman("http://localhost:3000");
+  const client = new PulsivoSalesman("http://localhost:4200");
 
-  // Create an agent
-  const agent = await client.agents.create({ template: "assistant" });
-  console.log("Agent:", agent.id);
-
-  // Stream the response
-  console.log("\n--- Streaming response ---");
-  for await (const event of client.agents.stream(agent.id, "Tell me a short story about a robot.")) {
-    if (event.type === "text_delta" && event.delta) {
-      process.stdout.write(event.delta);
-    } else if (event.type === "tool_call") {
-      console.log("\n[Tool call:", event.tool, "]");
-    } else if (event.type === "done") {
-      console.log("\n--- Done ---");
-    }
+  const active = await client.sales.getActiveJob("b2c");
+  if (!active.job) {
+    console.log("No active B2C job.");
+    return;
   }
 
-  // Clean up
-  await client.agents.delete(agent.id);
+  const jobId = active.job.job_id || active.job.id;
+  console.log("Polling job:", jobId);
+
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const progress = await client.sales.getJob(jobId);
+    console.log(progress);
+    if (progress.status && progress.status !== "running") {
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
 }
 
 main().catch(console.error);

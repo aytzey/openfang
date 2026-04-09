@@ -279,7 +279,8 @@ pub trait Memory: Send + Sync {
     ) -> crate::error::PulsivoSalesmanResult<()>;
 
     /// Delete a key-value pair for a specific agent.
-    async fn delete(&self, agent_id: AgentId, key: &str) -> crate::error::PulsivoSalesmanResult<()>;
+    async fn delete(&self, agent_id: AgentId, key: &str)
+        -> crate::error::PulsivoSalesmanResult<()>;
 
     // -- Semantic operations --
 
@@ -310,7 +311,8 @@ pub trait Memory: Send + Sync {
     async fn add_entity(&self, entity: Entity) -> crate::error::PulsivoSalesmanResult<String>;
 
     /// Add a relation between entities.
-    async fn add_relation(&self, relation: Relation) -> crate::error::PulsivoSalesmanResult<String>;
+    async fn add_relation(&self, relation: Relation)
+        -> crate::error::PulsivoSalesmanResult<String>;
 
     /// Query the knowledge graph.
     async fn query_graph(

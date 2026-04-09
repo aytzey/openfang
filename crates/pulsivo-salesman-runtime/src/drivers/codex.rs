@@ -137,8 +137,10 @@ impl CodexDriver {
         tools
             .iter()
             .map(|t| {
-                let mut schema =
-                    pulsivo_salesman_types::tool::normalize_schema_for_provider(&t.input_schema, "openai");
+                let mut schema = pulsivo_salesman_types::tool::normalize_schema_for_provider(
+                    &t.input_schema,
+                    "openai",
+                );
                 Self::enforce_strict_object_schema(&mut schema);
                 serde_json::json!({
                     "type": "function",

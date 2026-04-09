@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/pulsivo-salesman",
     "crates/pulsivo-salesman-types",
     "crates/pulsivo-salesman-memory",
     "crates/pulsivo-salesman-runtime",

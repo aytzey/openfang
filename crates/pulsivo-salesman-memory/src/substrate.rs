@@ -38,7 +38,8 @@ pub struct MemorySubstrate {
 impl MemorySubstrate {
     /// Open or create a memory substrate at the given database path.
     pub fn open(db_path: &Path, decay_rate: f32) -> PulsivoSalesmanResult<Self> {
-        let conn = Connection::open(db_path).map_err(|e| PulsivoSalesmanError::Memory(e.to_string()))?;
+        let conn =
+            Connection::open(db_path).map_err(|e| PulsivoSalesmanError::Memory(e.to_string()))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
             .map_err(|e| PulsivoSalesmanError::Memory(e.to_string()))?;
         run_migrations(&conn).map_err(|e| PulsivoSalesmanError::Memory(e.to_string()))?;
@@ -57,8 +58,8 @@ impl MemorySubstrate {
 
     /// Create an in-memory substrate (for testing).
     pub fn open_in_memory(decay_rate: f32) -> PulsivoSalesmanResult<Self> {
-        let conn =
-            Connection::open_in_memory().map_err(|e| PulsivoSalesmanError::Memory(e.to_string()))?;
+        let conn = Connection::open_in_memory()
+            .map_err(|e| PulsivoSalesmanError::Memory(e.to_string()))?;
         run_migrations(&conn).map_err(|e| PulsivoSalesmanError::Memory(e.to_string()))?;
         let shared = Arc::new(Mutex::new(conn));
 
@@ -120,7 +121,10 @@ impl MemorySubstrate {
     }
 
     /// List all KV pairs for an agent.
-    pub fn list_kv(&self, agent_id: AgentId) -> PulsivoSalesmanResult<Vec<(String, serde_json::Value)>> {
+    pub fn list_kv(
+        &self,
+        agent_id: AgentId,
+    ) -> PulsivoSalesmanResult<Vec<(String, serde_json::Value)>> {
         self.structured.list_kv(agent_id)
     }
 
@@ -183,7 +187,10 @@ impl MemorySubstrate {
     }
 
     /// List all sessions for a specific agent.
-    pub fn list_agent_sessions(&self, agent_id: AgentId) -> PulsivoSalesmanResult<Vec<serde_json::Value>> {
+    pub fn list_agent_sessions(
+        &self,
+        agent_id: AgentId,
+    ) -> PulsivoSalesmanResult<Vec<serde_json::Value>> {
         self.sessions.list_agent_sessions(agent_id)
     }
 
@@ -204,7 +211,10 @@ impl MemorySubstrate {
         &self,
         agent_id: AgentId,
         window_size: Option<usize>,
-    ) -> PulsivoSalesmanResult<(Option<String>, Vec<pulsivo_salesman_types::message::Message>)> {
+    ) -> PulsivoSalesmanResult<(
+        Option<String>,
+        Vec<pulsivo_salesman_types::message::Message>,
+    )> {
         self.sessions.canonical_context(agent_id, window_size)
     }
 
@@ -459,7 +469,10 @@ impl MemorySubstrate {
     }
 
     /// Claim the next pending task (optionally for a specific assignee). Returns task JSON or None.
-    pub async fn task_claim(&self, agent_id: &str) -> PulsivoSalesmanResult<Option<serde_json::Value>> {
+    pub async fn task_claim(
+        &self,
+        agent_id: &str,
+    ) -> PulsivoSalesmanResult<Option<serde_json::Value>> {
         let conn = Arc::clone(&self.conn);
         let agent_id = agent_id.to_string();
 
@@ -534,7 +547,10 @@ impl MemorySubstrate {
     }
 
     /// List tasks, optionally filtered by status.
-    pub async fn task_list(&self, status: Option<&str>) -> PulsivoSalesmanResult<Vec<serde_json::Value>> {
+    pub async fn task_list(
+        &self,
+        status: Option<&str>,
+    ) -> PulsivoSalesmanResult<Vec<serde_json::Value>> {
         let conn = Arc::clone(&self.conn);
         let status = status.map(|s| s.to_string());
 
@@ -580,7 +596,11 @@ impl MemorySubstrate {
 
 #[async_trait]
 impl Memory for MemorySubstrate {
-    async fn get(&self, agent_id: AgentId, key: &str) -> PulsivoSalesmanResult<Option<serde_json::Value>> {
+    async fn get(
+        &self,
+        agent_id: AgentId,
+        key: &str,
+    ) -> PulsivoSalesmanResult<Option<serde_json::Value>> {
         let store = self.structured.clone();
         let key = key.to_string();
         tokio::task::spawn_blocking(move || store.get(agent_id, &key))
@@ -680,7 +700,11 @@ impl Memory for MemorySubstrate {
         Ok(Vec::new())
     }
 
-    async fn import(&self, _data: &[u8], _format: ExportFormat) -> PulsivoSalesmanResult<ImportReport> {
+    async fn import(
+        &self,
+        _data: &[u8],
+        _format: ExportFormat,
+    ) -> PulsivoSalesmanResult<ImportReport> {
         Ok(ImportReport {
             entities_imported: 0,
             relations_imported: 0,

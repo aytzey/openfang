@@ -49,12 +49,12 @@ function Get-LatestVersion {
     catch {
         Write-Host "  Could not determine latest version." -ForegroundColor Red
         Write-Host "  Install from source instead:" -ForegroundColor Yellow
-        Write-Host "    cargo install --git https://github.com/$Repo pulsivo-salesman-cli"
+        Write-Host "    cargo install --git https://github.com/$Repo pulsivo-salesman"
         exit 1
     }
 }
 
-function Install-Pulsivo Salesman {
+function Install-PulsivoSalesman {
     Write-Banner
 
     $arch = Get-Architecture
@@ -85,7 +85,7 @@ function Install-Pulsivo Salesman {
     catch {
         Write-Host "  Download failed. The release may not exist for your platform." -ForegroundColor Red
         Write-Host "  Install from source instead:" -ForegroundColor Yellow
-        Write-Host "    cargo install --git https://github.com/$Repo pulsivo-salesman-cli"
+        Write-Host "    cargo install --git https://github.com/$Repo pulsivo-salesman"
         Remove-Item -Recurse -Force $tempDir -ErrorAction SilentlyContinue
         exit 1
     }
@@ -165,4 +165,4 @@ function Install-Pulsivo Salesman {
     Write-Host ""
 }
 
-Install-Pulsivo Salesman
+Install-PulsivoSalesman

@@ -37,12 +37,29 @@ pub fn operation_cost(method: &str, path: &str) -> NonZeroU32 {
             NonZeroU32::new(40).unwrap()
         }
         ("GET", "/api/sales/source-health") => NonZeroU32::new(4).unwrap(),
+        ("GET", "/api/sales/policy-proposals") => NonZeroU32::new(4).unwrap(),
+        ("POST", p) if p.starts_with("/api/sales/policy-proposals/") && p.ends_with("/approve") => {
+            NonZeroU32::new(12).unwrap()
+        }
+        ("POST", p) if p.starts_with("/api/sales/policy-proposals/") && p.ends_with("/reject") => {
+            NonZeroU32::new(10).unwrap()
+        }
         ("GET", "/api/sales/runs") => NonZeroU32::new(4).unwrap(),
         ("GET", "/api/sales/leads") => NonZeroU32::new(5).unwrap(),
         ("GET", "/api/sales/prospects") => NonZeroU32::new(5).unwrap(),
         ("GET", p) if p.starts_with("/api/sales/accounts/") && p.ends_with("/dossier") => {
             NonZeroU32::new(6).unwrap()
         }
+        ("GET", "/api/sales/unsubscribe") => NonZeroU32::new(1).unwrap(),
+        ("POST", "/api/sales/outcomes/webhook") => NonZeroU32::new(10).unwrap(),
+        ("POST", "/api/sales/sequences/advance") => NonZeroU32::new(10).unwrap(),
+        ("GET", "/api/sales/experiments") => NonZeroU32::new(4).unwrap(),
+        ("POST", "/api/sales/experiments") => NonZeroU32::new(12).unwrap(),
+        ("GET", p) if p.starts_with("/api/sales/experiments/") && p.ends_with("/results") => {
+            NonZeroU32::new(5).unwrap()
+        }
+        ("GET", "/api/sales/context-factors") => NonZeroU32::new(4).unwrap(),
+        ("POST", "/api/sales/calibration/run") => NonZeroU32::new(12).unwrap(),
         ("GET", "/api/sales/approvals") => NonZeroU32::new(5).unwrap(),
         ("POST", "/api/sales/approvals/bulk-approve") => NonZeroU32::new(30).unwrap(),
         ("PATCH", p) if p.starts_with("/api/sales/approvals/") && p.ends_with("/edit") => {
@@ -130,6 +147,22 @@ mod tests {
             operation_cost("GET", "/api/sales/accounts/example.com/dossier").get(),
             6
         );
+        assert_eq!(
+            operation_cost("GET", "/api/sales/policy-proposals").get(),
+            4
+        );
+        assert_eq!(operation_cost("GET", "/api/sales/unsubscribe").get(), 1);
+        assert_eq!(
+            operation_cost("POST", "/api/sales/outcomes/webhook").get(),
+            10
+        );
+        assert_eq!(
+            operation_cost("POST", "/api/sales/sequences/advance").get(),
+            10
+        );
+        assert_eq!(operation_cost("POST", "/api/sales/experiments").get(), 12);
+        assert_eq!(operation_cost("GET", "/api/sales/context-factors").get(), 4);
+        assert_eq!(operation_cost("POST", "/api/sales/calibration/run").get(), 12);
         assert_eq!(
             operation_cost("POST", "/api/sales/approvals/bulk-approve").get(),
             30

@@ -1748,7 +1748,10 @@ impl SalesEngine {
         {
             self.migrate_prospect_profile(&conn, &profile, sales_profile.as_ref())?;
         }
-        for lead in self.list_leads(10_000, None).unwrap_or_default() {
+        for lead in self
+            .list_leads(SalesSegment::B2B, 10_000, None)
+            .unwrap_or_default()
+        {
             self.migrate_lead(&conn, &lead, sales_profile.as_ref())?;
         }
         Ok(())
@@ -3282,12 +3285,23 @@ impl SalesEngine {
         Ok(out)
     }
 
-    pub fn list_leads(&self, limit: usize, run_id: Option<&str>) -> Result<Vec<SalesLead>, String> {
+    pub fn list_leads(
+        &self,
+        segment: SalesSegment,
+        limit: usize,
+        run_id: Option<&str>,
+    ) -> Result<Vec<SalesLead>, String> {
         let conn = self.open()?;
-        let sql_with_run = "SELECT id, run_id, company, website, company_domain, contact_name, contact_title, linkedin_url, email, phone, reasons_json, email_subject, email_body, linkedin_message, score, status, created_at
-                 FROM leads WHERE run_id = ? ORDER BY created_at DESC LIMIT ?";
-        let sql_all = "SELECT id, run_id, company, website, company_domain, contact_name, contact_title, linkedin_url, email, phone, reasons_json, email_subject, email_body, linkedin_message, score, status, created_at
-                 FROM leads ORDER BY created_at DESC LIMIT ?";
+        let sql_with_run = "SELECT l.id, l.run_id, l.company, l.website, l.company_domain, l.contact_name, l.contact_title, l.linkedin_url, l.email, l.phone, l.reasons_json, l.email_subject, l.email_body, l.linkedin_message, l.score, l.status, l.created_at
+                 FROM leads l
+                 LEFT JOIN sales_runs sr ON sr.id = l.run_id
+                 WHERE l.run_id = ?1 AND COALESCE(sr.segment, 'b2b') = ?2
+                 ORDER BY l.created_at DESC LIMIT ?3";
+        let sql_all = "SELECT l.id, l.run_id, l.company, l.website, l.company_domain, l.contact_name, l.contact_title, l.linkedin_url, l.email, l.phone, l.reasons_json, l.email_subject, l.email_body, l.linkedin_message, l.score, l.status, l.created_at
+                 FROM leads l
+                 LEFT JOIN sales_runs sr ON sr.id = l.run_id
+                 WHERE COALESCE(sr.segment, 'b2b') = ?1
+                 ORDER BY l.created_at DESC LIMIT ?2";
 
         let mut stmt = conn
             .prepare(if run_id.is_some() {
@@ -3298,10 +3312,10 @@ impl SalesEngine {
             .map_err(|e| format!("Prepare list leads failed: {e}"))?;
 
         let mut rows = if let Some(rid) = run_id {
-            stmt.query(params![rid, limit as i64])
+            stmt.query(params![rid, segment.as_str(), limit as i64])
                 .map_err(|e| format!("List leads query failed: {e}"))?
         } else {
-            stmt.query(params![limit as i64])
+            stmt.query(params![segment.as_str(), limit as i64])
                 .map_err(|e| format!("List leads query failed: {e}"))?
         };
 
@@ -3351,7 +3365,7 @@ impl SalesEngine {
         }
 
         let scan_limit = limit.saturating_mul(12).clamp(200, 4000);
-        let leads = self.list_leads(scan_limit, run_id)?;
+        let leads = self.list_leads(segment, scan_limit, run_id)?;
         Ok(build_prospect_profiles(
             leads,
             limit,
@@ -3476,11 +3490,32 @@ impl SalesEngine {
 
     pub fn list_approvals(
         &self,
+        segment: Option<SalesSegment>,
         status: Option<&str>,
         limit: usize,
     ) -> Result<Vec<SalesApproval>, String> {
         let conn = self.open()?;
-        let (sql, args): (&str, Vec<String>) = if let Some(s) = status {
+        let (sql, args): (&str, Vec<String>) = if let (Some(seg), Some(s)) = (segment, status) {
+            (
+                "SELECT a.id, a.lead_id, a.channel, a.payload_json, a.status, a.created_at, a.decided_at
+                 FROM approvals a
+                 JOIN leads l ON l.id = a.lead_id
+                 LEFT JOIN sales_runs sr ON sr.id = l.run_id
+                 WHERE a.status = ?1 AND COALESCE(sr.segment, 'b2b') = ?2
+                 ORDER BY a.created_at DESC LIMIT ?3",
+                vec![s.to_string(), seg.as_str().to_string(), limit.to_string()],
+            )
+        } else if let Some(seg) = segment {
+            (
+                "SELECT a.id, a.lead_id, a.channel, a.payload_json, a.status, a.created_at, a.decided_at
+                 FROM approvals a
+                 JOIN leads l ON l.id = a.lead_id
+                 LEFT JOIN sales_runs sr ON sr.id = l.run_id
+                 WHERE COALESCE(sr.segment, 'b2b') = ?1
+                 ORDER BY a.created_at DESC LIMIT ?2",
+                vec![seg.as_str().to_string(), limit.to_string()],
+            )
+        } else if let Some(s) = status {
             (
                 "SELECT id, lead_id, channel, payload_json, status, created_at, decided_at FROM approvals WHERE status = ? ORDER BY created_at DESC LIMIT ?",
                 vec![s.to_string(), limit.to_string()],
@@ -3496,7 +3531,10 @@ impl SalesEngine {
             .prepare(sql)
             .map_err(|e| format!("Prepare approvals query failed: {e}"))?;
 
-        let mut rows = if args.len() == 2 {
+        let mut rows = if args.len() == 3 {
+            stmt.query(params![args[0], args[1], args[2]])
+                .map_err(|e| format!("Approvals query failed: {e}"))?
+        } else if args.len() == 2 {
             stmt.query(params![args[0], args[1]])
                 .map_err(|e| format!("Approvals query failed: {e}"))?
         } else {
@@ -4084,17 +4122,41 @@ impl SalesEngine {
         })))
     }
 
-    pub fn list_deliveries(&self, limit: usize) -> Result<Vec<SalesDelivery>, String> {
+    pub fn list_deliveries(
+        &self,
+        segment: Option<SalesSegment>,
+        limit: usize,
+    ) -> Result<Vec<SalesDelivery>, String> {
         let conn = self.open()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, approval_id, channel, recipient, status, error, sent_at FROM deliveries ORDER BY sent_at DESC LIMIT ?",
+        let (sql, args): (&str, Vec<String>) = if let Some(seg) = segment {
+            (
+                "SELECT d.id, d.approval_id, d.channel, d.recipient, d.status, d.error, d.sent_at
+                 FROM deliveries d
+                 JOIN approvals a ON a.id = d.approval_id
+                 JOIN leads l ON l.id = a.lead_id
+                 LEFT JOIN sales_runs sr ON sr.id = l.run_id
+                 WHERE COALESCE(sr.segment, 'b2b') = ?1
+                 ORDER BY d.sent_at DESC LIMIT ?2",
+                vec![seg.as_str().to_string(), limit.to_string()],
             )
+        } else {
+            (
+                "SELECT id, approval_id, channel, recipient, status, error, sent_at FROM deliveries ORDER BY sent_at DESC LIMIT ?1",
+                vec![limit.to_string()],
+            )
+        };
+
+        let mut stmt = conn
+            .prepare(sql)
             .map_err(|e| format!("Prepare deliveries query failed: {e}"))?;
 
-        let mut rows = stmt
-            .query(params![limit as i64])
-            .map_err(|e| format!("Deliveries query failed: {e}"))?;
+        let mut rows = if args.len() == 2 {
+            stmt.query(params![args[0], args[1]])
+                .map_err(|e| format!("Deliveries query failed: {e}"))?
+        } else {
+            stmt.query(params![args[0]])
+                .map_err(|e| format!("Deliveries query failed: {e}"))?
+        };
 
         let mut out = Vec::new();
         while let Some(r) = rows
@@ -4115,14 +4177,21 @@ impl SalesEngine {
         Ok(out)
     }
 
-    fn deliveries_today(&self, timezone_mode: &str) -> Result<u32, String> {
+    fn deliveries_today(&self, segment: SalesSegment, timezone_mode: &str) -> Result<u32, String> {
         let conn = self.open()?;
         let today = current_sales_day(timezone_mode);
         let mut stmt = conn
-            .prepare("SELECT sent_at FROM deliveries WHERE status = 'sent'")
+            .prepare(
+                "SELECT d.sent_at
+                 FROM deliveries d
+                 JOIN approvals a ON a.id = d.approval_id
+                 JOIN leads l ON l.id = a.lead_id
+                 LEFT JOIN sales_runs sr ON sr.id = l.run_id
+                 WHERE d.status = 'sent' AND COALESCE(sr.segment, 'b2b') = ?1",
+            )
             .map_err(|e| format!("Deliveries count prepare failed: {e}"))?;
         let mut rows = stmt
-            .query([])
+            .query(params![segment.as_str()])
             .map_err(|e| format!("Deliveries count query failed: {e}"))?;
 
         let mut count = 0u32;
@@ -4136,6 +4205,24 @@ impl SalesEngine {
             }
         }
         Ok(count)
+    }
+
+    fn approval_segment(&self, approval_id: &str) -> Result<SalesSegment, String> {
+        let conn = self.open()?;
+        let segment = conn
+            .query_row(
+                "SELECT COALESCE(sr.segment, 'b2b')
+                 FROM approvals a
+                 JOIN leads l ON l.id = a.lead_id
+                 LEFT JOIN sales_runs sr ON sr.id = l.run_id
+                 WHERE a.id = ?1",
+                params![approval_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| format!("Approval segment lookup failed: {e}"))?
+            .unwrap_or_else(|| SalesSegment::B2B.as_str().to_string());
+        Ok(SalesSegment::from_optional(Some(segment.as_str())))
     }
 
     /// Load sender config from DB sender_policies table if available.
@@ -4668,11 +4755,12 @@ impl SalesEngine {
             ));
         }
 
+        let segment = self.approval_segment(&id)?;
         let profile = self
-            .get_profile(SalesSegment::B2B)?
+            .get_profile(segment)?
             .ok_or_else(|| "Sales profile is not configured".to_string())?;
 
-        let sent_today = self.deliveries_today(&profile.timezone_mode)?;
+        let sent_today = self.deliveries_today(segment, &profile.timezone_mode)?;
         if sent_today >= profile.daily_send_cap {
             return Err(format!(
                 "Daily send cap reached ({}/{})",
@@ -4811,14 +4899,18 @@ impl SalesEngine {
         self.update_approval_status(approval_id, "rejected")
     }
 
-    pub fn already_ran_today(&self, timezone_mode: &str) -> Result<bool, String> {
+    pub fn already_ran_today(
+        &self,
+        segment: SalesSegment,
+        timezone_mode: &str,
+    ) -> Result<bool, String> {
         let conn = self.open()?;
         let today = current_sales_day(timezone_mode);
         let mut stmt = conn
-            .prepare("SELECT started_at FROM sales_runs WHERE status = 'completed'")
+            .prepare("SELECT started_at FROM sales_runs WHERE segment = ?1 AND status = 'completed'")
             .map_err(|e| format!("Run-day check prepare failed: {e}"))?;
         let mut rows = stmt
-            .query([])
+            .query(params![segment.as_str()])
             .map_err(|e| format!("Run-day check query failed: {e}"))?;
 
         while let Some(row) = rows
@@ -6463,7 +6555,7 @@ impl SalesEngine {
         kernel: &pulsivo_salesman_kernel::PulsivoSalesmanKernel,
     ) -> Result<Vec<SalesProspectProfile>, String> {
         let scan_limit = DISCOVERY_REFRESH_SCAN_LIMIT;
-        let leads = self.list_leads(scan_limit, Some(run_id))?;
+        let leads = self.list_leads(segment, scan_limit, Some(run_id))?;
         if leads.is_empty() {
             return Ok(Vec::new());
         }

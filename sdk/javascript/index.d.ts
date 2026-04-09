@@ -4,38 +4,33 @@ export class PulsivoSalesmanError extends Error {
   constructor(message: string, status: number, body: string);
 }
 
-export interface AgentCreateOpts {
-  template?: string;
-  name?: string;
-  model?: string;
-  [key: string]: unknown;
+export type SalesSegment = "b2b" | "b2c";
+
+export interface SegmentOpts {
+  segment?: SalesSegment;
 }
 
-export interface MessageOpts {
-  attachments?: string[];
-  [key: string]: unknown;
+export interface PersistOpts extends SegmentOpts {
+  persist?: boolean;
 }
 
-export interface StreamEvent {
-  type?: string;
-  delta?: string;
-  raw?: string;
-  [key: string]: unknown;
+export interface SalesListOpts extends SegmentOpts {
+  limit?: number;
+  runId?: string;
+}
+
+export interface RetryJobOpts extends SegmentOpts {
+  forceFresh?: boolean;
+}
+
+export interface ApprovalListOpts {
+  status?: string;
+  limit?: number;
 }
 
 export class PulsivoSalesman {
   baseUrl: string;
-  agents: AgentResource;
-  sessions: SessionResource;
-  workflows: WorkflowResource;
-  skills: SkillResource;
-  channels: ChannelResource;
-  tools: ToolResource;
-  models: ModelResource;
-  providers: ProviderResource;
-  memory: MemoryResource;
-  triggers: TriggerResource;
-  schedules: ScheduleResource;
+  sales: SalesResource;
 
   constructor(baseUrl: string, opts?: { headers?: Record<string, string> });
 
@@ -44,97 +39,27 @@ export class PulsivoSalesman {
   status(): Promise<unknown>;
   version(): Promise<unknown>;
   metrics(): Promise<string>;
-  usage(): Promise<unknown>;
-  config(): Promise<unknown>;
 }
 
-export class AgentResource {
-  list(): Promise<unknown[]>;
-  get(id: string): Promise<unknown>;
-  create(opts: AgentCreateOpts): Promise<{ id: string; [key: string]: unknown }>;
-  delete(id: string): Promise<unknown>;
-  stop(id: string): Promise<unknown>;
-  clone(id: string): Promise<unknown>;
-  update(id: string, data: Record<string, unknown>): Promise<unknown>;
-  setMode(id: string, mode: string): Promise<unknown>;
-  setModel(id: string, model: string): Promise<unknown>;
-  message(id: string, text: string, opts?: MessageOpts): Promise<unknown>;
-  stream(id: string, text: string, opts?: MessageOpts): AsyncGenerator<StreamEvent>;
-  session(id: string): Promise<unknown>;
-  resetSession(id: string): Promise<unknown>;
-  compactSession(id: string): Promise<unknown>;
-  listSessions(id: string): Promise<unknown[]>;
-  createSession(id: string, label?: string): Promise<unknown>;
-  switchSession(id: string, sessionId: string): Promise<unknown>;
-  getSkills(id: string): Promise<unknown>;
-  setSkills(id: string, skills: unknown): Promise<unknown>;
-  upload(id: string, file: Blob | File, filename: string): Promise<unknown>;
-  setIdentity(id: string, identity: Record<string, unknown>): Promise<unknown>;
-  patchConfig(id: string, config: Record<string, unknown>): Promise<unknown>;
-}
-
-export class SessionResource {
-  list(): Promise<unknown[]>;
-  delete(id: string): Promise<unknown>;
-  setLabel(id: string, label: string): Promise<unknown>;
-}
-
-export class WorkflowResource {
-  list(): Promise<unknown[]>;
-  create(workflow: Record<string, unknown>): Promise<unknown>;
-  run(id: string, input?: Record<string, unknown>): Promise<unknown>;
-  runs(id: string): Promise<unknown[]>;
-}
-
-export class SkillResource {
-  list(): Promise<unknown[]>;
-  install(skill: Record<string, unknown>): Promise<unknown>;
-  uninstall(skill: Record<string, unknown>): Promise<unknown>;
-  search(query: string): Promise<unknown[]>;
-}
-
-export class ChannelResource {
-  list(): Promise<unknown[]>;
-  configure(name: string, config: Record<string, unknown>): Promise<unknown>;
-  remove(name: string): Promise<unknown>;
-  test(name: string): Promise<unknown>;
-}
-
-export class ToolResource {
-  list(): Promise<unknown[]>;
-}
-
-export class ModelResource {
-  list(): Promise<unknown[]>;
-  get(id: string): Promise<unknown>;
-  aliases(): Promise<unknown>;
-}
-
-export class ProviderResource {
-  list(): Promise<unknown[]>;
-  setKey(name: string, key: string): Promise<unknown>;
-  deleteKey(name: string): Promise<unknown>;
-  test(name: string): Promise<unknown>;
-}
-
-export class MemoryResource {
-  getAll(agentId: string): Promise<Record<string, unknown>>;
-  get(agentId: string, key: string): Promise<unknown>;
-  set(agentId: string, key: string, value: unknown): Promise<unknown>;
-  delete(agentId: string, key: string): Promise<unknown>;
-}
-
-export class TriggerResource {
-  list(): Promise<unknown[]>;
-  create(trigger: Record<string, unknown>): Promise<unknown>;
-  update(id: string, trigger: Record<string, unknown>): Promise<unknown>;
-  delete(id: string): Promise<unknown>;
-}
-
-export class ScheduleResource {
-  list(): Promise<unknown[]>;
-  create(schedule: Record<string, unknown>): Promise<unknown>;
-  update(id: string, schedule: Record<string, unknown>): Promise<unknown>;
-  delete(id: string): Promise<unknown>;
-  run(id: string): Promise<unknown>;
+export class SalesResource {
+  getProfile(segment?: SalesSegment): Promise<unknown>;
+  updateProfile(profile: Record<string, unknown>, opts?: SegmentOpts): Promise<unknown>;
+  autofillProfile(brief: string, opts?: PersistOpts): Promise<unknown>;
+  getOnboardingStatus(segment?: SalesSegment): Promise<unknown>;
+  updateOnboardingBrief(brief: string, opts?: PersistOpts): Promise<unknown>;
+  run(opts?: SegmentOpts): Promise<unknown>;
+  getActiveJob(segment?: SalesSegment): Promise<unknown>;
+  getJob(jobId: string): Promise<unknown>;
+  retryJob(jobId: string, opts?: RetryJobOpts): Promise<unknown>;
+  sourceHealth(): Promise<unknown>;
+  listRuns(opts?: SalesListOpts): Promise<unknown>;
+  listLeads(opts?: SalesListOpts): Promise<unknown>;
+  listProspects(opts?: SalesListOpts): Promise<unknown>;
+  getAccountDossier(id: string): Promise<unknown>;
+  listApprovals(opts?: ApprovalListOpts): Promise<unknown>;
+  bulkApprove(ids: string[]): Promise<unknown>;
+  editApproval(id: string, editedPayload: Record<string, unknown>): Promise<unknown>;
+  approve(id: string): Promise<unknown>;
+  reject(id: string): Promise<unknown>;
+  listDeliveries(opts?: { limit?: number }): Promise<unknown>;
 }

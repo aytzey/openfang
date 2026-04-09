@@ -151,12 +151,49 @@ pub async fn build_router(
             "/api/sales/source-health",
             get(sales::list_sales_source_health),
         )
+        .route(
+            "/api/sales/policy-proposals",
+            get(sales::list_sales_policy_proposals),
+        )
+        .route(
+            "/api/sales/policy-proposals/{id}/approve",
+            post(sales::approve_sales_policy_proposal),
+        )
+        .route(
+            "/api/sales/policy-proposals/{id}/reject",
+            post(sales::reject_sales_policy_proposal),
+        )
         .route("/api/sales/runs", get(sales::list_sales_runs))
         .route("/api/sales/leads", get(sales::list_sales_leads))
         .route("/api/sales/prospects", get(sales::list_sales_prospects))
         .route(
             "/api/sales/accounts/{id}/dossier",
             get(sales::get_sales_account_dossier),
+        )
+        .route("/api/sales/unsubscribe", get(sales::sales_unsubscribe))
+        .route(
+            "/api/sales/outcomes/webhook",
+            post(sales::sales_outcomes_webhook),
+        )
+        .route(
+            "/api/sales/sequences/advance",
+            post(sales::advance_sales_sequences),
+        )
+        .route(
+            "/api/sales/experiments",
+            get(sales::list_sales_experiments).post(sales::create_sales_experiment),
+        )
+        .route(
+            "/api/sales/experiments/{id}/results",
+            get(sales::get_sales_experiment_results),
+        )
+        .route(
+            "/api/sales/context-factors",
+            get(sales::list_sales_context_factors),
+        )
+        .route(
+            "/api/sales/calibration/run",
+            post(sales::run_sales_calibration),
         )
         .route("/api/sales/approvals", get(sales::list_sales_approvals))
         .route(
@@ -363,5 +400,134 @@ fn is_process_alive(pid: u32) -> bool {
     {
         let _ = pid;
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use axum::http::{Method, Request, StatusCode};
+    use pulsivo_salesman_types::config::KernelConfig;
+    use tower::ServiceExt;
+
+    fn request_with_loopback(
+        method: Method,
+        uri: &str,
+        body: Body,
+        is_json: bool,
+    ) -> Request<Body> {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if is_json {
+            builder = builder.header("content-type", "application/json");
+        }
+        let mut request = builder.body(body).expect("request");
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 8080))));
+        request
+    }
+
+    fn test_kernel(home_dir: &Path) -> Arc<PulsivoSalesmanKernel> {
+        let mut config = KernelConfig::default();
+        config.home_dir = home_dir.to_path_buf();
+        config.data_dir = home_dir.join("data");
+        Arc::new(PulsivoSalesmanKernel::boot_with_config(config).expect("kernel"))
+    }
+
+    #[tokio::test]
+    async fn router_exposes_sales_unsubscribe_and_admin_routes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let kernel = test_kernel(temp.path());
+        sales::SalesEngine::new(&kernel.home_dir())
+            .init()
+            .expect("sales init");
+
+        let (app, _state) =
+            build_router(kernel, "127.0.0.1:4200".parse().expect("listen addr")).await;
+
+        let unsubscribe = app
+            .clone()
+            .oneshot(request_with_loopback(
+                Method::GET,
+                "/api/sales/unsubscribe?token=invalid",
+                Body::empty(),
+                false,
+            ))
+            .await
+            .expect("unsubscribe response");
+        assert_eq!(unsubscribe.status(), StatusCode::BAD_REQUEST);
+
+        let proposals = app
+            .clone()
+            .oneshot(request_with_loopback(
+                Method::GET,
+                "/api/sales/policy-proposals?limit=1",
+                Body::empty(),
+                false,
+            ))
+            .await
+            .expect("policy proposals response");
+        assert_eq!(proposals.status(), StatusCode::OK);
+
+        let experiments = app
+            .clone()
+            .oneshot(request_with_loopback(
+                Method::GET,
+                "/api/sales/experiments",
+                Body::empty(),
+                false,
+            ))
+            .await
+            .expect("experiments response");
+        assert_eq!(experiments.status(), StatusCode::OK);
+
+        let context_factors = app
+            .clone()
+            .oneshot(request_with_loopback(
+                Method::GET,
+                "/api/sales/context-factors",
+                Body::empty(),
+                false,
+            ))
+            .await
+            .expect("context factors response");
+        assert_eq!(context_factors.status(), StatusCode::OK);
+
+        let calibration = app
+            .clone()
+            .oneshot(request_with_loopback(
+                Method::POST,
+                "/api/sales/calibration/run",
+                Body::empty(),
+                false,
+            ))
+            .await
+            .expect("calibration response");
+        assert_eq!(calibration.status(), StatusCode::OK);
+
+        let outcomes = app
+            .clone()
+            .oneshot(request_with_loopback(
+                Method::POST,
+                "/api/sales/outcomes/webhook",
+                Body::from(r#"{"delivery_id":"missing","event_type":"unsubscribe","raw_text":""}"#),
+                true,
+            ))
+            .await
+            .expect("outcomes response");
+        assert_eq!(outcomes.status(), StatusCode::BAD_REQUEST);
+
+        let advance = app
+            .oneshot(request_with_loopback(
+                Method::POST,
+                "/api/sales/sequences/advance",
+                Body::empty(),
+                false,
+            ))
+            .await
+            .expect("advance response");
+        assert_eq!(advance.status(), StatusCode::OK);
     }
 }

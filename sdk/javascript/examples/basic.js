@@ -1,5 +1,5 @@
 /**
- * Basic example — create an agent and chat with it.
+ * Basic example — inspect sales state through the public REST client.
  *
  * Usage:
  *   node basic.js
@@ -8,27 +8,19 @@
 const { PulsivoSalesman } = require("../index");
 
 async function main() {
-  const client = new PulsivoSalesman("http://localhost:3000");
+  const client = new PulsivoSalesman("http://localhost:4200");
 
   // Check server health
   const health = await client.health();
   console.log("Server:", health);
 
-  // List existing agents
-  const agents = await client.agents.list();
-  console.log("Agents:", agents.length);
+  // Inspect the current B2C profile
+  const profile = await client.sales.getProfile("b2c");
+  console.log("B2C profile:", profile);
 
-  // Create a new agent from the "assistant" template
-  const agent = await client.agents.create({ template: "assistant" });
-  console.log("Created agent:", agent.id);
-
-  // Send a message and get the full response
-  const reply = await client.agents.message(agent.id, "What can you help me with?");
-  console.log("Reply:", reply);
-
-  // Clean up
-  await client.agents.delete(agent.id);
-  console.log("Agent deleted.");
+  // Fetch the latest recent runs
+  const runs = await client.sales.listRuns({ segment: "b2c", limit: 5 });
+  console.log("Recent runs:", runs);
 }
 
 main().catch(console.error);
