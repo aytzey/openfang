@@ -1,0 +1,40 @@
+[package]
+name = "pulsivo-salesman-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Sales-focused HTTP API server for the Pulsivo Salesman daemon"
+
+[dependencies]
+pulsivo-salesman-types = { path = "../pulsivo-salesman-types" }
+pulsivo-salesman-kernel = { path = "../pulsivo-salesman-kernel" }
+pulsivo-salesman-runtime = { path = "../pulsivo-salesman-runtime" }
+dashmap = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+futures = { workspace = true }
+governor = { workspace = true }
+tokio-stream = { workspace = true }
+subtle = { workspace = true }
+base64 = { workspace = true }
+rusqlite = { workspace = true }
+reqwest = { workspace = true }
+regex-lite = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+url = { workspace = true }
+lettre = { version = "=0.10.4", default-features = false, features = ["tokio1", "tokio1-rustls-tls", "smtp-transport", "builder"] }
+hickory-resolver = { version = "0.24", default-features = false, features = ["system-config", "tokio-runtime"] }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+tempfile = { workspace = true }

@@ -22,7 +22,7 @@ if ! curl -fsS "$BASE_URL/api/health" >/dev/null; then
 fi
 
 if [[ "$RESET_DB" == "1" ]]; then
-  rm -f "$HOME/.openfang/sales.db"
+  rm -f "$HOME/.pulsivo-salesman/sales.db"
 fi
 
 BRIEF_FILE="${1:-}"

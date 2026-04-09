@@ -1,0 +1,33 @@
+
+          <section class="sales-panel-section" x-show="activeTab === 'profiles'">
+            <div class="sales-panel-header">
+              <h3>Run gecmisi</h3>
+              <button class="btn btn-ghost btn-sm" @click="loadRuns()">Yenile</button>
+            </div>
+            <div class="table-wrap" x-show="runs.length > 0">
+              <table>
+                <thead><tr><th>Baslangic</th><th>Durum</th><th x-text="runHistoryDiscoveryLabel"></th><th x-text="runHistoryActionLabel"></th><th x-show="!isB2C">Onay</th><th>Not</th></tr></thead>
+                <tbody>
+                  <template x-for="r in runs" :key="r.id">
+                    <tr>
+                      <td class="text-xs">
+                        <div x-text="formatDateTime(r.started_at)"></div>
+                        <div class="text-dim sales-mono-id" x-text="r.id"></div>
+                      </td>
+                      <td><span class="badge" :class="runBadgeClass(r)" x-text="r.status"></span></td>
+                      <td x-text="r.discovered"></td>
+                      <td x-text="isB2C ? b2cRunActionValue(r) : r.inserted"></td>
+                      <td x-show="!isB2C" x-text="r.approvals_queued"></td>
+                      <td class="text-xs">
+                        <div x-show="r.error" class="sales-line-clamp" x-text="r.error"></div>
+                        <button x-show="r.status === 'completed' && r.discovered > 0" class="btn btn-ghost btn-sm" @click="loadRunProspects(r.id)">Profilleri ac</button>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+            <div class="sales-empty" x-show="runs.length === 0">
+              <p>Henuz run yok. Ilk run tamamlandiginda burada listelenir.</p>
+            </div>
+          </section>

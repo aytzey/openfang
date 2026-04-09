@@ -1,31 +1,31 @@
-name: openfang
+name: pulsivo-salesman
 
 services:
-  openfang:
+  pulsivo-salesman:
     build:
       context: .
       dockerfile: Dockerfile
     init: true
     network_mode: host
-    user: "${OPENFANG_UID:-1000}:${OPENFANG_GID:-1000}"
+    user: "${PULSIVO_SALESMAN_UID:-1000}:${PULSIVO_SALESMAN_GID:-1000}"
     env_file:
       - path: .env
         required: false
     volumes:
       - type: bind
-        source: ${OPENFANG_DATA_DIR:-./.docker/openfang-home}
+        source: ${PULSIVO_SALESMAN_DATA_DIR:-./.docker/pulsivo-salesman-home}
         target: /data
         bind:
           create_host_path: true
       - type: bind
-        source: ${OPENFANG_CODEX_DIR:-${HOME}/.codex}
+        source: ${PULSIVO_SALESMAN_CODEX_DIR:-${HOME}/.codex}
         target: /data/.codex
         read_only: true
         bind:
           create_host_path: true
     environment:
       HOME: /data
-      OPENFANG_LISTEN: ${OPENFANG_LISTEN:-127.0.0.1:4200}
+      PULSIVO_SALESMAN_LISTEN: ${PULSIVO_SALESMAN_LISTEN:-127.0.0.1:4200}
       RUST_LOG: ${RUST_LOG:-info}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
@@ -42,7 +42,7 @@ services:
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://127.0.0.1:11434}
       VLLM_BASE_URL: ${VLLM_BASE_URL:-http://127.0.0.1:8000}
       LMSTUDIO_BASE_URL: ${LMSTUDIO_BASE_URL:-http://127.0.0.1:1234}
-      OPENFANG_API_KEY: ${OPENFANG_API_KEY:-}
+      PULSIVO_SALESMAN_API_KEY: ${PULSIVO_SALESMAN_API_KEY:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:-}
       SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}

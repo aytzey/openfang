@@ -4,18 +4,18 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
-export OPENFANG_UID="${OPENFANG_UID:-$(id -u)}"
-export OPENFANG_GID="${OPENFANG_GID:-$(id -g)}"
-export OPENFANG_DATA_DIR="${OPENFANG_DATA_DIR:-${ROOT_DIR}/.docker/openfang-home}"
-export OPENFANG_CODEX_DIR="${OPENFANG_CODEX_DIR:-${HOME}/.codex}"
+export PULSIVO_SALESMAN_UID="${PULSIVO_SALESMAN_UID:-$(id -u)}"
+export PULSIVO_SALESMAN_GID="${PULSIVO_SALESMAN_GID:-$(id -g)}"
+export PULSIVO_SALESMAN_DATA_DIR="${PULSIVO_SALESMAN_DATA_DIR:-${ROOT_DIR}/.docker/pulsivo-salesman-home}"
+export PULSIVO_SALESMAN_CODEX_DIR="${PULSIVO_SALESMAN_CODEX_DIR:-${HOME}/.codex}"
 
 command="${1:-up}"
 shift || true
 
 cleanup() {
   docker compose down --volumes --remove-orphans --rmi local >/dev/null 2>&1 || true
-  rm -rf "${OPENFANG_DATA_DIR}"
-  mkdir -p "${OPENFANG_DATA_DIR}"
+  rm -rf "${PULSIVO_SALESMAN_DATA_DIR}"
+  mkdir -p "${PULSIVO_SALESMAN_DATA_DIR}"
   docker builder prune -af >/dev/null 2>&1 || true
 }
 

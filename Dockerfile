@@ -11,16 +11,16 @@ COPY xtask ./xtask
 COPY agents ./agents
 COPY packages ./packages
 COPY deploy ./deploy
-RUN cargo build --locked --release --bin openfang
+RUN cargo build --locked --release --bin pulsivo-salesman
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /build/target/release/openfang /usr/local/bin/
-COPY --from=builder /build/agents /opt/openfang/agents
-COPY deploy/openfang-entrypoint.sh /usr/local/bin/openfang-entrypoint
-RUN chmod +x /usr/local/bin/openfang-entrypoint
+COPY --from=builder /build/target/release/pulsivo-salesman /usr/local/bin/
+COPY --from=builder /build/agents /opt/pulsivo-salesman/agents
+COPY deploy/pulsivo-salesman-entrypoint.sh /usr/local/bin/pulsivo-salesman-entrypoint
+RUN chmod +x /usr/local/bin/pulsivo-salesman-entrypoint
 EXPOSE 4200
 VOLUME /data
 ENV HOME=/data
-ENTRYPOINT ["openfang-entrypoint"]
+ENTRYPOINT ["pulsivo-salesman-entrypoint"]
 CMD ["start"]

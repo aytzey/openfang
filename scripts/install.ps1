@@ -1,20 +1,20 @@
-# OpenFang installer for Windows
-# Usage: iwr -useb https://openfang.sh/install.ps1 | iex
-#   or:  powershell -c "irm https://openfang.sh/install.ps1 | iex"
+# Pulsivo Salesman installer for Windows
+# Usage: iwr -useb https://pulsivo-salesman.sh/install.ps1 | iex
+#   or:  powershell -c "irm https://pulsivo-salesman.sh/install.ps1 | iex"
 #
 # Flags (via environment variables):
-#   $env:OPENFANG_INSTALL_DIR = custom install directory
-#   $env:OPENFANG_VERSION     = specific version tag (e.g. "v0.1.0")
+#   $env:PULSIVO_SALESMAN_INSTALL_DIR = custom install directory
+#   $env:PULSIVO_SALESMAN_VERSION     = specific version tag (e.g. "v0.1.0")
 
 $ErrorActionPreference = 'Stop'
 
-$Repo = "RightNow-AI/openfang"
-$DefaultInstallDir = Join-Path $env:USERPROFILE ".openfang\bin"
-$InstallDir = if ($env:OPENFANG_INSTALL_DIR) { $env:OPENFANG_INSTALL_DIR } else { $DefaultInstallDir }
+$Repo = "RightNow-AI/pulsivo-salesman"
+$DefaultInstallDir = Join-Path $env:USERPROFILE ".pulsivo-salesman\bin"
+$InstallDir = if ($env:PULSIVO_SALESMAN_INSTALL_DIR) { $env:PULSIVO_SALESMAN_INSTALL_DIR } else { $DefaultInstallDir }
 
 function Write-Banner {
     Write-Host ""
-    Write-Host "  OpenFang Installer" -ForegroundColor Cyan
+    Write-Host "  Pulsivo Salesman Installer" -ForegroundColor Cyan
     Write-Host "  ==================" -ForegroundColor Cyan
     Write-Host ""
 }
@@ -37,8 +37,8 @@ function Get-Architecture {
 }
 
 function Get-LatestVersion {
-    if ($env:OPENFANG_VERSION) {
-        return $env:OPENFANG_VERSION
+    if ($env:PULSIVO_SALESMAN_VERSION) {
+        return $env:PULSIVO_SALESMAN_VERSION
     }
 
     Write-Host "  Fetching latest release..."
@@ -49,22 +49,22 @@ function Get-LatestVersion {
     catch {
         Write-Host "  Could not determine latest version." -ForegroundColor Red
         Write-Host "  Install from source instead:" -ForegroundColor Yellow
-        Write-Host "    cargo install --git https://github.com/$Repo openfang-cli"
+        Write-Host "    cargo install --git https://github.com/$Repo pulsivo-salesman-cli"
         exit 1
     }
 }
 
-function Install-OpenFang {
+function Install-Pulsivo Salesman {
     Write-Banner
 
     $arch = Get-Architecture
     $version = Get-LatestVersion
     $target = "${arch}-pc-windows-msvc"
-    $archive = "openfang-${target}.zip"
+    $archive = "pulsivo-salesman-${target}.zip"
     $url = "https://github.com/$Repo/releases/download/$version/$archive"
     $checksumUrl = "$url.sha256"
 
-    Write-Host "  Installing OpenFang $version for $target..."
+    Write-Host "  Installing Pulsivo Salesman $version for $target..."
 
     # Create install directory
     if (-not (Test-Path $InstallDir)) {
@@ -72,7 +72,7 @@ function Install-OpenFang {
     }
 
     # Download to temp
-    $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) "openfang-install"
+    $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) "pulsivo-salesman-install"
     if (Test-Path $tempDir) { Remove-Item -Recurse -Force $tempDir }
     New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
 
@@ -85,7 +85,7 @@ function Install-OpenFang {
     catch {
         Write-Host "  Download failed. The release may not exist for your platform." -ForegroundColor Red
         Write-Host "  Install from source instead:" -ForegroundColor Yellow
-        Write-Host "    cargo install --git https://github.com/$Repo openfang-cli"
+        Write-Host "    cargo install --git https://github.com/$Repo pulsivo-salesman-cli"
         Remove-Item -Recurse -Force $tempDir -ErrorAction SilentlyContinue
         exit 1
     }
@@ -114,22 +114,22 @@ function Install-OpenFang {
 
     # Extract
     Expand-Archive -Path $archivePath -DestinationPath $tempDir -Force
-    $exePath = Join-Path $tempDir "openfang.exe"
+    $exePath = Join-Path $tempDir "pulsivo-salesman.exe"
     if (-not (Test-Path $exePath)) {
         # May be nested in a directory
-        $found = Get-ChildItem -Path $tempDir -Filter "openfang.exe" -Recurse | Select-Object -First 1
+        $found = Get-ChildItem -Path $tempDir -Filter "pulsivo-salesman.exe" -Recurse | Select-Object -First 1
         if ($found) {
             $exePath = $found.FullName
         }
         else {
-            Write-Host "  Could not find openfang.exe in archive." -ForegroundColor Red
+            Write-Host "  Could not find pulsivo-salesman.exe in archive." -ForegroundColor Red
             Remove-Item -Recurse -Force $tempDir -ErrorAction SilentlyContinue
             exit 1
         }
     }
 
     # Install
-    Copy-Item -Path $exePath -Destination (Join-Path $InstallDir "openfang.exe") -Force
+    Copy-Item -Path $exePath -Destination (Join-Path $InstallDir "pulsivo-salesman.exe") -Force
 
     # Clean up temp
     Remove-Item -Recurse -Force $tempDir -ErrorAction SilentlyContinue
@@ -143,26 +143,26 @@ function Install-OpenFang {
     }
 
     # Verify
-    $installedExe = Join-Path $InstallDir "openfang.exe"
+    $installedExe = Join-Path $InstallDir "pulsivo-salesman.exe"
     if (Test-Path $installedExe) {
         try {
             $versionOutput = & $installedExe --version 2>&1
             Write-Host ""
-            Write-Host "  OpenFang installed successfully! ($versionOutput)" -ForegroundColor Green
+            Write-Host "  Pulsivo Salesman installed successfully! ($versionOutput)" -ForegroundColor Green
         }
         catch {
             Write-Host ""
-            Write-Host "  OpenFang binary installed to $installedExe" -ForegroundColor Green
+            Write-Host "  Pulsivo Salesman binary installed to $installedExe" -ForegroundColor Green
         }
     }
 
     Write-Host ""
     Write-Host "  Get started:" -ForegroundColor Cyan
-    Write-Host "    openfang init"
+    Write-Host "    pulsivo-salesman init"
     Write-Host ""
     Write-Host "  The setup wizard will guide you through provider selection"
     Write-Host "  and configuration."
     Write-Host ""
 }
 
-Install-OpenFang
+Install-Pulsivo Salesman

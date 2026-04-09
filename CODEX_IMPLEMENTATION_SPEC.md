@@ -1,10 +1,10 @@
-# OpenFang Signal-to-Meeting Engine — Codex Implementation Spec
+# Pulsivo Salesman Signal-to-Meeting Engine — Codex Implementation Spec
 
 > **Purpose:** Single-file, self-contained implementation specification.
 > An AI coding agent (Codex) should be able to read ONLY this file and
 > implement the entire system correctly, phase by phase.
 >
-> **Reference:** `OPENFANG_MEGA_DOC_TR.md` contains full analysis, rationale,
+> **Reference:** `PULSIVO_SALESMAN_MEGA_DOC_TR.md` contains full analysis, rationale,
 > and architectural discussion. This file contains ONLY actionable instructions.
 >
 > **Language:** Rust (backend), Alpine.js (frontend), SQLite (data), SQL (DDL)
@@ -30,9 +30,9 @@
 ## 0. CODEBASE MAP
 
 ```
-/programs/openfang/
+/programs/pulsivo-salesman/
 ├── crates/
-│   ├── openfang-api/
+│   ├── pulsivo-salesman-api/
 │   │   ├── src/
 │   │   │   ├── sales.rs          # 14,466 lines — Sales/Prospecting engine (ALL pipeline logic)
 │   │   │   ├── codex_oauth.rs    # 1,335 lines — Codex OAuth2 PKCE flow
@@ -42,25 +42,25 @@
 │   │       ├── index_body.html   # 508 lines — Dashboard SPA shell
 │   │       └── js/pages/
 │   │           └── sales.js      # 611 lines — Sales UI (Alpine.js)
-│   ├── openfang-kernel/src/
+│   ├── pulsivo-salesman-kernel/src/
 │   │   └── kernel.rs             # ~5,000 lines — Kernel orchestration
-│   ├── openfang-runtime/src/
+│   ├── pulsivo-salesman-runtime/src/
 │   │   └── drivers/codex.rs      # Codex LLM driver
-│   ├── openfang-types/src/       # Shared types
-│   ├── openfang-memory/src/      # SQLite + semantic search
-│   └── openfang-wire/src/        # OFP mesh protocol
+│   ├── pulsivo-salesman-types/src/       # Shared types
+│   ├── pulsivo-salesman-memory/src/      # SQLite + semantic search
+│   └── pulsivo-salesman-wire/src/        # OFP mesh protocol
 ├── xtask/                        # Build automation
 ├── CLAUDE.md                     # Agent instructions
-├── OPENFANG_MEGA_DOC_TR.md       # Full analysis reference
+├── PULSIVO_SALESMAN_MEGA_DOC_TR.md       # Full analysis reference
 └── Cargo.toml                    # Workspace root
 ```
 
 **Key facts:**
-- Config: `~/.openfang/config.toml`
-- Sales DB: `~/.openfang/sales.db` (SQLite)
+- Config: `~/.pulsivo-salesman/config.toml`
+- Sales DB: `~/.pulsivo-salesman/sales.db` (SQLite)
 - Default API: `http://127.0.0.1:4200`
 - LLM: `gpt-5.3-codex` via OpenAI Codex OAuth (`openai-codex` provider)
-- CLI start command: `target/release/openfang.exe start`
+- CLI start command: `target/release/pulsivo-salesman.exe start`
 
 ---
 
@@ -176,7 +176,7 @@ pub struct SalesLead {
 }
 ```
 
-### 2.2 Current DB Schema (8 tables in `~/.openfang/sales.db`)
+### 2.2 Current DB Schema (8 tables in `~/.pulsivo-salesman/sales.db`)
 
 ```sql
 sales_profile       (id INTEGER PK CHECK(id=1), json TEXT, updated_at TEXT)
@@ -714,7 +714,7 @@ Legacy tables remain functional during transition. New tables run in parallel:
 
 ### TASK-01: Normalize + Verify + Classify Gateway
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** None
 **Action:** Create a module of gateway functions that ALL data sources must pass through. Every directory scraper, web search result, LLM output, and site HTML extraction must call these before storage.
 
@@ -819,7 +819,7 @@ pub fn is_placeholder_name(name: &str) -> bool {
 
 ### TASK-02: Consumer Domain Gate on ALL Code Paths
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** TASK-01
 **Action:** Add `is_valid_company_domain()` call at the output of EVERY directory scraper function. Specifically, wrap the domain extraction in each of these 8 functions:
 
@@ -844,7 +844,7 @@ Also add the gate to `llm_generate_company_candidates()` and `discover_via_web_s
 
 ### TASK-03: Turkish Placeholder Name List
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** TASK-01
 **Action:** Replace the existing `contact_name_is_placeholder()` function body with a call to the new `is_placeholder_name()` from TASK-01. The new function already includes Turkish entries.
 
@@ -864,7 +864,7 @@ fn contact_name_is_placeholder(name: Option<&str>) -> bool {
 
 ### TASK-04: Phone Number Pass-Through
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** TASK-01
 **Action:**
 
@@ -898,7 +898,7 @@ phone: candidate.phone.as_ref().and_then(|p| normalize_phone(p)),
 
 ### TASK-05: Idempotency Key for Approvals
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** None
 **Action:** Before creating an approval record, check for existing pending approval with same channel + recipient:
 
@@ -928,7 +928,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_approvals_pending_recipient
 
 ### TASK-06: Remove LinkedIn Browser Automation
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** None
 **Action:**
 
@@ -959,7 +959,7 @@ Step 3: In the dashboard, show LinkedIn tasks as "Manual Action Required" items.
 
 ### TASK-07: Async Job + Stage Checkpointing
 
-**Files:** `crates/openfang-api/src/sales.rs`, `crates/openfang-api/src/server.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`, `crates/pulsivo-salesman-api/src/server.rs`
 **Depends on:** None
 **Action:**
 
@@ -1006,7 +1006,7 @@ POST /api/sales/jobs/{job_id}/retry
 
 ### TASK-08: Suppression Table + Unsubscribe Ledger
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** None (uses DDL from Section 3)
 **Action:**
 
@@ -1051,7 +1051,7 @@ fn suppress_contact(db: &Connection, value: &str, reason: &str, permanent: bool)
 
 ### TASK-09: Field-Level Confidence
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** TASK-01
 **Action:** Add confidence tracking to prospect profile data. When extracting data from different sources, tag each field with confidence:
 
@@ -1077,7 +1077,7 @@ Store in `evidence` table (DDL in Section 3). Each extracted field gets an evide
 
 ### TASK-10: Fix target_geo Default
 
-**Files:** `crates/openfang-api/src/sales.rs`, `crates/openfang-api/static/js/pages/sales.js`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`, `crates/pulsivo-salesman-api/static/js/pages/sales.js`
 **Depends on:** None
 **Action:**
 
@@ -1111,7 +1111,7 @@ if profile.target_geo.is_empty() {
 
 ### TASK-11: Scraper Health Check
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** None (uses DDL from Section 3)
 **Action:**
 
@@ -1155,7 +1155,7 @@ Step 4: Add API endpoint `GET /api/sales/source-health` to expose health status.
 
 ### TASK-12: Bounce Shield (Email Validation)
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** TASK-08 (suppressions)
 **Action:**
 
@@ -1230,7 +1230,7 @@ Step 2: Call `validate_email_for_sending()` in `approve_and_send()` before SMTP 
 
 ### TASK-13: Sending Subdomain Infrastructure
 
-**Files:** `crates/openfang-api/src/sales.rs`, config
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`, config
 **Depends on:** None
 **Action:**
 
@@ -1269,7 +1269,7 @@ Step 3: Reject sending from main brand domain. Validate subdomain pattern.
 
 ### TASK-14: SPF + DKIM + DMARC + One-Click Unsubscribe
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** TASK-13
 **Action:**
 
@@ -1306,7 +1306,7 @@ Step 4: Document that sending subdomains MUST have SPF + DKIM + DMARC configured
 
 ### TASK-15: Canonical Relational Core Migration
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** All Phase 0 tasks
 **Action:**
 
@@ -1342,7 +1342,7 @@ Step 3: Run migration on first boot if `migration_version < 2`.
 
 ### TASK-16: Discovery / Activation Separation
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** TASK-15, TASK-07
 **Action:**
 
@@ -1384,7 +1384,7 @@ async fn run_activation(daily_target: u32, job_id: &str) -> Result<()> {
 
 ### TASK-17: 5-Axis Scoring Engine
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** TASK-15
 **Action:**
 
@@ -1438,7 +1438,7 @@ pub fn compute_five_axis_score(
 
 ### TASK-18: Send Gate Logic
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** TASK-17
 **Action:**
 
@@ -1496,7 +1496,7 @@ pub fn send_gate(score: &FiveAxisScore) -> SendGateDecision {
 
 ### TASK-19: Outcome Classification Ingest
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** TASK-15, TASK-08
 **Action:**
 
@@ -1554,7 +1554,7 @@ POST /api/sales/outcomes/webhook
 
 ### TASK-19b: Signal Effect Horizon Classifier
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** TASK-15
 **Action:**
 
@@ -1590,7 +1590,7 @@ pub fn classify_signal_horizon(signal_type: &str, text: &str) -> (&'static str, 
 
 ### TASK-19c: Signal Rationale Records
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** TASK-19b
 **Action:** When creating a signal, also create a rationale record explaining WHY it matters:
 
@@ -1633,7 +1633,7 @@ fn create_signal_with_rationale(
 
 ### TASK-20: Sender Pool + Mailbox Policy
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** TASK-13 (Phase 0), TASK-15
 **Action:** Create `sender_policies` records from config. Track per-mailbox daily sends. Implement warm-up schedule (start at 5/day, increase by 5/day until target cap).
 
@@ -1643,7 +1643,7 @@ fn create_signal_with_rationale(
 
 ### TASK-21: Evidence Provenance + Source Hierarchy
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** TASK-15
 **Action:** Every data extraction creates `artifacts` + `evidence` records. When conflicting data exists (e.g., two different emails for same contact), resolve using confidence hierarchy:
 
@@ -1661,7 +1661,7 @@ LLM generation = 0.4
 
 ### TASK-22: Research Workbench / Thesis Engine
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** TASK-15, TASK-17
 **Action:**
 
@@ -1719,7 +1719,7 @@ async fn build_account_thesis(
 
 ### TASK-23: Tier-Based Discovery Model
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** TASK-17
 **Action:**
 
@@ -1744,7 +1744,7 @@ A-tier accounts get: full multi-page site crawl, multi-query OSINT, LLM deep res
 
 ### TASK-24: 4-Layer LinkedIn Search
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** TASK-15
 **Action:**
 
@@ -1792,7 +1792,7 @@ fn transliterate_turkish(s: &str) -> String {
 
 ### TASK-25: Email Pattern Guesser
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** TASK-12 (bounce shield)
 **Action:**
 
@@ -1826,7 +1826,7 @@ async fn guess_personal_email(
 
 ### TASK-26: Turkish Site Page Expansion
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** None
 **Action:** Expand site HTML enrichment to fetch additional Turkish-language pages:
 
@@ -1849,7 +1849,7 @@ Add sitemap.xml parsing: if `/sitemap.xml` exists, extract relevant URLs matchin
 
 ### TASK-27: Job Posting Intent Signals
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** TASK-15, TASK-19b
 **Action:**
 
@@ -1893,7 +1893,7 @@ async fn search_job_posting_signals(
 
 ### TASK-28: Tech Stack Detection
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** TASK-26
 **Action:**
 
@@ -1938,7 +1938,7 @@ fn detect_tech_stack(html: &str, headers: &HashMap<String, String>) -> Vec<Strin
 
 ### TASK-29: 2-Stage LLM Message Generation
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** TASK-22 (thesis engine)
 **Action:**
 
@@ -2024,7 +2024,7 @@ async fn generate_message_copy(
 
 ### TASK-30: Sequence Planner
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** TASK-29, TASK-15
 **Action:**
 
@@ -2064,7 +2064,7 @@ Sequence advancement: after each outcome, check if sequence should advance, paus
 
 ### TASK-31: Outcome Attribution Snapshot
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** TASK-19, TASK-17
 **Action:** At every touch send, capture full snapshot of account state:
 
@@ -2101,7 +2101,7 @@ fn capture_attribution_snapshot(
 
 ### TASK-32: Missed Signal Analyzer
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** TASK-31
 **Action:** After positive outcome (reply, meeting), analyze what signals were used vs missed:
 
@@ -2141,7 +2141,7 @@ async fn analyze_missed_signals(
 
 ### TASK-33: Rule Proposal Sandbox
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** TASK-32
 **Action:** Create system for proposing policy changes that require operator approval:
 
@@ -2162,7 +2162,7 @@ POST /api/sales/policy/proposals/{id}/reject  → reject proposal
 
 ### TASK-34: Calibration + Exploration Manager
 
-**Files:** `crates/openfang-api/src/sales.rs`
+**Files:** `crates/pulsivo-salesman-api/src/sales.rs`
 **Depends on:** TASK-16 (activation queue)
 **Action:**
 
