@@ -1,0 +1,138 @@
+          <section class="sales-panel-section" x-show="activeTab === 'profiles' && !isB2C && selectedProspectRecord()">
+            <template x-if="selectedProspectRecord()">
+              <div>
+                <div class="sales-panel-header">
+                  <h3>Secili account dossier</h3>
+                  <div class="sales-btn-row">
+                    <span class="badge" :class="prospectResearchClass(selectedProspectRecord().research_status)" x-text="selectedProspectRecord().research_status"></span>
+                    <span class="badge badge-muted" x-text="prospectConfidencePct(selectedProspectRecord())"></span>
+                  </div>
+                </div>
+                <div>
+                  <div class="text-sm" style="margin-bottom:10px" x-text="selectedProspectRecord().summary"></div>
+                  <div class="sales-empty" x-show="dossierLoading">
+                    <p>Dossier yukleniyor...</p>
+                  </div>
+                  <div x-show="selectedDossier && !dossierLoading" class="sales-dossier-grid">
+                    <div class="sales-panel-section sales-panel-section--inner">
+                      <div class="sales-panel-header">
+                        <h3>5-axis score</h3>
+                        <div class="sales-btn-row">
+                          <span class="badge badge-muted" x-text="sendGateLabel()"></span>
+                          <span class="badge badge-success" x-text="selectedAccountLabel"></span>
+                        </div>
+                      </div>
+                      <div class="sales-score-grid">
+                        <template x-for="bar in selectedScoreBars()" :key="bar.key">
+                          <div class="sales-score-card">
+                            <div class="sales-score-meta">
+                              <span x-text="bar.label"></span>
+                              <strong x-text="asPercent(bar.value)"></strong>
+                            </div>
+                            <div class="sales-score-track">
+                              <div class="sales-score-fill" :class="scoreBarClass(bar)" :style="'width:' + scoreBarWidth(bar)"></div>
+                            </div>
+                          </div>
+                        </template>
+                      </div>
+                      <div class="text-xs text-dim" x-show="sendGateReason()" x-text="sendGateReason()"></div>
+                    </div>
+
+                    <div class="sales-panel-section sales-panel-section--inner">
+                      <div class="sales-panel-header">
+                        <h3>Thesis</h3>
+                        <span class="badge badge-muted" x-text="selectedDossier && selectedDossier.thesis ? (selectedDossier.thesis.thesis_status || '-') : '-'"></span>
+                      </div>
+                      <div class="sales-thesis-block" x-show="selectedDossier && selectedDossier.thesis">
+                        <div class="form-group">
+                          <label>Why this account</label>
+                          <div class="text-sm" x-text="selectedDossier.thesis.why_this_account || '-'"></div>
+                        </div>
+                        <div class="form-group">
+                          <label>Why now</label>
+                          <div class="text-sm" x-text="selectedDossier.thesis.why_now || '-'"></div>
+                        </div>
+                        <div class="sales-form-grid">
+                          <div class="form-group">
+                            <label>Recommended channel</label>
+                            <div class="text-sm" x-text="selectedDossier.thesis.recommended_channel || '-'"></div>
+                          </div>
+                          <div class="form-group">
+                            <label>Recommended pain</label>
+                            <div class="text-sm" x-text="selectedDossier.thesis.recommended_pain || '-'"></div>
+                          </div>
+                          <div class="form-group">
+                            <label>Next action</label>
+                            <div class="text-sm" x-text="selectedDossier.next_action || '-'"></div>
+                          </div>
+                          <div class="form-group">
+                            <label>Positive reply / meeting</label>
+                            <div class="text-sm" x-text="selectedPositiveReplyRate + ' / ' + selectedMeetingRate"></div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="sales-form-grid">
+                    <div class="form-group">
+                      <label>Birincil temas</label>
+                      <div class="text-sm" x-text="prospectPrimaryContact(selectedProspectRecord())"></div>
+                      <div class="text-xs text-dim" x-text="prospectChannels(selectedProspectRecord())"></div>
+                    </div>
+                    <div class="form-group">
+                      <label>Onerilen ilk kanal</label>
+                      <div class="text-sm" x-text="selectedProspectRecord().recommended_channel"></div>
+                      <div class="text-xs text-dim" x-text="selectedProspectRecord().contact_count + ' temas / ' + selectedProspectRecord().source_count + ' sinyal'"></div>
+                    </div>
+                    <div class="form-group">
+                      <label>Siradaki hamle</label>
+                      <div class="text-sm" x-text="prospectNextAction(selectedProspectRecord())"></div>
+                    </div>
+                    <div class="form-group">
+                      <label>Buyer roles</label>
+                      <div class="text-sm" x-text="(selectedProspectRecord().buyer_roles || []).join(' | ') || '-'"></div>
+                    </div>
+                    <div class="form-group">
+                      <label>Outreach angle</label>
+                      <div class="text-sm" x-text="selectedProspectRecord().outreach_angle || '-'"></div>
+                    </div>
+                    <div class="form-group">
+                      <label>Pain points</label>
+                      <div class="text-sm" x-text="(selectedProspectRecord().pain_points || []).join(' | ') || '-'"></div>
+                    </div>
+                    <div class="form-group">
+                      <label>Trigger events</label>
+                      <div class="text-sm" x-text="(selectedProspectRecord().trigger_events || []).join(' | ') || '-'"></div>
+                    </div>
+                    <div class="form-group">
+                      <label>OSINT baglantilar</label>
+                      <div class="text-xs" x-show="prospectOsintLinks(selectedProspectRecord()).length === 0">-</div>
+                      <div class="text-xs" x-show="prospectOsintLinks(selectedProspectRecord()).length > 0">
+                        <template x-for="link in prospectOsintLinks(selectedProspectRecord())" :key="link">
+                          <div><a :href="link" target="_blank" rel="noreferrer" x-text="link"></a></div>
+                        </template>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="sales-panel-section sales-panel-section--inner" x-show="selectedDossier && selectedDossier.signals && selectedDossier.signals.length > 0">
+                    <div class="sales-panel-header">
+                      <h3>Top signals</h3>
+                      <span class="badge badge-muted" x-text="selectedDossier.source || '-'"></span>
+                    </div>
+                    <div class="sales-signal-list">
+                      <template x-for="signal in selectedDossier.signals" :key="signal.id || signal.text">
+                        <div class="sales-signal-item">
+                          <div class="sales-signal-top">
+                            <strong x-text="signal.signal_type || 'signal'"></strong>
+                            <span class="badge badge-muted" x-text="signal.effect_horizon || '-'"></span>
+                          </div>
+                          <div class="text-sm" x-text="signal.text"></div>
+                          <div class="text-xs text-dim" x-text="signal.why_it_matters || '-'"></div>
+                        </div>
+                      </template>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </template>
+          </section>

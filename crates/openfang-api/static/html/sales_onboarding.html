@@ -1,0 +1,172 @@
+        <!-- ─── ONBOARDING ─── -->
+        <div x-show="showOnboarding">
+
+          <!-- Progress header -->
+          <div class="sales-section-header">
+            <h2 x-text="onboardingTitle"></h2>
+            <p class="text-sm text-dim" x-text="onboardingIntro"></p>
+          </div>
+
+          <!-- Step progress bar -->
+          <div class="sales-steps-bar">
+            <template x-for="(s, idx) in onboarding.steps" :key="s.key">
+              <div class="sales-step-item"
+                   :class="{
+                     'is-done': s.done,
+                     'is-active': !s.done && onboarding.active_step === (idx + 1),
+                     'is-upcoming': !s.done && onboarding.active_step !== (idx + 1)
+                   }">
+                <div class="sales-step-num">
+                  <template x-if="s.done"><span>&#10003;</span></template>
+                  <template x-if="!s.done"><span x-text="idx + 1"></span></template>
+                </div>
+                <span class="sales-step-label" x-text="s.title"></span>
+              </div>
+            </template>
+          </div>
+
+          <!-- Step 1: Codex OAuth -->
+          <section class="sales-step-section">
+            <div class="sales-step-heading">
+              <div class="sales-step-heading-num">1</div>
+              <div>
+                <h3>Codex OAuth</h3>
+                <p class="text-xs text-dim">Varsayilan model: gpt-5.3-codex (high reasoning)</p>
+              </div>
+              <div class="sales-step-status">
+                <span class="badge" :class="oauth.connected ? 'badge-success' : 'badge-warn'" x-text="oauth.connected ? 'Bagli' : 'Baglantiyi bekliyor'"></span>
+              </div>
+            </div>
+
+            <div class="sales-step-body">
+              <div x-show="oauth.connected && oauth.expires_at" class="text-xs text-dim" style="margin-bottom:8px">
+                Token bitis: <span x-text="formatDateTime(oauth.expires_at)"></span>
+              </div>
+              <div x-show="!oauth.connected && oauth.reason" class="text-xs" style="color:var(--warning);margin-bottom:8px" x-text="oauth.reason"></div>
+
+              <div class="sales-btn-row">
+                <button class="btn btn-primary btn-sm" @click="startOAuth()" :disabled="oauthBusy">
+                  <span x-show="!oauthBusy">OAuth bagla</span>
+                  <span x-show="oauthBusy">Bekleyin...</span>
+                </button>
+                <button class="btn btn-ghost btn-sm" @click="importCliAuth()" :disabled="oauthBusy">~/.codex/auth.json aktar</button>
+                <button class="btn btn-ghost btn-sm" @click="checkOAuthStatus()" :disabled="oauthBusy">Durum kontrol</button>
+                <button class="btn btn-danger btn-sm" @click="logoutOAuth()" :disabled="oauthBusy || !oauth.connected" x-show="oauth.connected">Baglantiyi kes</button>
+              </div>
+
+              <div x-show="oauth.auth_url" style="margin-top:12px">
+                <a class="btn btn-ghost btn-sm" :href="oauth.auth_url" target="_blank" rel="noopener">OAuth girisini ac &#8599;</a>
+                <div style="margin-top:10px">
+                  <p class="text-xs text-dim" style="margin-bottom:6px">Callback sorununda OAuth kodunu yapistirin:</p>
+                  <div class="sales-inline-form">
+                    <input class="form-input" x-model="manualCode" placeholder="OAuth code">
+                    <button class="btn btn-primary btn-sm" @click="submitManualCode()" :disabled="oauthBusy">Kodu degistir</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- Step 2: Company brief -->
+          <section class="sales-step-section">
+            <div class="sales-step-heading">
+              <div class="sales-step-heading-num">2</div>
+              <div>
+                <h3 x-text="briefLabel"></h3>
+                <p class="text-xs text-dim" x-text="briefHelpText"></p>
+              </div>
+            </div>
+            <div class="sales-step-body">
+              <textarea class="form-textarea" x-model="profileBrief" style="min-height:120px" :placeholder="briefPlaceholder"></textarea>
+              <div class="sales-btn-row" style="margin-top:10px">
+                <button class="btn btn-primary btn-sm" @click="saveBriefAndAutofill()" :disabled="autofillingProfile || !profileBrief.trim()">
+                  <span x-show="!autofillingProfile">Brieften otomatik doldur</span>
+                  <span x-show="autofillingProfile">Isleniyor...</span>
+                </button>
+                <span class="text-xs text-dim">Bu adim briefi kaydeder ve profili doldurur.</span>
+              </div>
+            </div>
+          </section>
+
+          <!-- Step 3: Profile verification -->
+          <section class="sales-step-section">
+            <div class="sales-step-heading">
+              <div class="sales-step-heading-num">3</div>
+              <div>
+                <h3 x-text="isB2C ? 'ICP profil dogrulamasi' : 'Profil dogrulama'"></h3>
+                <p class="text-xs text-dim" x-text="isB2C ? 'B2C niche, geo ve gonderen ayarlarini kontrol edin; social discovery hedefini netlestirin.' : 'Otomatik doldurulan alanlari kontrol edin, gerekirse duzenleyin.'"></p>
+              </div>
+            </div>
+            <div class="sales-step-body">
+              <div class="sales-form-grid">
+                <div class="form-group"><label>Urun adi</label><input class="form-input" x-model="profile.product_name"></div>
+                <div class="form-group"><label>Hedef sektor</label><input class="form-input" x-model="profile.target_industry"></div>
+                <div class="form-group"><label>Hedef cografi</label><input class="form-input" x-model="profile.target_geo"></div>
+                <div class="form-group"><label>Gonderen adi</label><input class="form-input" x-model="profile.sender_name"></div>
+                <div class="form-group"><label>Gonderen e-posta</label><input class="form-input" x-model="profile.sender_email"></div>
+                <div class="form-group"><label>LinkedIn (opsiyonel)</label><input class="form-input" x-model="profile.sender_linkedin"></div>
+                <div class="form-group">
+                  <label>Hedef title politikasi</label>
+                  <select class="form-select" x-model="profile.target_title_policy">
+                    <option value="ceo_then_founder">CEO sonra Founder</option>
+                    <option value="ceo_only">Sadece CEO</option>
+                  </select>
+                </div>
+                <div class="form-group"><label>Gunluk profil hedefi</label><input type="number" min="1" max="200" class="form-input" x-model.number="profile.daily_target"></div>
+                <div class="form-group"><label>Gunluk gonderim limiti</label><input type="number" min="1" max="200" class="form-input" x-model.number="profile.daily_send_cap"></div>
+                <div class="form-group"><label>Calisma saati (0-23)</label><input type="number" min="0" max="23" class="form-input" x-model.number="profile.schedule_hour_local"></div>
+              </div>
+              <div class="form-group">
+                <label>Urun deger onerisi</label>
+                <textarea class="form-textarea" x-model="profile.product_description" style="min-height:100px"></textarea>
+              </div>
+              <button class="btn btn-primary btn-sm" @click="saveProfile()" :disabled="savingProfile">
+                <span x-show="!savingProfile">Profili kaydet</span>
+                <span x-show="savingProfile">Kaydediliyor...</span>
+              </button>
+            </div>
+          </section>
+
+          <!-- Step 4: First profiling run -->
+          <section class="sales-step-section">
+            <div class="sales-step-heading">
+              <div class="sales-step-heading-num">4</div>
+              <div>
+                <h3 x-text="firstRunLabel"></h3>
+                <p class="text-xs text-dim" x-text="firstRunHelp"></p>
+              </div>
+              <button class="btn btn-primary btn-sm" @click="runNow()" :disabled="runningNow" style="margin-left:auto">
+                <span x-show="!runningNow" x-text="firstRunActionLabel"></span>
+                <span x-show="runningNow">Calisiyor...</span>
+              </button>
+            </div>
+            <div class="sales-step-body">
+              <div class="table-wrap" x-show="runProspects.length > 0">
+                <table>
+                  <thead><tr><th x-text="isB2C ? 'Profile' : 'Sirket'"></th><th>Durum</th><th x-text="isB2C ? 'Birincil profil' : 'Birincil temas'"></th><th>Kanal</th><th>Fit</th><th>ICP sinyali</th></tr></thead>
+                  <tbody>
+                    <template x-for="p in runProspects" :key="p.id">
+                      <tr>
+                        <td><span class="font-bold" x-text="p.company"></span><div class="text-xs text-dim" x-text="p.company_domain"></div></td>
+                        <td><span class="badge" :class="prospectStatusClass(p.profile_status)" x-text="p.profile_status"></span></td>
+                        <td class="text-xs">
+                          <div x-text="prospectPrimaryContact(p)"></div>
+                          <div class="text-dim" x-text="p.contact_count + ' temas'"></div>
+                        </td>
+                        <td class="text-xs" x-text="prospectChannels(p)"></td>
+                        <td x-text="p.fit_score"></td>
+                        <td class="text-xs">
+                          <div class="sales-line-clamp" x-text="prospectSignalsPreview(p).join(' | ') || '-'"></div>
+                        </td>
+                      </tr>
+                    </template>
+                  </tbody>
+                </table>
+              </div>
+              <div class="sales-empty" x-show="runProspects.length === 0">
+                <p x-text="isB2C ? 'Henuz social profile yok. Briefinizi girip social discovery run baslatabilirsiniz.' : 'Henuz prospect profile yok. Profilinizi doldurup run baslatabilirsiniz.'"></p>
+              </div>
+            </div>
+          </section>
+        </div>
+

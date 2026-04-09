@@ -319,3 +319,5 @@ var OpenFangAPI = (function() {
     onConnectionChange: onConnectionChange
   };
 })();
+
+export { OpenFangAPI, OpenFangToast, friendlyError };

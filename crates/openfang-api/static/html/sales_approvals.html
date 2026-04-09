@@ -1,0 +1,81 @@
+          <!-- Approval queue -->
+          <section class="sales-panel-section" x-show="activeTab === 'approvals' && !isB2C">
+            <div class="sales-panel-header">
+              <h3>Mesaj onay kuyrugu</h3>
+              <div class="sales-btn-row">
+                <button class="btn btn-ghost btn-sm" @click="toggleAllPendingApprovals(true)">Tumunu sec</button>
+                <button class="btn btn-ghost btn-sm" @click="toggleAllPendingApprovals(false)">Temizle</button>
+                <button class="btn btn-primary btn-sm" @click="bulkApproveSelected()" :disabled="selectedApprovalCount === 0">Approve all Ready</button>
+                <button class="btn btn-ghost btn-sm" @click="loadApprovals()">Yenile</button>
+              </div>
+            </div>
+            <div class="sales-keyhint">Hizli mod: <strong>&rarr;</strong> approve, <strong>&larr;</strong> reject, <strong>&uarr;</strong> rewrite, <strong>&darr;</strong> next</div>
+            <div class="table-wrap" x-show="pendingApprovalItems.length > 0">
+              <table>
+                <thead><tr><th></th><th>Kanal</th><th>Alici</th><th>Taslak</th><th>Durum</th><th>Olusma</th><th>Aksiyon</th></tr></thead>
+                <tbody>
+                  <template x-for="a in pendingApprovalItems" :key="a.id">
+                    <tr :class="approvalRowClass(a)">
+                      <td>
+                        <input type="checkbox" :checked="approvalSelected(a.id)" @change="toggleApprovalSelection(a.id, $event.target.checked)">
+                      </td>
+                      <td x-text="a.channel"></td>
+                      <td class="text-xs">
+                        <div x-text="approvalRecipient(a)"></div>
+                        <div x-show="approvalHasWarning(a)" class="sales-approval-warning" x-text="approvalWarningLabel(a)"></div>
+                      </td>
+                      <td class="text-xs">
+                        <div class="sales-preview-card">
+                          <div class="font-bold" x-text="approvalTitle(a)"></div>
+                          <pre class="sales-preview-body" x-text="approvalBody(a) || '-'"></pre>
+                          <div class="sales-btn-row" style="margin-top:8px">
+                            <button class="btn btn-ghost btn-sm" @click="startApprovalEdit(a)">Edit</button>
+                            <span class="badge badge-muted" x-show="approvalClassification(a)" x-text="approvalClassification(a)"></span>
+                          </div>
+                          <div class="sales-approval-editor" x-show="approvalEditorId === a.id">
+                            <template x-if="a.channel === 'email'">
+                              <div>
+                                <div class="form-group">
+                                  <label>Icebreaker</label>
+                                  <input class="form-input" x-model="approvalDraft(a).icebreaker" @input="approvalDraft(a).body = approvalDraft(a).icebreaker + (approvalBodyRemainder(a) ? '\n\n' + approvalBodyRemainder(a) : '')">
+                                </div>
+                                <div class="form-group">
+                                  <label>Subject</label>
+                                  <input class="form-input" x-model="approvalDraft(a).subject">
+                                </div>
+                                <div class="form-group">
+                                  <label>Body</label>
+                                  <textarea class="form-textarea" style="min-height:120px" x-model="approvalDraft(a).body"></textarea>
+                                </div>
+                              </div>
+                            </template>
+                            <template x-if="a.channel !== 'email'">
+                              <div class="form-group">
+                                <label>LinkedIn copy</label>
+                                <textarea class="form-textarea" style="min-height:120px" x-model="approvalDraft(a).message"></textarea>
+                              </div>
+                            </template>
+                            <div class="sales-btn-row">
+                              <button class="btn btn-primary btn-sm" @click="saveApprovalEdit(a.id)">Kaydet</button>
+                              <button class="btn btn-ghost btn-sm" @click="cancelApprovalEdit()">Vazgec</button>
+                            </div>
+                          </div>
+                        </div>
+                      </td>
+                      <td><span class="badge" :class="a.status === 'pending' ? 'badge-warn' : (a.status === 'approved' ? 'badge-success' : 'badge-muted')" x-text="a.status"></span></td>
+                      <td class="text-xs" x-text="formatDateTime(a.created_at)"></td>
+                      <td>
+                        <div class="sales-btn-row" x-show="a.status === 'pending'">
+                          <button class="btn btn-success btn-sm" @click="approve(a.id)" x-text="a.channel === 'linkedin_assist' ? 'Operator gorevi ac' : 'Onayla'"></button>
+                          <button class="btn btn-danger btn-sm" @click="reject(a.id)">Reddet</button>
+                        </div>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+            <div class="sales-empty" x-show="pendingApprovalItems.length === 0">
+              <p>Bekleyen onay yok. Run alarak yeni taslaklar olusturun.</p>
+            </div>
+          </section>

@@ -1,0 +1,151 @@
+        <!-- ─── OPERATION PANEL ─── -->
+        <div x-show="!showOnboarding">
+
+          <div class="sales-section-header">
+            <h2 x-text="modeLabel"></h2>
+            <div class="sales-btn-row">
+              <button class="btn btn-primary btn-sm" @click="runNow()" :disabled="runningNow">
+                <span x-show="!runningNow" x-text="runActionLabel"></span>
+                <span x-show="runningNow">Calisiyor...</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="sales-tabbar">
+            <template x-for="tab in tabItems" :key="tab.key">
+              <button class="sales-tab" :class="{ active: activeTab === tab.key }" @click="setTab(tab.key)" x-text="tab.label"></button>
+            </template>
+          </div>
+
+          <!-- Stats grid -->
+          <div class="sales-stats-grid" x-show="activeTab === 'command'">
+            <div class="sales-stat-card">
+              <div class="sales-stat-label">Toplam run</div>
+              <div class="sales-stat-value" x-text="runs.length"></div>
+            </div>
+            <div class="sales-stat-card">
+              <div class="sales-stat-label" x-text="isB2C ? 'Social profiles' : 'Prospect profile'"></div>
+              <div class="sales-stat-value" x-text="prospects.length"></div>
+            </div>
+            <div class="sales-stat-card">
+              <div class="sales-stat-label" x-text="isB2C ? 'DM-ready' : 'Contact-ready'"></div>
+              <div class="sales-stat-value" x-text="contactReadyProspects"></div>
+            </div>
+            <div class="sales-stat-card">
+              <div class="sales-stat-label" x-text="isB2C ? 'Research backlog' : 'Company-only backlog'"></div>
+              <div class="sales-stat-value" x-text="companyOnlyProspects"></div>
+            </div>
+            <div class="sales-stat-card" x-show="!isB2C">
+              <div class="sales-stat-label">Bekleyen onay</div>
+              <div class="sales-stat-value" :style="pendingApprovals > 0 ? 'color:var(--warning)' : ''" x-text="pendingApprovals"></div>
+            </div>
+            <div class="sales-stat-card" x-show="!isB2C">
+              <div class="sales-stat-label">Teslimat</div>
+              <div class="sales-stat-value" x-text="deliveries.length"></div>
+            </div>
+            <div class="sales-stat-card">
+              <div class="sales-stat-label">Aktif job</div>
+              <div class="sales-stat-value" x-text="jobProgress ? (jobProgress.current_stage || jobProgress.status || '-') : '-'"></div>
+            </div>
+            <div class="sales-stat-card" x-show="!isB2C">
+              <div class="sales-stat-label">Secili account reply</div>
+              <div class="sales-stat-value" x-text="selectedPositiveReplyRate"></div>
+            </div>
+            <div class="sales-stat-card" x-show="!isB2C">
+              <div class="sales-stat-label">Secili account meeting</div>
+              <div class="sales-stat-value" x-text="selectedMeetingRate"></div>
+            </div>
+            <div class="sales-stat-card" x-show="isB2C">
+              <div class="sales-stat-label">Secili kanal</div>
+              <div class="sales-stat-value" style="font-size:18px" x-text="selectedProspectRecord() ? prospectChannels(selectedProspectRecord()) : '-'"></div>
+            </div>
+            <div class="sales-stat-card" x-show="isB2C">
+              <div class="sales-stat-label">Secili signal</div>
+              <div class="sales-stat-value" x-text="selectedProspectSignalCount"></div>
+            </div>
+            <div class="sales-stat-card" x-show="isB2C">
+              <div class="sales-stat-label">Secili link</div>
+              <div class="sales-stat-value" x-text="selectedProspectLinkCount"></div>
+            </div>
+          </div>
+
+          <section class="sales-panel-section" x-show="activeTab === 'command' && jobProgress">
+            <div class="sales-panel-header">
+              <h3>Canli job ilerlemesi</h3>
+              <div class="sales-btn-row">
+                <button class="btn btn-ghost btn-sm" @click="retryJob(false)" x-show="jobProgress && jobProgress.status === 'failed'">Retry</button>
+                <button class="btn btn-ghost btn-sm" @click="retryJob(true)" x-show="jobProgress && jobProgress.status === 'failed'">Fresh retry</button>
+              </div>
+            </div>
+            <div class="sales-form-grid">
+              <div class="form-group">
+                <label>Job</label>
+                <div class="text-sm" x-text="jobProgress && jobProgress.job_id ? jobProgress.job_id : '-'"></div>
+              </div>
+              <div class="form-group">
+                <label>Durum</label>
+                <div class="text-sm"><span class="badge" :class="runBadgeClass(jobProgress)" x-text="jobProgress && jobProgress.status ? jobProgress.status : '-'"></span></div>
+              </div>
+              <div class="form-group">
+                <label>Aktif asama</label>
+                <div class="text-sm" x-text="jobProgress && jobProgress.current_stage ? jobProgress.current_stage : '-'"></div>
+              </div>
+              <div class="form-group">
+                <label>Hata</label>
+                <div class="text-sm" x-text="jobProgress && jobProgress.error_message ? jobProgress.error_message : '-'"></div>
+              </div>
+              <div class="form-group" x-show="jobProgressSummary()">
+                <label>Canli ozet</label>
+                <div class="text-sm" x-text="jobProgressSummary()"></div>
+              </div>
+              <div class="form-group" x-show="jobProgress">
+                <label>Ilerleme</label>
+                <div class="progress-bar">
+                  <div class="progress-bar-fill" :style="'width:' + jobProgressPercent() + '%'"></div>
+                </div>
+                <div class="text-xs mt-1" x-text="jobProgressPercent() + '%'"></div>
+              </div>
+            </div>
+            <div class="table-wrap" x-show="jobProgress && (jobProgress.stages || []).length > 0">
+              <table>
+                <thead><tr><th>Asama</th><th>Durum</th><th>Not</th><th>Basladi</th><th>Bitti</th></tr></thead>
+                <tbody>
+                  <template x-for="stage in (jobProgress ? (jobProgress.stages || []) : [])" :key="stage.name">
+                    <tr>
+                      <td x-text="stage.name"></td>
+                      <td><span class="badge" :class="jobStageBadgeClass(stage)" x-text="stage.status"></span></td>
+                      <td class="text-xs" x-text="jobStageNote(stage)"></td>
+                      <td class="text-xs" x-text="formatDateTime(stage.started_at)"></td>
+                      <td class="text-xs" x-text="formatDateTime(stage.completed_at)"></td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="sales-panel-section" x-show="activeTab === 'command'">
+            <div class="sales-panel-header">
+              <h3>Source health</h3>
+              <button class="btn btn-ghost btn-sm" @click="loadSourceHealth()">Yenile</button>
+            </div>
+            <div class="table-wrap" x-show="sourceHealth.length > 0">
+              <table>
+                <thead><tr><th>Kaynak</th><th>Parser</th><th>Freshness</th><th>Son kontrol</th><th>Durum</th></tr></thead>
+                <tbody>
+                  <template x-for="row in sourceHealth" :key="row.id">
+                    <tr>
+                      <td x-text="row.source_type"></td>
+                      <td x-text="row.parser_health"></td>
+                      <td class="text-xs" x-text="row.freshness || '-'"></td>
+                      <td class="text-xs" x-text="formatDateTime(row.last_checked_at)"></td>
+                      <td><span class="badge" :class="sourceHealthBadgeClass(row)" x-text="row.auto_skip ? 'auto_skip' : 'ok'"></span></td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+            <div class="sales-empty" x-show="sourceHealth.length === 0">
+              <p>Kaynak health verisi henuz yok.</p>
+            </div>
+          </section>

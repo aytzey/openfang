@@ -65,6 +65,16 @@ openfang init && openfang start
 # Open http://127.0.0.1:4200
 ```
 
+### Docker Compose
+
+```bash
+./scripts/compose-fresh.sh up
+# Open http://127.0.0.1:4200
+```
+
+The compose stack runs the single OpenFang binary with the embedded web UI. It mounts host `~/.codex` read-only into the container so Codex/OpenAI CLI auth remains available inside, and it resets prior runtime data plus local compose images/build cache on each `up` or `build`.
+It also uses host networking on Linux, so OpenFang still listens on `127.0.0.1:4200` from both the host and the container without needing a separate Docker-only API auth workaround.
+
 ### Key Numbers
 
 | Metric | Count |

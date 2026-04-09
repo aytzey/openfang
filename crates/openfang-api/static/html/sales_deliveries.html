@@ -1,0 +1,26 @@
+          <!-- Deliveries -->
+          <section class="sales-panel-section" x-show="activeTab === 'deliveries' && !isB2C">
+            <div class="sales-panel-header">
+              <h3>Teslimatlar</h3>
+              <button class="btn btn-ghost btn-sm" @click="loadDeliveries()">Yenile</button>
+            </div>
+            <div class="table-wrap" x-show="deliveries.length > 0">
+              <table>
+                <thead><tr><th>Kanal</th><th>Alici</th><th>Durum</th><th>Zaman</th><th>Not</th></tr></thead>
+                <tbody>
+                  <template x-for="d in deliveries" :key="d.id">
+                    <tr>
+                      <td x-text="d.channel"></td>
+                      <td class="text-xs" x-text="d.recipient"></td>
+                      <td><span class="badge" :class="deliveryStatusClass(d)" x-text="d.status"></span></td>
+                      <td class="text-xs" x-text="formatDateTime(d.sent_at)"></td>
+                      <td class="text-xs"><div class="sales-line-clamp" x-text="d.error || '-'"></div></td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+            <div class="sales-empty" x-show="deliveries.length === 0">
+              <p>Henuz teslimat yok. Onaylanmis mesajlar gonderildiginde burada gorunur.</p>
+            </div>
+          </section>

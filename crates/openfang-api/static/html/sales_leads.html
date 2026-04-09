@@ -1,0 +1,29 @@
+          <!-- Leads list -->
+          <section class="sales-panel-section" x-show="activeTab === 'profiles' && !isB2C">
+            <div class="sales-panel-header">
+              <h3>Ham contact adaylari</h3>
+              <button class="btn btn-ghost btn-sm" @click="loadLeads()">Yenile</button>
+            </div>
+            <div class="table-wrap" x-show="leads.length > 0">
+              <table>
+                <thead><tr><th>Sirket</th><th>Kisi</th><th>E-posta</th><th>LinkedIn</th><th>Skor</th><th>ICP sinyali</th></tr></thead>
+                <tbody>
+                  <template x-for="l in leads" :key="l.id">
+                    <tr>
+                      <td><span class="font-bold" x-text="l.company"></span><div class="text-xs text-dim" x-text="l.company_domain"></div></td>
+                      <td><span x-text="l.contact_name"></span><div class="text-xs text-dim" x-text="l.contact_title"></div></td>
+                      <td class="text-xs" x-text="l.email || '-'"></td>
+                      <td class="text-xs"><a x-show="l.linkedin_url" :href="l.linkedin_url" target="_blank" rel="noopener">Ac</a><span x-show="!l.linkedin_url">-</span></td>
+                      <td x-text="l.score"></td>
+                      <td class="text-xs">
+                        <div class="sales-line-clamp" x-text="leadReasonsPreview(l).join(' | ') || '-'"></div>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+            <div class="sales-empty" x-show="leads.length === 0">
+              <p>Henuz lead yok. Yeni run calistirin.</p>
+            </div>
+          </section>

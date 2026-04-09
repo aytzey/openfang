@@ -1,27 +1,67 @@
-# NOTE: The GHCR image (ghcr.io/rightnow-ai/openfang) is not yet public.
-# For now, build from source using `docker compose up --build`.
-# See: https://github.com/RightNow-AI/openfang/issues/12
+name: openfang
 
-version: "3.8"
 services:
   openfang:
-    build: .
-    # image: ghcr.io/rightnow-ai/openfang:latest  # Uncomment when GHCR is public
-    ports:
-      - "4200:4200"
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    network_mode: host
+    user: "${OPENFANG_UID:-1000}:${OPENFANG_GID:-1000}"
+    env_file:
+      - path: .env
+        required: false
     volumes:
-      - openfang-data:/data
+      - type: bind
+        source: ${OPENFANG_DATA_DIR:-./.docker/openfang-home}
+        target: /data
+        bind:
+          create_host_path: true
+      - type: bind
+        source: ${OPENFANG_CODEX_DIR:-${HOME}/.codex}
+        target: /data/.codex
+        read_only: true
+        bind:
+          create_host_path: true
     environment:
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - OPENAI_CODEX_ACCESS_TOKEN=${OPENAI_CODEX_ACCESS_TOKEN:-}
-      - OPENAI_CODEX_ACCOUNT_ID=${OPENAI_CODEX_ACCOUNT_ID:-}
-      - GROQ_API_KEY=${GROQ_API_KEY:-}
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
-      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
-      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-}
-      - SLACK_APP_TOKEN=${SLACK_APP_TOKEN:-}
+      HOME: /data
+      OPENFANG_LISTEN: ${OPENFANG_LISTEN:-127.0.0.1:4200}
+      RUST_LOG: ${RUST_LOG:-info}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_CODEX_ACCESS_TOKEN: ${OPENAI_CODEX_ACCESS_TOKEN:-}
+      OPENAI_CODEX_ACCOUNT_ID: ${OPENAI_CODEX_ACCOUNT_ID:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      TOGETHER_API_KEY: ${TOGETHER_API_KEY:-}
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      FIREWORKS_API_KEY: ${FIREWORKS_API_KEY:-}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://127.0.0.1:11434}
+      VLLM_BASE_URL: ${VLLM_BASE_URL:-http://127.0.0.1:8000}
+      LMSTUDIO_BASE_URL: ${LMSTUDIO_BASE_URL:-http://127.0.0.1:1234}
+      OPENFANG_API_KEY: ${OPENFANG_API_KEY:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:-}
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
+      SLACK_APP_TOKEN: ${SLACK_APP_TOKEN:-}
+      WHATSAPP_TOKEN: ${WHATSAPP_TOKEN:-}
+      WHATSAPP_PHONE_ID: ${WHATSAPP_PHONE_ID:-}
+      SIGNAL_CLI_PATH: ${SIGNAL_CLI_PATH:-}
+      SIGNAL_PHONE_NUMBER: ${SIGNAL_PHONE_NUMBER:-}
+      MATRIX_HOMESERVER: ${MATRIX_HOMESERVER:-}
+      MATRIX_ACCESS_TOKEN: ${MATRIX_ACCESS_TOKEN:-}
+      EMAIL_IMAP_HOST: ${EMAIL_IMAP_HOST:-}
+      EMAIL_SMTP_HOST: ${EMAIL_SMTP_HOST:-}
+      EMAIL_USERNAME: ${EMAIL_USERNAME:-}
+      EMAIL_PASSWORD: ${EMAIL_PASSWORD:-}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:4200/api/health >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    stop_grace_period: 30s
     restart: unless-stopped
-
-volumes:
-  openfang-data:

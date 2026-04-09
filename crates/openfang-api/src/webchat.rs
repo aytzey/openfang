@@ -1,14 +1,8 @@
 //! Embedded WebChat UI served as static HTML.
 //!
-//! The production dashboard is assembled at compile time from separate
-//! HTML/CSS/JS files under `static/` using `include_str!()`. This keeps
-//! single-binary deployment while allowing organized source files.
-//!
-//! Features:
-//! - Alpine.js single-panel prospecting harness UI
-//! - Dark/light theme toggle with system preference detection
-//! - OAuth + onboarding + prospect discovery / profiling controls
-//! - Vendor libraries bundled locally (no CDN dependency)
+//! The production dashboard is assembled at compile time from HTML fragments,
+//! CSS assets, vendor libraries, and a Bun-built application bundle. This
+//! preserves single-binary deployment while keeping the source tree manageable.
 
 use axum::http::header;
 use axum::response::IntoResponse;
@@ -45,8 +39,6 @@ pub async fn favicon_ico() -> impl IntoResponse {
 }
 
 /// GET / — Serve the OpenFang Dashboard single-page application.
-///
-/// Returns the full SPA with ETag header based on package version for caching.
 pub async fn webchat_page() -> impl IntoResponse {
     (
         [
@@ -63,10 +55,8 @@ pub async fn webchat_page() -> impl IntoResponse {
 
 /// The embedded HTML/CSS/JS for the OpenFang Dashboard.
 ///
-/// Assembled at compile time from organized static files.
-/// All vendor libraries (Alpine.js, marked.js, highlight.js) are bundled
-/// locally — no CDN dependency. Alpine.js is included LAST because it
-/// immediately processes x-data directives and fires alpine:init on load.
+/// Vendor libraries are bundled locally — no CDN dependency. Alpine.js is
+/// included LAST because it immediately processes x-data directives on load.
 const WEBCHAT_HTML: &str = concat!(
     include_str!("../static/index_head.html"),
     "<style>\n",
@@ -78,24 +68,27 @@ const WEBCHAT_HTML: &str = concat!(
     "\n",
     include_str!("../static/vendor/github-dark.min.css"),
     "\n</style>\n",
-    include_str!("../static/index_body.html"),
-    // Vendor libs: marked + highlight first (used by app.js)
+    include_str!("../static/html/body_open.html"),
+    include_str!("../static/html/sales_onboarding.html"),
+    include_str!("../static/html/sales_command.html"),
+    include_str!("../static/html/sales_runs.html"),
+    include_str!("../static/html/sales_profiles_shared.html"),
+    include_str!("../static/html/sales_profiles_b2b.html"),
+    include_str!("../static/html/sales_profiles_b2c.html"),
+    include_str!("../static/html/sales_approvals.html"),
+    include_str!("../static/html/sales_leads.html"),
+    include_str!("../static/html/sales_run_profiles.html"),
+    include_str!("../static/html/sales_deliveries.html"),
+    include_str!("../static/html/body_close.html"),
     "<script>\n",
     include_str!("../static/vendor/marked.min.js"),
     "\n</script>\n",
     "<script>\n",
     include_str!("../static/vendor/highlight.min.js"),
     "\n</script>\n",
-    // App code
     "<script>\n",
-    include_str!("../static/js/api.js"),
-    "\n",
-    include_str!("../static/js/app.js"),
-    "\n",
-    include_str!("../static/js/pages/sales.js"),
-    "\n",
+    include_str!(concat!(env!("OUT_DIR"), "/webchat.bundle.js")),
     "\n</script>\n",
-    // Alpine.js MUST be last — it processes x-data and fires alpine:init
     "<script>\n",
     include_str!("../static/vendor/alpine.min.js"),
     "\n</script>\n",

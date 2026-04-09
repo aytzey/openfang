@@ -1,8 +1,10 @@
 'use strict';
 
-function app() {
+import { OpenFangAPI } from './api.js';
+
+export function createApp() {
   return {
-    page: 'prospecting',
+    page: 'prospecting-b2b',
     themeMode: localStorage.getItem('openfang-theme-mode') || 'system',
     theme: (() => {
       var mode = localStorage.getItem('openfang-theme-mode') || 'system';
@@ -16,19 +18,35 @@ function app() {
     connectionState: 'connected',
     lastError: '',
 
+    normalizePage(hashValue) {
+      var raw = (hashValue || '').replace('#', '').trim().toLowerCase();
+      var page = raw.split('/')[0];
+      if (!page || page === 'prospecting') return 'prospecting-b2b';
+      if (page === 'prospecting-b2b' || page === 'prospecting-b2c') return page;
+      return 'prospecting-b2b';
+    },
+
+    get pageLabel() {
+      return this.page === 'prospecting-b2c'
+        ? 'Prospecting Harness / B2C'
+        : 'Prospecting Harness / B2B';
+    },
+
     init() {
       var self = this;
 
-      function enforceSalesHash() {
-        var hash = (window.location.hash || '').replace('#', '').trim().toLowerCase();
-        if (!hash || hash !== 'prospecting') {
-          window.location.hash = 'prospecting';
+      function enforcePageHash() {
+        var normalized = self.normalizePage(window.location.hash || '');
+        var rest = ((window.location.hash || '').replace('#', '').trim().split('/').slice(1).join('/'));
+        self.page = normalized;
+        if (!window.location.hash || self.normalizePage(window.location.hash || '') !== normalized) {
+          window.location.hash = normalized + (rest ? ('/' + rest) : '');
+          return;
         }
-        self.page = 'prospecting';
       }
 
-      window.addEventListener('hashchange', enforceSalesHash);
-      enforceSalesHash();
+      window.addEventListener('hashchange', enforcePageHash);
+      enforcePageHash();
 
       window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function(e) {
         if (self.themeMode === 'system') {
@@ -42,6 +60,13 @@ function app() {
 
       this.pollStatus();
       setInterval(function() { self.pollStatus(); }, 5000);
+    },
+
+    goToPage(page) {
+      var normalized = this.normalizePage(page);
+      var current = (window.location.hash || '').replace('#', '').trim();
+      var rest = current.split('/').slice(1).join('/');
+      window.location.hash = normalized + (rest ? ('/' + rest) : '');
     },
 
     async pollStatus() {
