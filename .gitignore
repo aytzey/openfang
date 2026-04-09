@@ -32,8 +32,8 @@ predictions_database.json
 prediction_report_*.md
 BUILD_LOG.md
 .docker/
-crates/openfang-api/ui/dist/
-crates/openfang-api/ui/node_modules/
+crates/pulsivo-salesman-api/ui/dist/
+crates/pulsivo-salesman-api/ui/node_modules/
 
 # OS
 .DS_Store

@@ -8,8 +8,8 @@ const { randomUUID } = require('node:crypto');
 // Config from environment
 // ---------------------------------------------------------------------------
 const PORT = parseInt(process.env.WHATSAPP_GATEWAY_PORT || '3009', 10);
-const OPENFANG_URL = (process.env.OPENFANG_URL || 'http://127.0.0.1:4200').replace(/\/+$/, '');
-const DEFAULT_AGENT = process.env.OPENFANG_DEFAULT_AGENT || 'assistant';
+const PULSIVO_SALESMAN_URL = (process.env.PULSIVO_SALESMAN_URL || 'http://127.0.0.1:4200').replace(/\/+$/, '');
+const DEFAULT_AGENT = process.env.PULSIVO_SALESMAN_DEFAULT_AGENT || 'assistant';
 
 // ---------------------------------------------------------------------------
 // State
@@ -50,7 +50,7 @@ async function startConnection() {
     auth: state,
     logger,
     printQRInTerminal: true,
-    browser: ['OpenFang', 'Desktop', '1.0.0'],
+    browser: ['PulsivoSalesman', 'Desktop', '1.0.0'],
   });
 
   // Save credentials whenever they update
@@ -115,7 +115,7 @@ async function startConnection() {
     }
   });
 
-  // Incoming messages → forward to OpenFang
+  // Incoming messages → forward to PulsivoSalesman
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
 
@@ -138,9 +138,9 @@ async function startConnection() {
 
       console.log(`[gateway] Incoming from ${pushName} (${phone}): ${text.substring(0, 80)}`);
 
-      // Forward to OpenFang agent
+      // Forward to PulsivoSalesman agent
       try {
-        const response = await forwardToOpenFang(text, phone, pushName);
+        const response = await forwardToPulsivoSalesman(text, phone, pushName);
         if (response && sock) {
           // Send agent response back to WhatsApp
           await sock.sendMessage(sender, { text: response });
@@ -154,9 +154,9 @@ async function startConnection() {
 }
 
 // ---------------------------------------------------------------------------
-// Forward incoming message to OpenFang API, return agent response
+// Forward incoming message to PulsivoSalesman API, return agent response
 // ---------------------------------------------------------------------------
-function forwardToOpenFang(text, phone, pushName) {
+function forwardToPulsivoSalesman(text, phone, pushName) {
   return new Promise((resolve, reject) => {
     const payload = JSON.stringify({
       message: text,
@@ -167,7 +167,7 @@ function forwardToOpenFang(text, phone, pushName) {
       },
     });
 
-    const url = new URL(`${OPENFANG_URL}/api/agents/${encodeURIComponent(DEFAULT_AGENT)}/message`);
+    const url = new URL(`${PULSIVO_SALESMAN_URL}/api/agents/${encodeURIComponent(DEFAULT_AGENT)}/message`);
 
     const req = http.request(
       {
@@ -199,7 +199,7 @@ function forwardToOpenFang(text, phone, pushName) {
     req.on('error', reject);
     req.on('timeout', () => {
       req.destroy();
-      reject(new Error('OpenFang API timeout'));
+      reject(new Error('PulsivoSalesman API timeout'));
     });
     req.write(payload);
     req.end();
@@ -207,7 +207,7 @@ function forwardToOpenFang(text, phone, pushName) {
 }
 
 // ---------------------------------------------------------------------------
-// Send a message via Baileys (called by OpenFang for outgoing)
+// Send a message via Baileys (called by PulsivoSalesman for outgoing)
 // ---------------------------------------------------------------------------
 async function sendMessage(to, text) {
   if (!sock || connStatus !== 'connected') {
@@ -334,7 +334,7 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`[gateway] WhatsApp Web gateway listening on http://127.0.0.1:${PORT}`);
-  console.log(`[gateway] OpenFang URL: ${OPENFANG_URL}`);
+  console.log(`[gateway] PulsivoSalesman URL: ${PULSIVO_SALESMAN_URL}`);
   console.log(`[gateway] Default agent: ${DEFAULT_AGENT}`);
   console.log('[gateway] Waiting for POST /login/start to begin QR flow...');
 });

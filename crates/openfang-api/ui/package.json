@@ -1,8 +1,0 @@
-{
-  "name": "openfang-webchat-ui",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "build:webchat": "\"${BUN_BIN:-bun}\" build ./src/webchat-entry.js --target=browser --format=iife --outfile \"${WEBCHAT_OUTFILE:-./dist/webchat.bundle.js}\""
-  }
-}

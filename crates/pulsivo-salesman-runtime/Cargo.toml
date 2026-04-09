@@ -1,0 +1,26 @@
+[package]
+name = "pulsivo-salesman-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Agent runtime and execution environment for Pulsivo Salesman"
+
+[dependencies]
+pulsivo-salesman-types = { path = "../pulsivo-salesman-types" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+futures = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+zeroize = { workspace = true }
+dashmap = { workspace = true }
+regex-lite = { workspace = true }
+
+[dev-dependencies]

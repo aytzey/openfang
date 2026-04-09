@@ -15,8 +15,8 @@ CLAUDE.md
 BUILD_LOG.md
 .env
 .env.*
-crates/openfang-api/ui/node_modules
-crates/openfang-api/ui/dist
+crates/pulsivo-salesman-api/ui/node_modules
+crates/pulsivo-salesman-api/ui/dist
 *.db
 *.sqlite
 *.pem

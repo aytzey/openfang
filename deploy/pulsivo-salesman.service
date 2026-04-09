@@ -1,0 +1,38 @@
+[Unit]
+Description=Pulsivo Salesman Agent OS Daemon
+Documentation=https://github.com/pulsivo-salesman-ai/pulsivo-salesman
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pulsivo-salesman
+Group=pulsivo-salesman
+ExecStart=/usr/local/bin/pulsivo-salesman start
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+# Environment
+EnvironmentFile=-/etc/pulsivo-salesman/env
+WorkingDirectory=/var/lib/pulsivo-salesman
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/pulsivo-salesman
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=false
+RestrictRealtime=true
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target

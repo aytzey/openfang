@@ -1,0 +1,140 @@
+          <section class="sales-panel-section" x-show="activeTab === 'market' && isB2C">
+            <div class="sales-panel-header">
+              <h3>B2C market cockpit</h3>
+              <div class="sales-btn-row">
+                <span class="badge badge-success" x-text="b2cReadinessStage()"></span>
+                <span class="badge badge-muted" x-text="b2cPrimaryChannelLabel()"></span>
+              </div>
+            </div>
+            <div class="sales-step-body">
+              <div class="sales-market-hero">
+                <div class="sales-market-copy">
+                  <div class="sales-market-kicker">Market thesis</div>
+                  <h3 x-text="b2cMarketLabel()"></h3>
+                  <p class="text-sm" x-text="b2cGrowthNarrative()"></p>
+                  <div class="sales-chip-list" x-show="b2cTopSignalTags(6).length > 0">
+                    <template x-for="tag in b2cTopSignalTags(6)" :key="tag">
+                      <span class="sales-chip" x-text="tag"></span>
+                    </template>
+                  </div>
+                </div>
+                <div class="sales-market-metrics">
+                  <div class="sales-market-mini">
+                    <span>High-intent</span>
+                    <strong x-text="contactReadyProspects"></strong>
+                  </div>
+                  <div class="sales-market-mini">
+                    <span>Pitch backlog</span>
+                    <strong x-text="companyOnlyProspects"></strong>
+                  </div>
+                  <div class="sales-market-mini">
+                    <span>Top pocket</span>
+                    <strong x-text="b2cLocalityBreakdown(1).length ? b2cLocalityBreakdown(1)[0].label : '-'"></strong>
+                  </div>
+                  <div class="sales-market-mini">
+                    <span>Next step</span>
+                    <strong x-text="b2cReadinessNote()"></strong>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="sales-panel-section" x-show="activeTab === 'market' && isB2C">
+            <div class="sales-step-body">
+              <div class="sales-market-grid">
+                <div class="sales-market-card">
+                  <div class="sales-market-card-head">
+                    <h3>Message pillars</h3>
+                  </div>
+                  <div class="sales-market-list">
+                    <template x-for="item in b2cMessagePillars()" :key="item.label">
+                      <div class="sales-market-list-item">
+                        <strong x-text="item.label"></strong>
+                        <p class="text-sm" x-text="item.body"></p>
+                      </div>
+                    </template>
+                  </div>
+                </div>
+
+                <div class="sales-market-card">
+                  <div class="sales-market-card-head">
+                    <h3>Offer angles</h3>
+                  </div>
+                  <div class="sales-market-list">
+                    <template x-for="item in b2cOfferAngles()" :key="item.label">
+                      <div class="sales-market-list-item">
+                        <strong x-text="item.label"></strong>
+                        <p class="text-sm" x-text="item.body"></p>
+                      </div>
+                    </template>
+                  </div>
+                </div>
+
+                <div class="sales-market-card">
+                  <div class="sales-market-card-head">
+                    <h3>Channel mix</h3>
+                  </div>
+                  <div class="sales-market-list" x-show="b2cPlatformBreakdown(4).length > 0">
+                    <template x-for="item in b2cPlatformBreakdown(4)" :key="item.key">
+                      <div class="sales-market-list-item">
+                        <strong x-text="item.label + ' / ' + item.count"></strong>
+                        <p class="text-sm" x-text="item.note"></p>
+                      </div>
+                    </template>
+                  </div>
+                  <div class="sales-empty" x-show="b2cPlatformBreakdown(4).length === 0">
+                    <p>Henuz platform dagilimi olusmadi.</p>
+                  </div>
+                </div>
+
+                <div class="sales-market-card">
+                  <div class="sales-market-card-head">
+                    <h3>Local market pockets</h3>
+                  </div>
+                  <div class="sales-market-list" x-show="b2cLocalityBreakdown(4).length > 0">
+                    <template x-for="item in b2cLocalityBreakdown(4)" :key="item.label">
+                      <div class="sales-market-list-item">
+                        <strong x-text="item.label + ' / ' + item.count"></strong>
+                        <p class="text-sm">Bu cep icin ayni sehir, ayni rutin veya ayni niche baglamiyla acilmalisiniz.</p>
+                      </div>
+                    </template>
+                  </div>
+                  <div class="sales-empty" x-show="b2cLocalityBreakdown(4).length === 0">
+                    <p>Lokal market cebi henuz cikmadi.</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="sales-panel-section" x-show="activeTab === 'market' && isB2C">
+            <div class="sales-panel-header">
+              <h3>Priority buyer queue</h3>
+              <span class="badge badge-muted" x-text="b2cPriorityProfiles(6).length + ' profile'"></span>
+            </div>
+            <div class="table-wrap" x-show="b2cPriorityProfiles(6).length > 0">
+              <table>
+                <thead><tr><th>Buyer</th><th>Platform</th><th>Why now</th><th>First line</th><th>Aksiyon</th></tr></thead>
+                <tbody>
+                  <template x-for="item in b2cPriorityProfiles(6)" :key="item.prospect.id">
+                    <tr>
+                      <td>
+                        <span class="font-bold" x-text="item.prospect.company"></span>
+                        <div class="text-xs text-dim" x-text="item.locality"></div>
+                      </td>
+                      <td class="text-xs" x-text="item.platform"></td>
+                      <td class="text-xs"><div class="sales-line-clamp" x-text="item.why_now"></div></td>
+                      <td class="text-xs"><div class="sales-line-clamp" x-text="item.opener"></div></td>
+                      <td>
+                        <button class="btn btn-ghost btn-sm" @click="setTab('profiles'); selectProspect(item.prospect)">Buyer'i ac</button>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+            <div class="sales-empty" x-show="b2cPriorityProfiles(6).length === 0">
+              <p>Ilk B2C run tamamlandiginda priority queue burada olusur.</p>
+            </div>
+          </section>

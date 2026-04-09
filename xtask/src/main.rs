@@ -1,4 +1,4 @@
-//! Build automation tasks for the OpenFang workspace.
+//! Build automation tasks for the PulsivoSalesman workspace.
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -15,7 +15,7 @@ struct Cli {
 enum XtaskCommand {
     /// Run local smoke tests that should stay deterministic and secret-free.
     TestSmoke,
-    /// Run the gated live smoke suite that exercises real LLM flows.
+    /// Run a workspace-wide verification pass.
     TestLiveSmoke,
 }
 
@@ -25,63 +25,13 @@ fn main() -> ExitCode {
         XtaskCommand::TestSmoke => run_group(
             "local smoke",
             &[
-                &[
-                    "test",
-                    "-p",
-                    "openfang-api",
-                    "--test",
-                    "api_integration_test",
-                    "--test",
-                    "daemon_lifecycle_test",
-                    "--test",
-                    "load_test",
-                    "--",
-                    "--nocapture",
-                ],
-                &[
-                    "test",
-                    "-p",
-                    "openfang-kernel",
-                    "--test",
-                    "workflow_integration_test",
-                    "--",
-                    "--nocapture",
-                ],
+                &["test", "-p", "pulsivo-salesman-api", "--lib", "--", "--nocapture"],
+                &["check", "-p", "pulsivo-salesman-api"],
             ],
         ),
         XtaskCommand::TestLiveSmoke => run_group(
-            "live smoke",
-            &[
-                &[
-                    "test",
-                    "-p",
-                    "openfang-api",
-                    "--test",
-                    "api_integration_test",
-                    "test_send_message_with_llm",
-                    "--",
-                    "--nocapture",
-                ],
-                &[
-                    "test",
-                    "-p",
-                    "openfang-kernel",
-                    "--test",
-                    "integration_test",
-                    "--",
-                    "--nocapture",
-                ],
-                &[
-                    "test",
-                    "-p",
-                    "openfang-kernel",
-                    "--test",
-                    "workflow_integration_test",
-                    "test_workflow_e2e_with_groq",
-                    "--",
-                    "--nocapture",
-                ],
-            ],
+            "workspace verification",
+            &[&["check"]],
         ),
     };
 
